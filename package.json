@@ -1,0 +1,19 @@
+{
+  "name": "@ten98/runtime",
+  "version": "0.1.0",
+  "description": "Shared HTTP, OpenRouter and OIDC primitives for ten98 applications",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.mjs",
+  "types": "./index.d.mts",
+  "exports": {
+    ".": { "types": "./index.d.mts", "import": "./index.mjs" }
+  },
+  "files": ["index.mjs", "index.d.mts", "LICENSE", "README.md", "architecture.json", "check.mjs"],
+  "scripts": {
+    "check:architecture": "node check.mjs .",
+    "test": "npm run check:architecture && node --test tests/*.test.mjs"
+  },
+  "engines": { "node": ">=24.0.0 <25" },
+  "repository": { "type": "git", "url": "https://github.com/Ten98-IO-Company/ten98-code-system.git" }
+}

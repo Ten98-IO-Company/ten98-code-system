@@ -1,0 +1,64 @@
+{
+  "node": ">=24.0.0 <25",
+  "sharedVersions": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "typescript": "7.0.2",
+    "vite": "8.3.4",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2"
+  },
+  "sharedPackages": {
+    "@ten98/ui": "file:vendor/ten98-ui-0.3.16.tgz",
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.0.tgz"
+  },
+  "profiles": {
+    "ten98-campaign": {
+      "boundary": "Node HTTP, SQLite and openid-client; application owns sessions, authorization and paid-work accounting.",
+      "dependencies": { "openid-client": "6.8.8", "qrcode-generator": "2.0.4" },
+      "sharedDependencies": ["react", "react-dom", "@ten98/ui", "@ten98/runtime"],
+      "sharedDevDependencies": ["typescript", "vite", "@types/react", "@types/react-dom"],
+      "peerDependencies": {},
+      "checkScripts": ["test", "build"]
+    },
+    "ten98-monitor": {
+      "boundary": "TanStack Start and Nitro, PostgreSQL, Drizzle and Better Auth; application owns sessions, workspace authorization and provider ledger.",
+      "dependencies": {
+        "@modelcontextprotocol/server": "2.3.1",
+        "@tanstack/react-router": "1.170.42",
+        "@tanstack/react-start": "1.168.61",
+        "better-auth": "1.7.7",
+        "detect-browser": "5.3.0",
+        "drizzle-orm": "0.45.2",
+        "mmdb-lib": "3.0.3",
+        "nodemailer": "10.1.1",
+        "parse5": "8.0.1",
+        "pg": "8.23.0",
+        "pg-boss": "12.37.1",
+        "saxes": "6.0.0",
+        "ua-parser-js": "1.0.41",
+        "zod": "4.5.4"
+      },
+      "sharedDependencies": ["react", "react-dom", "@ten98/ui", "@ten98/runtime"],
+      "sharedDevDependencies": ["typescript", "vite", "@types/react", "@types/react-dom"],
+      "peerDependencies": {},
+      "checkScripts": ["test", "build"]
+    },
+    "@ten98/ui": {
+      "boundary": "React presentation only; routing, authentication, persistence and provider controllers remain in applications.",
+      "dependencies": {},
+      "sharedDependencies": [],
+      "sharedDevDependencies": ["react", "react-dom", "typescript", "vite", "@types/react", "@types/react-dom", "@ten98/runtime"],
+      "peerDependencies": { "react": "^18.3.0 || ^19.0.0", "react-dom": "^18.3.0 || ^19.0.0" },
+      "checkScripts": ["test", "build"]
+    },
+    "@ten98/runtime": {
+      "boundary": "Node standard library and web platform primitives only; no framework, database, session controller or provider accounting.",
+      "dependencies": {},
+      "sharedDependencies": [],
+      "sharedDevDependencies": [],
+      "peerDependencies": {},
+      "checkScripts": ["test"]
+    }
+  }
+}
