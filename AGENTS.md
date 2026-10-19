@@ -2,6 +2,8 @@
 
 Read README.md and architecture.json before editing. This is the canonical home for shared technical mechanisms; @ten98/ui remains the presentation package.
 
+Before implementing a repeated feature, inspect features/catalog.json and follow docs/FEATURE-ADOPTION.md. Prefer imports; copy a pinned complete implementation only when its stack integration requires it. Include every required migration, configuration, frontend/server entrypoint and dependency, the runnable source checks, provenance and known issues. Register the receiving app and version in its adoption issue. Never call a feature complete or battle-tested from helpers or synthetic tests alone.
+
 Apply DRY, KISS and Ponytail: trace all callers, reuse native features, remove duplicate implementations, and add no speculative framework or dependency. Keep application authorization, storage, identity controllers and paid-work accounting in their apps until a concrete migration preserves their contracts.
 
 Use bounded parallel workers with disjoint files: at most two implementation workers and one independent reviewer, twelve minutes per implementation task, two failed repair attempts and 120 seconds per command. Record the task, base, allowlist, acceptance cases and actual checks. Stop on unrelated edits or original failures. No paid calls, deployment or push without task authorization.

@@ -1,0 +1,521 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Find working feature source and its verification boundary before importing shared code or adopting a stack-bound implementation.",
+  "architectureContract": "../architecture.json",
+  "adoptionGuide": "../docs/FEATURE-ADOPTION.md",
+  "defaultAuthenticatedNodeStack": "discover",
+  "release": {
+    "tag": "feature-library-2026-10-20",
+    "url": "https://github.com/Ten98-IO-Company/ten98-code-system/releases/tag/feature-library-2026-10-20",
+    "manifestAsset": "feature-source-manifest.json",
+    "verification": "checks-and-hashes-recorded-in-manifest",
+    "manifestSHA256": "f12bd9e13c83358e1d5927cbd6992467e24ed54111d4a2378cb90d3883cf8950"
+  },
+  "bundles": {
+    "campaign": {
+      "repository": "ten98-campaign",
+      "asset": "ten98-campaign-source.zip",
+      "stack": "React/Vite SPA, Node HTTP, SQLite, openid-client",
+      "adoption": "retained-stack-reference",
+      "installInputs": [
+        "package.json",
+        "package-lock.json",
+        "vendor/"
+      ],
+      "applicationChecks": [
+        "npm run check:architecture",
+        "npm test",
+        "npm run build"
+      ],
+      "sha256": "7e6e920d9ca2b5b19663f790d2f980ccaa02cd262057095a5669e71ebe508e19",
+      "sourceTreeSHA256": "d44eebcd8925bad63549c9469bb58978aca7fd12d44052d308d88bd49c671d01"
+    },
+    "discover": {
+      "repository": "ten98-discover",
+      "asset": "ten98-discover-source.zip",
+      "stack": "React, TanStack Start/Router, Nitro, Better Auth, PostgreSQL/Drizzle, pg-boss",
+      "adoption": "default-stack-reference",
+      "installInputs": [
+        "package.json",
+        "pnpm-lock.yaml",
+        "vendor/",
+        "migrations/"
+      ],
+      "applicationChecks": [
+        "pnpm check:architecture",
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm check:plan",
+        "pnpm build"
+      ],
+      "integrationPrerequisites": "Isolated PostgreSQL, approved public configuration and the selected test's documented fixture setup; never production credentials.",
+      "sha256": "7cca7504b9a5a66b6cf10ebb613dbd9a0c7c1acd4d1e6ed93fbb0b0c7668d978",
+      "sourceTreeSHA256": "d6a146a1bbddce5e046a7c870019824cf7241c9179ead0b49f76d057e40b2a0b"
+    },
+    "ui": {
+      "repository": "ten98-design-system",
+      "asset": "ten98-design-system-source.zip",
+      "stack": "React presentation and semantic CSS; no authentication or persistence controller",
+      "adoption": "shared-presentation-source",
+      "installInputs": [
+        "package.json",
+        "package-lock.json",
+        "vendor/"
+      ],
+      "applicationChecks": [
+        "npm run check:all"
+      ],
+      "sha256": "59a05e04996239d8355a61453ad20dc7a3b7eff0690c2c2d6d023a8a9d2d51cb",
+      "sourceTreeSHA256": "9b655995e998eeb6554c4ae59c7f00ef1d608b449842d3eae189b03b463269c6"
+    }
+  },
+  "portableImports": {
+    "runtime": {
+      "package": "@ten98/runtime",
+      "entrypoints": [
+        "index.mjs",
+        "index.d.mts"
+      ],
+      "exports": [
+        "readResponseText",
+        "openRouterFetch",
+        "oidcEndpoint",
+        "workspaceRoles",
+        "mayGrantWorkspaceRole"
+      ],
+      "tests": [
+        "tests/runtime.test.mjs"
+      ],
+      "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence."
+    },
+    "presentation": {
+      "package": "@ten98/ui",
+      "bundle": "ui",
+      "entrypoints": [
+        "src/lib/index.ts",
+        "src/lib/app.tsx"
+      ],
+      "tests": [
+        "tests/library.test.mjs",
+        "tests/catalogue.test.mjs",
+        "tests/browser/auth-layout.spec.ts"
+      ],
+      "boundary": "Typed controls, branding, layouts and interaction patterns. Application controllers retain data, authorization, requests and draft identity."
+    }
+  },
+  "features": [
+    {
+      "id": "first-user-bootstrap",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/routes/index.tsx",
+            "src/server/api.ts",
+            "src/server/auth.ts",
+            "src/server/schema.ts"
+          ],
+          "tests": [
+            "tests/account-security-integration.ts"
+          ]
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "src/main.tsx",
+            "server/index.mjs",
+            "server/auth.mjs",
+            "server/database.mjs"
+          ],
+          "tests": [
+            "tests/bootstrap.test.mjs",
+            "tests/workspace-onboarding.test.mjs"
+          ],
+          "issues": [
+            4
+          ]
+        }
+      ],
+      "acceptance": "Host-held setup capability, first-owner transaction, concurrent claim rejection, rollback/retry, existing-installation handling and no public self-registration."
+    },
+    {
+      "id": "local-signin-account-security",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/server/auth.ts",
+            "src/server/account-security.ts",
+            "src/components/AccountSecurityPanel.tsx",
+            "src/components/PasswordRecoveryPanel.tsx"
+          ],
+          "tests": [
+            "tests/account-security-integration.ts"
+          ]
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "server/auth.mjs",
+            "server/cli.mjs",
+            "src/AccountSettings.tsx"
+          ],
+          "tests": [
+            "tests/auth-races.test.mjs",
+            "tests/account.test.mjs",
+            "tests/session-revocation-http.test.mjs"
+          ],
+          "issues": [
+            7
+          ]
+        }
+      ],
+      "gap": "Campaign does not provide Discover's web password recovery or MFA lifecycle. Host recovery is a retained fallback, not feature parity."
+    },
+    {
+      "id": "oidc-signin-linking",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/server/oidc.ts",
+            "src/server/account-security.ts",
+            "src/components/OidcSignIn.tsx",
+            "src/components/OidcPanel.tsx"
+          ],
+          "tests": [
+            "tests/oidc.test.ts",
+            "tests/oidc-integration.ts"
+          ]
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "server/auth.mjs",
+            "server/index.mjs",
+            "src/main.tsx"
+          ],
+          "tests": [
+            "tests/auth-races.test.mjs"
+          ],
+          "issues": [
+            7,
+            8
+          ]
+        }
+      ],
+      "boundary": "Preserve state, nonce, PKCE, issuer/subject identity, verified-email policy and single-use browser-bound flows. Provisioning allowlists and ongoing admission are different policies. Generic fixture tests do not certify a live identity provider."
+    },
+    {
+      "id": "workspaces-projects-rbac-invitations",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/server/api.ts",
+            "src/server/teams.ts",
+            "src/components/TeamPanel.tsx",
+            "src/components/InvitePanel.tsx"
+          ],
+          "tests": [
+            "tests/teams-integration.ts",
+            "tests/invitation-email-integration.ts"
+          ]
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "server/index.mjs",
+            "server/invitations.mjs",
+            "server/database.mjs",
+            "src/TeamPanel.tsx",
+            "src/WorkspaceInvitations.tsx",
+            "src/AcceptInvitation.tsx"
+          ],
+          "tests": [
+            "tests/invitations.test.mjs",
+            "tests/collaboration-http.test.mjs",
+            "tests/workspace-onboarding.test.mjs"
+          ],
+          "issues": [
+            7
+          ]
+        }
+      ],
+      "boundary": "Import shared grant predicates; keep tenant joins, current-authority rechecks and last-owner locks inside the database transaction. Campaign permits owner invitations; Discover uses ownership transfer."
+    },
+    {
+      "id": "provider-settings-credential-lifecycle",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/server/providers.ts",
+            "src/server/credential-vault.ts",
+            "src/components/ProviderPanel.tsx"
+          ],
+          "tests": [
+            "tests/providers.test.ts",
+            "tests/providers-integration.ts",
+            "tests/provider-spending-controls-integration.ts"
+          ]
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "server/integration-settings.mjs",
+            "server/integrations.mjs",
+            "src/IntegrationSettings.tsx"
+          ],
+          "tests": [
+            "tests/integration-settings.test.mjs",
+            "tests/settings-http.test.mjs",
+            "tests/provider-response.test.mjs"
+          ],
+          "issues": [
+            6,
+            8
+          ]
+        }
+      ],
+      "boundary": "Keep encrypted envelope versions, tenancy/AAD, rotation/restore behavior and unchanged-versus-clear semantics. A password reveal control is not a complete credential editor."
+    },
+    {
+      "id": "openrouter-execution-model-settings",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/server/openrouter.ts",
+            "src/server/openrouter-models.ts",
+            "src/server/providers.ts",
+            "src/components/ProviderPanel.tsx"
+          ],
+          "tests": [
+            "tests/prompt-execution.test.ts",
+            "tests/prompt-execution-integration.ts",
+            "tests/openrouter-models.test.ts",
+            "tests/openrouter-models-integration.ts"
+          ]
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "server/agent.mjs",
+            "server/integration-settings.mjs",
+            "src/CampaignAgent.tsx",
+            "src/IntegrationSettings.tsx"
+          ],
+          "tests": [
+            "tests/agent.test.mjs",
+            "tests/agent-recovery-audit.test.mjs",
+            "tests/integration-settings.test.mjs"
+          ]
+        }
+      ],
+      "boundary": "Import transport; adopt the application's complete reservation/idempotency, receipt, uncertainty and reconciliation flow. Never retry an ambiguous paid outcome or run paid calls during health/setup checks."
+    },
+    {
+      "id": "native-api-keys",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/server/api-keys.ts",
+            "src/server/api.ts",
+            "src/server/openapi.ts",
+            "src/components/ApiKeysPanel.tsx"
+          ],
+          "tests": [
+            "tests/api-keys.test.ts",
+            "tests/api-key-scopes.test.ts",
+            "tests/api-keys-integration.ts",
+            "tests/api-key-delayed-reads-integration.ts"
+          ]
+        }
+      ],
+      "gap": "No native Campaign API-key issuance/admission implementation is supplied. Outbound provider credentials are a different feature.",
+      "boundary": "Preserve one-time display, hashed storage, expiry/revocation, live membership/MFA intersection, route scopes and authority rechecks after waits."
+    },
+    {
+      "id": "native-mcp-server",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/server/mcp.ts",
+            "src/server/mcp-tools.ts",
+            "src/server/api-keys.ts"
+          ],
+          "tests": [
+            "tests/mcp.test.ts",
+            "tests/mcp-report-tools.test.ts",
+            "tests/mcp-integration.ts"
+          ]
+        }
+      ],
+      "boundary": "Existing official server package, stateless scoped POST, bounded complete responses and native domain services. Campaign's internal assistant loop is not an exposed MCP server."
+    },
+    {
+      "id": "search-and-filter-presentation",
+      "implementations": [
+        {
+          "bundle": "ui",
+          "entrypoints": [
+            "src/lib/patterns.tsx"
+          ],
+          "tests": [
+            "tests/library.test.mjs"
+          ],
+          "scope": "Declared column values in a loaded local table."
+        },
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/routes/index.tsx",
+            "src/components/ExplorerFilters.tsx",
+            "src/lib/navigation.ts"
+          ],
+          "tests": [
+            "tests/advanced-filters-browser.mjs",
+            "tests/navigation.test.ts"
+          ],
+          "scope": "Tool navigation search and separate applied report filters."
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "src/main.tsx"
+          ],
+          "tests": [
+            "tests/navigation-editor-ui.test.mjs"
+          ],
+          "scope": "Loaded-view whole-record search; explicit display-field migration remains open.",
+          "issues": [
+            8
+          ]
+        }
+      ],
+      "boundary": "These scopes are not interchangeable. Preserve loaded/total counts, applied-versus-draft filters, pagination and stable selection."
+    },
+    {
+      "id": "account-preferences",
+      "implementations": [
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/components/AccountPreferencesPanel.tsx",
+            "src/lib/account-preferences.ts",
+            "src/lib/account-presentation.tsx",
+            "src/server/account-security.ts"
+          ],
+          "tests": [
+            "tests/account-preferences.test.ts",
+            "tests/account-preferences-integration.ts",
+            "tests/account-preferences-browser.mjs"
+          ]
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "src/AccountSettings.tsx",
+            "public/theme.js",
+            "server/auth.mjs"
+          ],
+          "tests": [
+            "tests/account.test.mjs",
+            "tests/theme.test.mjs"
+          ],
+          "issues": [
+            8
+          ]
+        }
+      ],
+      "boundary": "Discover stores revisioned account preferences server-side; Campaign appearance is browser-local. Preserve ownership, stale-response rejection, drafts and reload-before-retry behavior."
+    },
+    {
+      "id": "application-shell-auth-presentation",
+      "implementations": [
+        {
+          "bundle": "ui",
+          "entrypoints": [
+            "src/lib/workspace.tsx",
+            "src/lib/patterns.tsx",
+            "src/lib/auth.css"
+          ],
+          "tests": [
+            "tests/browser/auth-layout.spec.ts",
+            "tests/browser/catalogue.spec.ts"
+          ]
+        },
+        {
+          "bundle": "discover",
+          "entrypoints": [
+            "src/routes/index.tsx",
+            "src/components/AuthLayout.tsx",
+            "src/campaign-ui.css"
+          ],
+          "tests": [
+            "tests/shell-flow-browser.mjs",
+            "tests/design-system-browser.mjs"
+          ]
+        },
+        {
+          "bundle": "campaign",
+          "entrypoints": [
+            "src/main.tsx",
+            "src/styles.css"
+          ],
+          "tests": [
+            "tests/navigation-editor-ui.test.mjs",
+            "tests/design-system.test.mjs"
+          ],
+          "issues": [
+            5,
+            8
+          ]
+        }
+      ],
+      "boundary": "Shared layout does not implement routing or dirty-state guards. Campaign mobile focus exclusion/Escape/return behavior remains an open defect; do not use it as the canonical drawer."
+    }
+  ],
+  "knownIssues": [
+    {
+      "number": 4,
+      "status": "fixed-and-verified-in-snapshot",
+      "scope": "Campaign host-held bootstrap proof"
+    },
+    {
+      "number": 5,
+      "status": "open",
+      "scope": "Campaign mobile drawer accessibility"
+    },
+    {
+      "number": 6,
+      "status": "fixed-and-verified-in-snapshot",
+      "scope": "Campaign shared provider response reader"
+    },
+    {
+      "number": 7,
+      "status": "open",
+      "scope": "Identity, invitation, API and stack migration contracts"
+    },
+    {
+      "number": 8,
+      "status": "open",
+      "scope": "Auth presentation, search fields and settings consistency"
+    }
+  ],
+  "issueBase": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/",
+  "excludedImplementations": [
+    {
+      "app": "ten98-connect",
+      "reason": "Not built yet. No complete feature implementation or verification claim exists."
+    },
+    {
+      "app": "ten98-io",
+      "reason": "Native Cloudflare Worker/static site; use its own D1/email/security contracts rather than importing an authenticated Node stack."
+    }
+  ],
+  "maturity": "Complete stack-bound source references with scoped code checks; integration and production acceptance remain explicitly separate."
+}

@@ -26,6 +26,19 @@ test('bounded response reading counts bytes and decodes split UTF-8 strictly', a
   assert.equal(await readResponseText(new Response('ok', { headers: { 'content-length': '9999999' } }), { maxBytes: 2 }), 'ok');
 });
 
+test('BOM preservation is explicit, including split BOM bytes and exact-empty JSON semantics', async () => {
+  for (const suffix of ['', '{}']) for (const preserveBOM of [false, true]) {
+    const response = new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(Uint8Array.of(0xef)); controller.enqueue(Uint8Array.of(0xbb, 0xbf));
+      controller.enqueue(new TextEncoder().encode(suffix)); controller.close();
+    } }));
+    const text = await readResponseText(response, { maxBytes: 5, preserveBOM });
+    assert.equal(text, (preserveBOM ? '\ufeff' : '') + suffix);
+    if (preserveBOM) assert.throws(() => JSON.parse(text), SyntaxError);
+    assert.equal(response.body.locked, false);
+  }
+});
+
 test('response failures and pending-read abort cancel the stream and release its lock', async () => {
   for (const value of [Uint8Array.of(1, 2), Uint8Array.of(0xff)]) {
     let cancelled = 0;

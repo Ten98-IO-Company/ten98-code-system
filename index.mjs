@@ -4,7 +4,7 @@ export function mayGrantWorkspaceRole(actor, role) {
   return workspaceRoles.includes(role) && (actor === 'owner' || actor === 'admin' && (role === 'editor' || role === 'viewer'));
 }
 
-export async function readResponseText(response, { maxBytes, signal } = {}) {
+export async function readResponseText(response, { maxBytes, signal, preserveBOM = false } = {}) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError('maxBytes must be a nonnegative safe integer.');
   const reader = response.body?.getReader();
   if (!reader) { signal?.throwIfAborted(); return ''; }
@@ -12,7 +12,7 @@ export async function readResponseText(response, { maxBytes, signal } = {}) {
   signal?.addEventListener('abort', abort, { once: true });
   try {
     signal?.throwIfAborted();
-    const decoder = new TextDecoder('utf-8', { fatal: true });
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: preserveBOM });
     let bytes = 0, text = '';
     while (true) {
       const { value, done } = await reader.read();
