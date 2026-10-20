@@ -3,6 +3,9 @@ export const workspaceRoles = Object.freeze(['owner', 'admin', 'editor', 'viewer
 export function mayGrantWorkspaceRole(actor, role) {
   return workspaceRoles.includes(role) && (actor === 'owner' || actor === 'admin' && (role === 'editor' || role === 'viewer'));
 }
+export function mayManageWorkspaceMember(actor, previousRole, nextRole) {
+  return mayGrantWorkspaceRole(actor, previousRole) && (nextRole === undefined || mayGrantWorkspaceRole(actor, nextRole));
+}
 
 export async function readResponseText(response, { maxBytes, signal, preserveBOM = false } = {}) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError('maxBytes must be a nonnegative safe integer.');

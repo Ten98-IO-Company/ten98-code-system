@@ -10,7 +10,7 @@ import { checkManifest } from '../check.mjs';
 // Independent fixture: do not derive the expected application from architecture.json.
 const campaign = () => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.0.0 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.3.16.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.1.tgz', 'openid-client': '6.8.8', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.3.18.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.2.tgz', 'openid-client': '6.8.8', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4', 'app-specific-tool': '1.0.0' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });

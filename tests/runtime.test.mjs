@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readResponseText, openRouterFetch, oidcEndpoint, workspaceRoles, mayGrantWorkspaceRole } from '../index.mjs';
+import { readResponseText, openRouterFetch, oidcEndpoint, workspaceRoles, mayGrantWorkspaceRole, mayManageWorkspaceMember } from '../index.mjs';
 
 test('workspace grants fail closed across every actor/target pair', () => {
   const allowed = { owner: ['owner', 'admin', 'editor', 'viewer'], admin: ['editor', 'viewer'], editor: [], viewer: [] };
@@ -8,6 +8,19 @@ test('workspace grants fail closed across every actor/target pair', () => {
   assert.equal(Object.isFrozen(workspaceRoles), true);
   for (const actor of [...workspaceRoles, undefined, 'operator', 'constructor']) for (const target of [...workspaceRoles, undefined, 'operator', 'constructor']) {
     assert.equal(mayGrantWorkspaceRole(actor, target), Object.hasOwn(allowed, actor) && allowed[actor].includes(target), `${actor} -> ${target}`);
+  }
+});
+
+test('member changes require authority over both saved and requested roles, and unknown roles fail closed', () => {
+  assert.equal(mayManageWorkspaceMember('admin', 'owner', 'viewer'), false);
+  assert.equal(mayManageWorkspaceMember('admin', 'editor', 'owner'), false);
+  assert.equal(mayManageWorkspaceMember('admin', 'editor', 'viewer'), true);
+  assert.equal(mayManageWorkspaceMember('admin', 'viewer'), true);
+  assert.equal(mayManageWorkspaceMember('owner', 'owner', 'admin'), true);
+  for (const unknown of [undefined, null, 'operator', 'constructor', {}, 0]) {
+    assert.equal(mayManageWorkspaceMember(unknown, 'viewer', 'editor'), false);
+    assert.equal(mayManageWorkspaceMember('owner', unknown, 'editor'), false);
+    if (unknown !== undefined) assert.equal(mayManageWorkspaceMember('owner', 'viewer', unknown), false);
   }
 });
 

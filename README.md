@@ -10,7 +10,7 @@ Keep one maintained implementation for each supported feature and stack. Promote
 
 Import these functions from `@ten98/runtime`:
 
-- `workspaceRoles` and `mayGrantWorkspaceRole(actor, role)` own the four membership roles and grant rule: owners manage all known roles; administrators manage editors/viewers; other or unknown actors cannot grant access. Database tenant checks, last-owner locks and instance-operator authority remain app-owned.
+- `workspaceRoles`, `mayGrantWorkspaceRole(actor, role)` and `mayManageWorkspaceMember(actor, previousRole, nextRole?)` own the four membership roles and grant rules. Owners manage all known roles; administrators manage editors/viewers; other or unknown actors cannot grant access. Member changes check both saved and requested roles; omit the next role for removal. Database tenant checks, last-owner locks and instance-operator authority remain app-owned.
 
 - `readResponseText(response, { maxBytes, signal, preserveBOM })` counts received bytes, rejects malformed UTF-8 and cancels/releases the reader on completion, failure or abort. A leading UTF-8 BOM is stripped by default; set `preserveBOM: true` to retain it when replacing a Buffer decoder, so JSON parsing and exact-empty checks keep their existing behavior. Callers retain JSON/schema parsing, status policy and safe errors.
 - `openRouterFetch(path, { apiKey, title, body, signal, metadata }, send)` uses the fixed HTTPS OpenRouter API, rejects redirects, omits ambient credentials and makes one request. GET defaults to a 10-second deadline; JSON POST defaults to 60 seconds. Pass a signal when requests share one deadline. Paid authorization, idempotency, receipts and reconciliation remain app-owned.
@@ -27,6 +27,8 @@ node check.mjs ../ten98-design-system ../ten98-campaign ../ten98-discover .
 Campaign, Discover and the design-system development tools share Node 24, React, TypeScript and Vite versions. Their existing npm/pnpm lockfiles remain installation inputs. Application consumers use the same accepted immutable UI and runtime archives in `vendor`; standalone Docker builds require no sibling checkout or private registry. A design-system source version can be ahead of the last accepted consumer archive.
 
 Shared presentation belongs in `@ten98/ui`; common server mechanisms belong here. Frontends call their app's authenticated API. Provider keys, database access and paid dispatch stay on the server. Reuse installed frameworks and native platform capabilities before adding a library. Runtime dependency or version changes require updating this contract and checking affected consumers together.
+
+Both Node apps reuse `@ten98/ui` authentication layout and sidebar keyboard/focus behavior. Their identity adapters implement the [feature contracts](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/docs/FEATURE-CONTRACTS.md), including permanent invitation revocation, explicit ownership transfer and fragment-based invitation links. Search uses explicit displayed fields while retaining each operation's native scope.
 
 Current retained adapters are explicit: Campaign uses Node HTTP, SQLite and `openid-client`; Discover uses TanStack Start/Nitro, PostgreSQL/Drizzle and Better Auth. Their storage, routing and identity controllers have not been unified. Shared primitives preserve their distinct security and accounting contracts. The checker verifies declared consistency; it does not prove framework equivalence, runtime call coverage, OIDC interoperability or release readiness.
 
