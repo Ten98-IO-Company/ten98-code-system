@@ -19,7 +19,9 @@
         "openid-client": "6.8.8",
         "qrcode-generator": "2.0.4"
       },
-      "devDependencies": {},
+      "devDependencies": {
+        "@types/node": "24.10.1"
+      },
       "sharedDependencies": [
         "react",
         "react-dom",
@@ -57,7 +59,6 @@
           "server/google-ads.mjs",
           "server/inbox.mjs",
           "server/index.mjs",
-          "server/instance-operators.mjs",
           "server/integration-settings.mjs",
           "server/integrations.mjs",
           "server/invitations.mjs",
@@ -66,6 +67,7 @@
           "server/native-microsoft-ads.mjs",
           "server/ooh.mjs",
           "server/operation-recovery.mjs",
+          "server/seed.mjs",
           "server/sms-inbox.mjs",
           "server/webhooks.mjs",
           "server/zernio-accounts.mjs",
@@ -85,13 +87,14 @@
           "server/zernio-recycling.mjs",
           "server/zernio-webhook-settings.mjs",
           "server/zernio-whatsapp-templates.mjs",
+          "shared/post-schedule.mjs",
           "shared/social-posts.mjs"
         ],
         "generated": {},
         "migration": {
           "owner": "Campaign app owner",
           "issue": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/14",
-          "status": "41 retained JavaScript modules remain untyped after the qualified seed/schedule TypeScript slice, including the foundation instance-operator transaction adapter; remove exact exceptions with checked TypeScript adoption."
+          "status": "42 retained JavaScript modules remain untyped (server and shared). The instance-operator transaction adapter is not yet adopted; it lands as checked TypeScript. Remove exact exceptions with checked TypeScript adoption."
         },
         "artifactDirectories": [
           ".git",
@@ -329,7 +332,8 @@
         "artifactDirectories": [
           ".git",
           "node_modules",
-          "vendor"
+          "vendor",
+          "work"
         ],
         "testDirectories": [
           "tests"

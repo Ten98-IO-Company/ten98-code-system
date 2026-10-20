@@ -87,7 +87,7 @@ test('running Node must satisfy the canonical range, not just manifest declarati
 const campaign = () => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.0.0 <25' },
   dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.3.22.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.7.tgz', 'openid-client': '6.8.8', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
-  devDependencies: { '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
+  devDependencies: { '@types/node': '24.10.1', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
 
@@ -158,9 +158,10 @@ test('architecture rejects unreviewed toolchains and dependency resolution subst
 });
 
 test('approved profile-specific development tools keep their reviewed declaration', () => {
+  const { '@types/node': _campaignOnly, ...sharedDevDependencies } = campaign().devDependencies;
   const manifest = {
     name: '@ten98/ui', type: 'module', engines: { node: '>=24.0.0 <25' },
-    devDependencies: { ...campaign().devDependencies, '@playwright/test': '^1.64.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.7.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.7.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };
