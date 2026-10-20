@@ -53,17 +53,8 @@
           "server",
           "shared"
         ],
-        "legacyJavaScript": [
-          "server/cli.mjs",
-          "server/index.mjs",
-          "server/integrations.mjs"
-        ],
+        "legacyJavaScript": [],
         "generated": {},
-        "migration": {
-          "owner": "Campaign app owner",
-          "issue": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/14",
-          "status": "3 retained server entry modules (cli, index, integrations) remain untyped; every other server and shared module is checked TypeScript. Remove exact exceptions with checked TypeScript adoption."
-        },
         "artifactDirectories": [
           ".git",
           "node_modules",
