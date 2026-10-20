@@ -39,6 +39,13 @@
         "test",
         "build"
       ],
+      "presentation": {
+        "owner": "@ten98/ui",
+        "roots": [
+          "src"
+        ],
+        "baseline": "presentation-baseline.json"
+      },
       "sourceLanguage": {
         "default": "typescript",
         "roots": [
@@ -180,6 +187,13 @@
         "test",
         "build"
       ],
+      "presentation": {
+        "owner": "@ten98/ui",
+        "roots": [
+          "src"
+        ],
+        "baseline": "presentation-baseline.json"
+      },
       "sourceLanguage": {
         "default": "typescript",
         "roots": [

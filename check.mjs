@@ -1,8 +1,9 @@
 import { inspectDatabasePolicy } from './database-policy.mjs';
-import { readFileSync, realpathSync, existsSync, readdirSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, realpathSync, existsSync, readdirSync, lstatSync } from 'node:fs';
 import { resolve, relative, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const contract = JSON.parse(readFileSync(new URL('./architecture.json', import.meta.url), 'utf8'));
@@ -145,6 +146,93 @@ export function checkSourceLanguage(directory, name) {
   return errors;
 }
 
+const CREATE_ELEMENT = new Set(['createElement', 'jsx', 'jsxs', '_jsx']);
+const UI_SOURCE = /^@ten98\/ui(?:\/app)?$/u;
+
+// Counts presentation violations per file and rule. Dynamic JSX spreads are a known limit: only
+// object-literal spreads are inspected, so a spread variable can still carry className/style.
+function presentationCounts(directory, policy, parseAst) {
+  const counts = {}, errors = [], files = [];
+  const add = (name, rule) => { counts[name] ??= {}; counts[name][rule] = (counts[name][rule] ?? 0) + 1; };
+  const rootOf = node => node.type === 'JSXMemberExpression' ? rootOf(node.object) : node.name;
+  const walk = folder => {
+    if (!existsSync(folder)) { errors.push(`Required presentation root missing: ${relative(directory, folder)}`); return; }
+    for (const entry of readdirSync(folder, { withFileTypes: true })) {
+      const file = resolve(folder, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else if (entry.isFile() && /\.[jt]sx$/u.test(entry.name)) files.push(file);
+    }
+  };
+  for (const root of policy.roots) walk(resolve(directory, root));
+  for (const file of files) {
+    const name = relative(directory, file).replaceAll('\\', '/');
+    let program;
+    try { program = parseAst(readFileSync(file, 'utf8'), { lang: name.endsWith('tsx') ? 'tsx' : 'jsx' }); }
+    catch (error) { errors.push(`${name}: cannot parse for the presentation check: ${error.message}`); continue; }
+    const uiNamespaces = new Set();
+    for (const node of program.body) {
+      if (node.type !== 'ImportDeclaration') continue;
+      const source = node.source.value;
+      if (/\.(?:css|scss|sass|less)$/u.test(source) && !source.startsWith('@ten98/ui')) add(name, 'stylesheet');
+      if (UI_SOURCE.test(source)) for (const specifier of node.specifiers) if (specifier.type !== 'ImportSpecifier') uiNamespaces.add(specifier.local.name);
+    }
+    const visit = node => {
+      if (Array.isArray(node)) return node.forEach(visit);
+      if (!node || typeof node.type !== 'string') return;
+      if (node.type === 'JSXOpeningElement') {
+        const tag = node.name;
+        if (tag.type === 'JSXIdentifier' ? /^[a-z]/u.test(tag.name) : tag.type === 'JSXMemberExpression' && !uiNamespaces.has(rootOf(tag))) add(name, 'element');
+      } else if (node.type === 'JSXAttribute') {
+        if (node.name.name === 'className' || node.name.name === 'style') add(name, 'styling');
+        if (node.name.name === 'dangerouslySetInnerHTML') add(name, 'inner-html');
+      } else if (node.type === 'JSXSpreadAttribute') {
+        if (node.argument.type === 'ObjectExpression' && node.argument.properties.some(property => ['className', 'style'].includes(property.key?.name ?? property.key?.value))) add(name, 'styling');
+      } else if (node.type === 'CallExpression' && typeof node.arguments[0]?.value === 'string' && node.arguments[0].type === 'Literal') {
+        const callee = node.callee;
+        if (callee.type === 'Identifier' ? CREATE_ELEMENT.has(callee.name) : callee.type === 'MemberExpression' && callee.object.name === 'React' && callee.property.name === 'createElement') add(name, 'create-element');
+      }
+      for (const value of Object.values(node)) if (value && typeof value === 'object') visit(value);
+    };
+    visit(program.body);
+  }
+  return { counts, errors };
+}
+
+function resolveParseAst(directory) {
+  try { return createRequire(resolve(directory, 'package.json'))('rolldown/parseAst').parseAst; }
+  catch { return undefined; }
+}
+
+// Ratchet: a file may not exceed its baseline count for any rule; unlisted files and rules allow 0.
+// parseAst is injectable for tests; the CLI always resolves it from the consumer and fails closed.
+export function checkPresentation(directory, name, { parseAst = resolveParseAst(directory) } = {}) {
+  const policy = contract.profiles[name]?.presentation;
+  if (!policy) return [];
+  if (typeof parseAst !== 'function') return ['Cannot resolve rolldown/parseAst from the consumer; install the pinned build tooling to check presentation ownership.'];
+  directory = resolve(directory);
+  const { counts, errors } = presentationCounts(directory, policy, parseAst);
+  const file = policy.baseline && resolve(directory, policy.baseline);
+  const baseline = file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+  for (const [path, rules] of Object.entries(counts)) {
+    for (const [rule, found] of Object.entries(rules)) {
+      const allowed = baseline[path]?.[rule] ?? 0;
+      if (found > allowed) errors.push(`${path}: ${rule} ${found} exceeds baseline ${allowed} (presentation is owned by ${policy.owner}).`);
+    }
+  }
+  return errors;
+}
+
+// Only lowers or removes entries: any rise or new violation refuses and reports the errors instead.
+export function updatePresentationBaseline(directory, name, options = {}) {
+  const policy = contract.profiles[name]?.presentation;
+  if (!policy?.baseline) return [];
+  const errors = checkPresentation(directory, name, options);
+  if (errors.length) return errors;
+  const { counts } = presentationCounts(resolve(directory), policy, options.parseAst ?? resolveParseAst(directory));
+  writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1)), null, 2)}\n`);
+  return [];
+}
+
 // Release mode is separate from ordinary architecture checks and reads committed evidence.
 export function collectReleaseIdentity(directory, { tag, commit, tagObject, archive, archiveSha256, event } = {}) {
   directory = resolve(directory);
@@ -210,16 +298,18 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
   const runtimeErrors = checkRuntimeVersion();
   for (const error of runtimeErrors) console.error(error);
   let failures = runtimeErrors.length;
-  const args = process.argv.slice(2), release = args[0] === '--release';
+  const flag = '--update-presentation-baseline', args = process.argv.slice(2), release = args[0] === '--release', update = !release && args.includes(flag);
+  const directories = args.filter(arg => arg !== flag);
   if (!failures && release) {
     try { console.log(JSON.stringify(releaseArguments(args.slice(1)), null, 2)); }
     catch (error) { failures++; console.error(error.message); }
   }
-  for (const directory of runtimeErrors.length || release ? [] : args.length ? args : ['.']) {
+  for (const directory of runtimeErrors.length || release ? [] : directories.length ? directories : ['.']) {
     try {
       const manifest = JSON.parse(readFileSync(resolve(directory, 'package.json'), 'utf8'));
       const errors = checkManifest(manifest);
       if (!errors.length) errors.push(...checkSourceLanguage(directory, manifest.name));
+      if (!errors.length) errors.push(...(update ? updatePresentationBaseline : checkPresentation)(directory, manifest.name));
       for (const error of errors) console.error(`${directory}: ${error}`);
       failures += errors.length;
       if (!errors.length) console.log(`${directory}: architecture declarations match ${manifest.name}.`);
