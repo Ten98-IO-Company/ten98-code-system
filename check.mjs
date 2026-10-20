@@ -181,7 +181,7 @@ function presentationCounts(directory, policy, parseAst) {
       if (!node || typeof node.type !== 'string') return;
       if (node.type === 'JSXOpeningElement') {
         const tag = node.name;
-        if (tag.type === 'JSXIdentifier' ? /^[a-z]/u.test(tag.name) : tag.type === 'JSXMemberExpression' && !uiNamespaces.has(rootOf(tag))) add(name, 'element');
+        if (tag.type === 'JSXIdentifier' ? /^[a-z]/u.test(tag.name) : tag.type === 'JSXNamespacedName' || !uiNamespaces.has(rootOf(tag))) add(name, 'element');
       } else if (node.type === 'JSXAttribute') {
         if (node.name.name === 'className' || node.name.name === 'style') add(name, 'styling');
         if (node.name.name === 'dangerouslySetInnerHTML') add(name, 'inner-html');
@@ -223,12 +223,17 @@ export function checkPresentation(directory, name, { parseAst = resolveParseAst(
 }
 
 // Only lowers or removes entries: any rise or new violation refuses and reports the errors instead.
+// A missing baseline is recorded once from current counts; that first file is reviewed in the app's diff.
 export function updatePresentationBaseline(directory, name, options = {}) {
   const policy = contract.profiles[name]?.presentation;
   if (!policy?.baseline) return [];
-  const errors = checkPresentation(directory, name, options);
+  const parseAst = options.parseAst ?? resolveParseAst(directory);
+  if (existsSync(resolve(directory, policy.baseline)) || typeof parseAst !== 'function') {
+    const errors = checkPresentation(directory, name, { parseAst });
+    if (errors.length) return errors;
+  }
+  const { counts, errors } = presentationCounts(resolve(directory), policy, parseAst);
   if (errors.length) return errors;
-  const { counts } = presentationCounts(resolve(directory), policy, options.parseAst ?? resolveParseAst(directory));
   writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1)), null, 2)}\n`);
   return [];
 }

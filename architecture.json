@@ -74,7 +74,6 @@
           "server/native-microsoft-ads.mjs",
           "server/ooh.mjs",
           "server/operation-recovery.mjs",
-          "server/seed.mjs",
           "server/sms-inbox.mjs",
           "server/webhooks.mjs",
           "server/zernio-accounts.mjs",
@@ -93,15 +92,13 @@
           "server/zernio-queues.mjs",
           "server/zernio-recycling.mjs",
           "server/zernio-webhook-settings.mjs",
-          "server/zernio-whatsapp-templates.mjs",
-          "shared/post-schedule.mjs",
-          "shared/social-posts.mjs"
+          "server/zernio-whatsapp-templates.mjs"
         ],
         "generated": {},
         "migration": {
           "owner": "Campaign app owner",
           "issue": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/14",
-          "status": "42 retained JavaScript modules remain untyped (server and shared). The instance-operator transaction adapter is not yet adopted; it lands as checked TypeScript. Remove exact exceptions with checked TypeScript adoption."
+          "status": "39 retained server JavaScript modules remain untyped after the shared, seed and schedule TypeScript conversion. The instance-operator transaction adapter is not yet adopted; it lands as checked TypeScript. Remove exact exceptions with checked TypeScript adoption."
         },
         "artifactDirectories": [
           ".git",

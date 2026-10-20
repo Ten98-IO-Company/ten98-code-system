@@ -68,6 +68,16 @@ test('update mode lowers counts, removes cleared entries and refuses to raise th
   });
 });
 
+test('update mode records a missing baseline once from current counts', needsParser, () => consumer(['element-twice.tsx', 'pass.tsx'], undefined, root => {
+  assert.deepEqual(updatePresentationBaseline(root, profile, { parseAst }), []);
+  assert.deepEqual(JSON.parse(readFileSync(join(root, baselineName), 'utf8')), { 'src/element-twice.tsx': { element: 2 } });
+  assert.deepEqual(check(root), []);
+}));
+
+test('namespaced JSX tags are raw elements', needsParser, () => consumer(['namespaced.tsx'], undefined, root => {
+  assert.deepEqual(check(root), ['src/namespaced.tsx: element 1 exceeds baseline 0 (presentation is owned by @ten98/ui).']);
+}));
+
 test('presentation checking fails closed when the consumer cannot resolve rolldown', () => consumer(['pass.tsx'], undefined, root => {
   assert.match(checkPresentation(root, profile).join('\n'), /Cannot resolve rolldown\/parseAst/);
 }));
