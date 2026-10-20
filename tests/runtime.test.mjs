@@ -131,3 +131,15 @@ test('OIDC URLs reject insecure or ambiguous endpoints and issuer queries', () =
   for (const raw of ['http://identity.example', 'ftp://identity.example', 'https://user:password@identity.example', 'https://identity.example/#', 'https://identity.example/#fragment', '/relative']) assert.throws(() => oidcEndpoint(raw), TypeError);
   for (const raw of ['https://identity.example/?', 'https://identity.example/?tenant=1']) assert.throws(() => oidcEndpoint(raw, { issuer: true }), TypeError);
 });
+
+// Preserve untyped callers' validation and provider response ownership after TS emission.
+test('generated runtime retains missing-limit validation, unknown roles and response status', async () => {
+  for (const options of [undefined, {}, { maxBytes: NaN }, { maxBytes: Infinity }, { maxBytes: '1' }, { maxBytes: 1.5 }]) {
+    await assert.rejects(readResponseText(new Response('x'), options), TypeError);
+  }
+  for (const role of [null, {}, [], true, Symbol('viewer'), NaN]) assert.equal(mayGrantWorkspaceRole('owner', role), false);
+  const response = new Response('rate limited', { status: 429, headers: { 'retry-after': '7' } });
+  assert.equal(await openRouterFetch('/key', {}, async () => response), response);
+  assert.equal(response.status, 429); assert.equal(response.headers.get('retry-after'), '7');
+  assert.equal(await response.text(), 'rate limited');
+});

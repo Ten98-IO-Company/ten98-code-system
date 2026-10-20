@@ -9,18 +9,128 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/ui": "file:vendor/ten98-ui-0.3.19.tgz",
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.3.tgz"
+    "@ten98/ui": "file:vendor/ten98-ui-0.3.20.tgz",
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.5.tgz"
   },
   "profiles": {
     "ten98-campaign": {
       "boundary": "Node HTTP, SQLite and openid-client; application owns sessions, authorization and paid-work accounting.",
-      "dependencies": { "openid-client": "6.8.8", "qrcode-generator": "2.0.4" },
+      "dependencies": {
+        "openid-client": "6.8.8",
+        "qrcode-generator": "2.0.4"
+      },
       "devDependencies": {},
-      "sharedDependencies": ["react", "react-dom", "@ten98/ui", "@ten98/runtime"],
-      "sharedDevDependencies": ["typescript", "vite", "@types/react", "@types/react-dom"],
+      "sharedDependencies": [
+        "react",
+        "react-dom",
+        "@ten98/ui",
+        "@ten98/runtime"
+      ],
+      "sharedDevDependencies": [
+        "typescript",
+        "vite",
+        "@types/react",
+        "@types/react-dom"
+      ],
       "peerDependencies": {},
-      "checkScripts": ["test", "build"]
+      "checkScripts": [
+        "test",
+        "build"
+      ],
+      "sourceLanguage": {
+        "default": "typescript",
+        "roots": [
+          "src",
+          "server",
+          "shared"
+        ],
+        "legacyJavaScript": [
+          "server/agent.mjs",
+          "server/approvals.mjs",
+          "server/auth.mjs",
+          "server/calendar.mjs",
+          "server/cli.mjs",
+          "server/contacts.mjs",
+          "server/database.mjs",
+          "server/direct-campaigns.mjs",
+          "server/direct-providers.mjs",
+          "server/google-ads.mjs",
+          "server/inbox.mjs",
+          "server/index.mjs",
+          "server/instance-operators.mjs",
+          "server/integration-settings.mjs",
+          "server/integrations.mjs",
+          "server/invitations.mjs",
+          "server/links.mjs",
+          "server/native-google-ads.mjs",
+          "server/native-microsoft-ads.mjs",
+          "server/ooh.mjs",
+          "server/operation-recovery.mjs",
+          "server/sms-inbox.mjs",
+          "server/webhooks.mjs",
+          "server/zernio-accounts.mjs",
+          "server/zernio-ad-events.mjs",
+          "server/zernio-admin.mjs",
+          "server/zernio-blogs.mjs",
+          "server/zernio-connections.mjs",
+          "server/zernio-contacts.mjs",
+          "server/zernio-google-conversions.mjs",
+          "server/zernio-insights.mjs",
+          "server/zernio-leads.mjs",
+          "server/zernio-measurement.mjs",
+          "server/zernio-media.mjs",
+          "server/zernio-products.mjs",
+          "server/zernio-publishing.mjs",
+          "server/zernio-queues.mjs",
+          "server/zernio-recycling.mjs",
+          "server/zernio-webhook-settings.mjs",
+          "server/zernio-whatsapp-templates.mjs",
+          "shared/social-posts.mjs"
+        ],
+        "generated": {},
+        "migration": {
+          "owner": "Campaign app owner",
+          "issue": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/14",
+          "status": "41 retained JavaScript modules remain untyped after the qualified seed/schedule TypeScript slice, including the foundation instance-operator transaction adapter; remove exact exceptions with checked TypeScript adoption."
+        },
+        "artifactDirectories": [
+          ".git",
+          "node_modules",
+          "vendor",
+          "dist",
+          "site-dist",
+          "private",
+          "work",
+          "data",
+          ".cache",
+          ".qa",
+          ".integration",
+          ".output",
+          ".nitro",
+          ".wrangler",
+          "test-results",
+          "playwright-report",
+          "coverage",
+          ".codex",
+          ".agents",
+          ".claude",
+          ".aws",
+          ".tmp"
+        ],
+        "nativeFiles": {
+          "vite.config.mjs": "Native Vite configuration",
+          "public/theme.js": "Classic early theme initialization; retained authored browser JavaScript gap, Campaign owner, issue14",
+          "scripts/check-container.mjs": "Native container smoke runner",
+          "scripts/dev.mjs": "Native development process runner"
+        },
+        "testDirectories": [
+          "tests"
+        ],
+        "compilerProjects": [
+          "tsconfig.json",
+          "tsconfig.backend.json"
+        ]
+      }
     },
     "ten98-monitor": {
       "boundary": "TanStack Start and Nitro, PostgreSQL, Drizzle and Better Auth; application owns sessions, workspace authorization and provider ledger.",
@@ -40,29 +150,243 @@
         "ua-parser-js": "1.0.41",
         "zod": "4.5.4"
       },
-      "devDependencies": {"@types/node": "24.10.1", "@types/pg": "8.15.6", "@types/ua-parser-js": "0.7.39", "@vitejs/plugin-react": "6.1.1", "nitro": "3.0.260903-beta"},
-      "sharedDependencies": ["react", "react-dom", "@ten98/ui", "@ten98/runtime"],
-      "sharedDevDependencies": ["typescript", "vite", "@types/react", "@types/react-dom"],
+      "devDependencies": {
+        "@types/node": "24.10.1",
+        "@types/pg": "8.15.6",
+        "@types/ua-parser-js": "0.7.39",
+        "@vitejs/plugin-react": "6.1.1",
+        "nitro": "3.0.260903-beta"
+      },
+      "sharedDependencies": [
+        "react",
+        "react-dom",
+        "@ten98/ui",
+        "@ten98/runtime"
+      ],
+      "sharedDevDependencies": [
+        "typescript",
+        "vite",
+        "@types/react",
+        "@types/react-dom"
+      ],
       "peerDependencies": {},
-      "checkScripts": ["test", "build"]
+      "checkScripts": [
+        "test",
+        "build"
+      ],
+      "sourceLanguage": {
+        "default": "typescript",
+        "roots": [
+          "src"
+        ],
+        "legacyJavaScript": [],
+        "generated": {
+          "src/routeTree.gen.ts": "This file was automatically generated by TanStack Router."
+        },
+        "artifactDirectories": [
+          ".git",
+          "node_modules",
+          "vendor",
+          "dist",
+          "site-dist",
+          "private",
+          "work",
+          "data",
+          ".cache",
+          ".qa",
+          ".integration",
+          ".output",
+          ".nitro",
+          ".wrangler",
+          "test-results",
+          "playwright-report",
+          "coverage",
+          ".codex",
+          ".agents",
+          ".claude",
+          ".aws",
+          ".tmp"
+        ],
+        "nativeFiles": {
+          "vite.config.ts": "Native Vite configuration",
+          "public/destinations.js": "Retained standalone browser adapter; Discover owner, issue14",
+          "public/performance.js": "Retained browser instrumentation; Discover owner, issue14",
+          "public/replay.js": "Standalone replay instrumentation with upstream payload/notices; Discover owner, issue14",
+          "public/tracker.js": "Standalone tracking instrumentation; Discover owner, issue14",
+          "scripts/analytics-geo.mjs": "Native geolocation maintenance tool",
+          "scripts/check-plan.mjs": "Native repository plan check",
+          "scripts/docker-setup.mjs": "Native Docker setup tool"
+        },
+        "testDirectories": [
+          "tests"
+        ],
+        "compilerProjects": [
+          "tsconfig.json"
+        ]
+      }
     },
     "@ten98/ui": {
       "boundary": "React presentation only; routing, authentication, persistence and provider controllers remain in applications.",
       "dependencies": {},
-      "devDependencies": {"@playwright/test": "^1.64.1"},
+      "devDependencies": {
+        "@playwright/test": "^1.64.1"
+      },
       "sharedDependencies": [],
-      "sharedDevDependencies": ["react", "react-dom", "typescript", "vite", "@types/react", "@types/react-dom", "@ten98/runtime"],
-      "peerDependencies": { "react": "^18.3.0 || ^19.0.0", "react-dom": "^18.3.0 || ^19.0.0" },
-      "checkScripts": ["test", "build"]
+      "sharedDevDependencies": [
+        "react",
+        "react-dom",
+        "typescript",
+        "vite",
+        "@types/react",
+        "@types/react-dom",
+        "@ten98/runtime"
+      ],
+      "peerDependencies": {
+        "react": "^18.3.0 || ^19.0.0",
+        "react-dom": "^18.3.0 || ^19.0.0"
+      },
+      "checkScripts": [
+        "test",
+        "build"
+      ],
+      "sourceLanguage": {
+        "default": "typescript",
+        "roots": [
+          "src"
+        ],
+        "legacyJavaScript": [],
+        "generated": {},
+        "artifactDirectories": [
+          ".git",
+          "node_modules",
+          "vendor",
+          "dist",
+          "site-dist",
+          "private",
+          "work",
+          "data",
+          ".cache",
+          ".qa",
+          ".integration",
+          ".output",
+          ".nitro",
+          ".wrangler",
+          "test-results",
+          "playwright-report",
+          "coverage",
+          ".codex",
+          ".agents",
+          ".claude",
+          ".aws",
+          ".tmp"
+        ],
+        "nativeFiles": {
+          "vite.config.ts": "Native Vite configuration",
+          "playwright.config.ts": "Native browser test configuration",
+          "scripts/build.mjs": "Native library distribution builder",
+          "scripts/serve-browser.mjs": "Native browser fixture server"
+        },
+        "testDirectories": [
+          "tests"
+        ],
+        "compilerProjects": [
+          "tsconfig.json"
+        ]
+      }
     },
     "@ten98/runtime": {
       "boundary": "Node standard library and web platform primitives only; no framework, database, session controller or provider accounting.",
       "dependencies": {},
       "devDependencies": {},
       "sharedDependencies": [],
-      "sharedDevDependencies": [],
+      "sharedDevDependencies": [
+        "typescript"
+      ],
       "peerDependencies": {},
-      "checkScripts": ["test"]
+      "checkScripts": [
+        "test",
+        "build",
+        "typecheck"
+      ],
+      "sourceBoundary": "Runtime API is authored in src/index.mts and strictly compiler checked; root index.mjs and index.d.mts are generated public entrypoints. Canonical checker and native tests remain an explicit authored JavaScript migration gap owned by the code-system integrator in issue14.",
+      "sourceLanguage": {
+        "default": "typescript",
+        "roots": [
+          "src"
+        ],
+        "legacyJavaScript": [],
+        "generated": {},
+        "artifactDirectories": [
+          ".git",
+          "node_modules",
+          "vendor"
+        ],
+        "testDirectories": [
+          "tests"
+        ],
+        "nativeFiles": {
+          "index.mjs": "Generated public runtime executable from src/index.mts; build before test and pack.",
+          "index.d.mts": "Generated public declarations from src/index.mts.",
+          "check.mjs": "Retained canonical native checker; authored JavaScript migration gap, code-system integrator, issue14."
+        },
+        "compilerProjects": [
+          "tsconfig.json"
+        ]
+      }
+    },
+    "ten98-io": {
+      "boundary": "Native Cloudflare Worker and static HTML with D1, email and platform security bindings. Shared CSS and architecture/compiler tools are build-only; no Node application runtime or authenticated-app migration.",
+      "dependencies": {},
+      "devDependencies": {
+        "wrangler": "4.145.0",
+        "@types/node": "24.10.1"
+      },
+      "sharedDependencies": [],
+      "sharedDevDependencies": [
+        "typescript",
+        "@ten98/ui",
+        "@ten98/runtime",
+        "react",
+        "react-dom"
+      ],
+      "peerDependencies": {},
+      "checkScripts": [
+        "build",
+        "check",
+        "test"
+      ],
+      "sourceBoundary": "New build/token tooling and its tests use checked TypeScript. Existing Worker, browser scripts and native checks remain explicit JavaScript boundaries with behavioral tests, not semantic TypeScript coverage. Dependency placement checks do not inspect Node/auth imports inside retained JavaScript.",
+      "sourceLanguage": {
+        "default": "typescript",
+        "roots": [
+          "src",
+          "public",
+          "scripts"
+        ],
+        "legacyJavaScript": [
+          "src/worker.js",
+          "public/enquiry.js",
+          "public/tracking-preferences.js",
+          "scripts/check.mjs",
+          "scripts/check-self-test.mjs",
+          "scripts/enquiry-test.mjs",
+          "scripts/turnstile-frontend-test.mjs",
+          "scripts/tracking-preferences-test.mjs"
+        ],
+        "generated": {},
+        "artifactDirectories": [
+          ".git",
+          "node_modules",
+          "vendor",
+          ".wrangler",
+          "site-dist"
+        ],
+        "testDirectories": [],
+        "nativeFiles": {},
+        "compilerProjects": [
+          "tsconfig.tooling.json"
+        ]
+      }
     }
   }
 }
