@@ -10,7 +10,7 @@
   },
   "sharedPackages": {
     "@ten98/ui": "file:vendor/ten98-ui-0.3.22.tgz",
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.7.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.8.tgz"
   },
   "profiles": {
     "ten98-campaign": {
@@ -19,7 +19,9 @@
         "openid-client": "6.8.8",
         "qrcode-generator": "2.0.4"
       },
-      "devDependencies": {},
+      "devDependencies": {
+        "@types/node": "24.10.1"
+      },
       "sharedDependencies": [
         "react",
         "react-dom",
@@ -37,6 +39,13 @@
         "test",
         "build"
       ],
+      "presentation": {
+        "owner": "@ten98/ui",
+        "roots": [
+          "src"
+        ],
+        "baseline": "presentation-baseline.json"
+      },
       "sourceLanguage": {
         "default": "typescript",
         "roots": [
@@ -57,7 +66,6 @@
           "server/google-ads.mjs",
           "server/inbox.mjs",
           "server/index.mjs",
-          "server/instance-operators.mjs",
           "server/integration-settings.mjs",
           "server/integrations.mjs",
           "server/invitations.mjs",
@@ -84,14 +92,13 @@
           "server/zernio-queues.mjs",
           "server/zernio-recycling.mjs",
           "server/zernio-webhook-settings.mjs",
-          "server/zernio-whatsapp-templates.mjs",
-          "shared/social-posts.mjs"
+          "server/zernio-whatsapp-templates.mjs"
         ],
         "generated": {},
         "migration": {
           "owner": "Campaign app owner",
           "issue": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/14",
-          "status": "41 retained JavaScript modules remain untyped after the qualified seed/schedule TypeScript slice, including the foundation instance-operator transaction adapter; remove exact exceptions with checked TypeScript adoption."
+          "status": "39 retained server JavaScript modules remain untyped after the shared, seed and schedule TypeScript conversion. The instance-operator transaction adapter is not yet adopted; it lands as checked TypeScript. Remove exact exceptions with checked TypeScript adoption."
         },
         "artifactDirectories": [
           ".git",
@@ -177,6 +184,13 @@
         "test",
         "build"
       ],
+      "presentation": {
+        "owner": "@ten98/ui",
+        "roots": [
+          "src"
+        ],
+        "baseline": "presentation-baseline.json"
+      },
       "sourceLanguage": {
         "default": "typescript",
         "roots": [
@@ -329,7 +343,8 @@
         "artifactDirectories": [
           ".git",
           "node_modules",
-          "vendor"
+          "vendor",
+          "work"
         ],
         "testDirectories": [
           "tests"
