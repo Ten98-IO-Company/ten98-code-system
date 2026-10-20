@@ -81,7 +81,8 @@
         "openRouterFetch",
         "oidcEndpoint",
         "workspaceRoles",
-        "mayGrantWorkspaceRole"
+        "mayGrantWorkspaceRole",
+        "mayManageWorkspaceMember"
       ],
       "tests": [
         "tests/runtime.test.mjs"
