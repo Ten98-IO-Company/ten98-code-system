@@ -198,9 +198,13 @@ function presentationCounts(directory, policy, parseAst) {
   return { counts, errors };
 }
 
+// rolldown arrives through the pinned vite; strict layouts (pnpm) expose it only from vite's own scope.
 function resolveParseAst(directory) {
-  try { return createRequire(resolve(directory, 'package.json'))('rolldown/parseAst').parseAst; }
-  catch { return undefined; }
+  const consumer = createRequire(resolve(directory, 'package.json'));
+  for (const load of [() => consumer('rolldown/parseAst'), () => createRequire(consumer.resolve('vite/package.json'))('rolldown/parseAst')]) {
+    try { return load().parseAst; } catch { /* try the next scope */ }
+  }
+  return undefined;
 }
 
 // Ratchet: a file may not exceed its baseline count for any rule; unlisted files and rules allow 0.

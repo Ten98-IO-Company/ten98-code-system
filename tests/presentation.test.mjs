@@ -78,6 +78,17 @@ test('namespaced JSX tags are raw elements', needsParser, () => consumer(['names
   assert.deepEqual(check(root), ['src/namespaced.tsx: element 1 exceeds baseline 0 (presentation is owned by @ten98/ui).']);
 }));
 
+test('rolldown is resolved through vite when a strict layout keeps it out of the consumer scope', () => consumer(['pass.tsx'], undefined, root => {
+  // pnpm layout: the consumer sees only vite; rolldown is reachable from vite's own node_modules.
+  const rolldown = join(root, 'node_modules', 'vite', 'node_modules', 'rolldown');
+  mkdirSync(rolldown, { recursive: true });
+  writeFileSync(join(root, 'package.json'), '{"name":"fixture"}');
+  writeFileSync(join(root, 'node_modules', 'vite', 'package.json'), '{"name":"vite","version":"8.3.4"}');
+  writeFileSync(join(rolldown, 'package.json'), '{"name":"rolldown","exports":{"./parseAst":"./parse-ast.cjs"}}');
+  writeFileSync(join(rolldown, 'parse-ast.cjs'), "exports.parseAst = () => ({ type: 'Program', body: [] });");
+  assert.deepEqual(checkPresentation(root, profile), []);
+}));
+
 test('presentation checking fails closed when the consumer cannot resolve rolldown', () => consumer(['pass.tsx'], undefined, root => {
   assert.match(checkPresentation(root, profile).join('\n'), /Cannot resolve rolldown\/parseAst/);
 }));
