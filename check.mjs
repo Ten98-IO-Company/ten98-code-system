@@ -1,3 +1,4 @@
+import { inspectDatabasePolicy } from './database-policy.mjs';
 import { readFileSync, realpathSync, existsSync, readdirSync, lstatSync } from 'node:fs';
 import { resolve, relative, basename } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -29,7 +30,7 @@ function hasRequiredGate(script) {
 
 // This checks declared dependencies and build gates, not application security or behavior.
 export function checkManifest(manifest) {
-  const errors = [], profile = Object.hasOwn(contract.profiles, manifest.name) ? contract.profiles[manifest.name] : undefined;
+  const errors = inspectDatabasePolicy(contract.databasePolicy, contract.profiles), profile = Object.hasOwn(contract.profiles, manifest.name) ? contract.profiles[manifest.name] : undefined;
   if (!profile) return [`Unknown architecture profile: ${manifest.name ?? '(missing name)'}. Update architecture.json after review.`];
   const shared = { ...contract.sharedVersions, ...contract.sharedPackages };
   const same = (actual, expected, label) => { if (actual !== expected) errors.push(`${label}: expected ${expected}, found ${actual ?? '(missing)'}.`); };

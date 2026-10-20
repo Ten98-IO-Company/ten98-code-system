@@ -23,6 +23,7 @@ test('actual compiler rejects an implementation type error and preserves last go
     writeFileSync(join(temporary, 'tsconfig.json'), readFileSync(new URL('../tsconfig.json', import.meta.url)));
     const implementation = join(temporary, 'src/index.mts');
     writeFileSync(implementation, source);
+    writeFileSync(join(temporary, 'src/database-policy.mts'), readFileSync(new URL('../src/database-policy.mts', import.meta.url)));
     let result = compile(); assert.equal(result.status, 0, result.stdout + result.stderr);
     const outputs = ['index.mjs', 'index.d.mts'].map(name => join(temporary, name));
     const before = outputs.map(hash);

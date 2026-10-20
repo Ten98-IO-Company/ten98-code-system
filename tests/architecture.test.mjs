@@ -6,6 +6,76 @@ import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { checkManifest, checkRuntimeVersion, inspectSourcePolicy } from '../check.mjs';
+import { inspectDatabasePolicy } from '../database-policy.mjs';
+
+const databaseFixture = () => ({
+  policy: { default: 'sqlite', integration: 'drizzle', stateless: 'none',
+    exceptions: { native: { engine: 'd1', profiles: ['site'], purpose: 'native-platform-binding', requirement: 'Native D1 binding', review: 'issue7' } },
+    transitions: { existing: { profile: 'existing', engine: 'postgresql', target: 'sqlite', reason: 'Preserve installed data pending verified parity', review: 'issue7' } } },
+  profiles: { app: { database: { engine: 'sqlite' } }, library: { database: { engine: 'none' } },
+    site: { database: { engine: 'd1', exception: 'native' } }, existing: { database: { engine: 'postgresql', transition: 'existing' } } },
+});
+
+test('canonical database default is SQLite with Drizzle and no database in stateless packages', () => {
+  const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
+  assert.equal(contract.databasePolicy.default, 'sqlite');
+  assert.equal(contract.databasePolicy.integration, 'drizzle');
+  assert.equal(contract.profiles['@ten98/runtime'].database.engine, 'none');
+  assert.equal(contract.profiles['@ten98/ui'].database.engine, 'none');
+  assert.deepEqual(inspectDatabasePolicy(contract.databasePolicy, contract.profiles), []);
+  const { policy, profiles } = databaseFixture();
+  assert.deepEqual(inspectDatabasePolicy(policy, profiles), []);
+});
+
+test('database choices need explicit declarations and centrally reviewed exceptions', () => {
+  for (const mutate of [
+    f => { f.policy.default = 'postgresql'; },
+    f => { delete f.profiles.app.database; },
+    f => { f.profiles.app.database = { engine: 'postgresql' }; },
+    f => { f.profiles.app.database = { engine: 'postgresql', exception: 'not-recorded' }; },
+    f => { f.profiles.app.database = { engine: 'd1', exception: 'native' }; },
+    f => { f.policy.exceptions.native.purpose = 'vector-storage'; },
+    f => { f.policy.exceptions.native.purpose = ['approved-requirement']; },
+    f => { f.policy.exceptions.native.requirement = ''; },
+    f => { f.policy.exceptions.native.review = ''; },
+    f => { f.policy.transitions.existing.target = 'postgresql'; },
+    f => { f.policy.transitions.existing.reason = ''; },
+    f => { f.profiles.library.database = { engine: 'none', exception: 'native' }; },
+    f => { f.profiles.app.database = []; },
+  ]) {
+    const fixture = databaseFixture(); mutate(fixture);
+    assert.ok(inspectDatabasePolicy(fixture.policy, fixture.profiles).length > 0);
+  }
+  assert.ok(inspectDatabasePolicy(null, null).length > 0);
+});
+
+test('canonical checker CLI enforces database policy before accepting a reviewed manifest', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ten98-database-policy-'));
+  try {
+    const checkerFolder = join(directory, 'checker-fixture');
+    mkdirSync(checkerFolder, { recursive: true });
+    for (const name of ['check.mjs', 'database-policy.mjs']) writeFileSync(join(checkerFolder, name), readFileSync(new URL('../' + name, import.meta.url)));
+    const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
+    contract.profiles['fixture-stateful'] = { dependencies: {}, devDependencies: {}, sharedDependencies: [], sharedDevDependencies: [], peerDependencies: {}, checkScripts: ['test'], database: { engine: 'sqlite' } };
+    const manifest = { name: 'fixture-stateful', type: 'module', engines: { node: '>=24.0.0 <25' },
+      scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test' } };
+    writeFileSync(join(directory, 'package.json'), JSON.stringify(manifest));
+    const run = () => {
+      writeFileSync(join(checkerFolder, 'architecture.json'), JSON.stringify(contract));
+      const result = spawnSync(process.execPath, [join(checkerFolder, 'check.mjs'), directory], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+      assert.ifError(result.error);
+      return result;
+    };
+    assert.equal(run().status, 0);
+    contract.profiles['fixture-stateful'].database = { engine: 'postgresql' };
+    const denied = run();
+    assert.equal(denied.status, 1);
+    assert.match(denied.stderr, /nondefault engine postgresql needs/);
+    contract.profiles['fixture-stateful'].database = { engine: 'sqlite' };
+    contract.databasePolicy.default = 'postgresql';
+    assert.equal(run().status, 1);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
 
 test('running Node must satisfy the canonical range, not just manifest declarations', () => {
   for (const version of ['24.0.0', '24.19.0', '24.999.999']) assert.deepEqual(checkRuntimeVersion(version), []);
@@ -16,7 +86,7 @@ test('running Node must satisfy the canonical range, not just manifest declarati
 // Independent fixture: do not derive the expected application from architecture.json.
 const campaign = () => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.0.0 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.3.20.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.5.tgz', 'openid-client': '6.8.8', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.3.21.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.6.tgz', 'openid-client': '6.8.8', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
@@ -30,7 +100,7 @@ test('architecture accepts independent manifests with reviewed tools and mandato
 test('native static site uses shared build tools without application runtime dependencies', () => {
   const site = () => ({
     name: 'ten98-io', type: 'module', engines: { node: '>=24.0.0 <25' },
-    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.3.20.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.5.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.3.21.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.6.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', build: 'npm run check:architecture && tsc --project tsconfig.tooling.json && node scripts/build.mts', check: 'npm run check:architecture && npm run build && node scripts/check.mjs', test: 'npm run check:architecture && node scripts/enquiry-test.mjs' },
   });
   assert.deepEqual(checkManifest(site()), []);
@@ -90,7 +160,7 @@ test('architecture rejects unreviewed toolchains and dependency resolution subst
 test('approved profile-specific development tools keep their reviewed declaration', () => {
   const manifest = {
     name: '@ten98/ui', type: 'module', engines: { node: '>=24.0.0 <25' },
-    devDependencies: { ...campaign().devDependencies, '@playwright/test': '^1.64.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.5.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { ...campaign().devDependencies, '@playwright/test': '^1.64.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.6.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };

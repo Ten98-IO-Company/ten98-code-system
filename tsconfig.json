@@ -17,6 +17,7 @@
     "newLine": "lf"
   },
   "files": [
-    "src/index.mts"
+    "src/index.mts",
+    "src/database-policy.mts"
   ]
 }

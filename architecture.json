@@ -9,8 +9,8 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/ui": "file:vendor/ten98-ui-0.3.20.tgz",
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.5.tgz"
+    "@ten98/ui": "file:vendor/ten98-ui-0.3.21.tgz",
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.6.tgz"
   },
   "profiles": {
     "ten98-campaign": {
@@ -130,6 +130,9 @@
           "tsconfig.json",
           "tsconfig.backend.json"
         ]
+      },
+      "database": {
+        "engine": "sqlite"
       }
     },
     "ten98-monitor": {
@@ -223,6 +226,10 @@
         "compilerProjects": [
           "tsconfig.json"
         ]
+      },
+      "database": {
+        "engine": "postgresql",
+        "transition": "discover-to-sqlite"
       }
     },
     "@ten98/ui": {
@@ -292,6 +299,9 @@
         "compilerProjects": [
           "tsconfig.json"
         ]
+      },
+      "database": {
+        "engine": "none"
       }
     },
     "@ten98/runtime": {
@@ -327,11 +337,16 @@
         "nativeFiles": {
           "index.mjs": "Generated public runtime executable from src/index.mts; build before test and pack.",
           "index.d.mts": "Generated public declarations from src/index.mts.",
-          "check.mjs": "Retained canonical native checker; authored JavaScript migration gap, code-system integrator, issue14."
+          "check.mjs": "Retained canonical native checker; authored JavaScript migration gap, code-system integrator, issue14.",
+          "database-policy.mjs": "Generated internal database-policy checker from checked src/database-policy.mts.",
+          "database-policy.d.mts": "Generated declarations for the internal database-policy checker."
         },
         "compilerProjects": [
           "tsconfig.json"
         ]
+      },
+      "database": {
+        "engine": "none"
       }
     },
     "ten98-io": {
@@ -386,6 +401,35 @@
         "compilerProjects": [
           "tsconfig.tooling.json"
         ]
+      },
+      "database": {
+        "engine": "d1",
+        "exception": "cloudflare-d1"
+      }
+    }
+  },
+  "databasePolicy": {
+    "default": "sqlite",
+    "integration": "drizzle",
+    "stateless": "none",
+    "exceptions": {
+      "cloudflare-d1": {
+        "engine": "d1",
+        "profiles": [
+          "ten98-io"
+        ],
+        "purpose": "native-platform-binding",
+        "requirement": "Use native Cloudflare D1 bindings without a Node database server.",
+        "review": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/7#issuecomment-6283899904"
+      }
+    },
+    "transitions": {
+      "discover-to-sqlite": {
+        "profile": "ten98-monitor",
+        "engine": "postgresql",
+        "target": "sqlite",
+        "reason": "Preserve the installed PostgreSQL, identity, ledger and durable-job contracts until complete SQLite import, transaction, queue and recovery parity is verified.",
+        "review": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/7#issuecomment-6283899904"
       }
     }
   }

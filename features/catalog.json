@@ -34,7 +34,7 @@
       "repository": "ten98-discover",
       "asset": "ten98-discover-source.zip",
       "stack": "React, TanStack Start/Router, Nitro, Better Auth, PostgreSQL/Drizzle, pg-boss",
-      "adoption": "default-stack-reference",
+      "adoption": "existing-postgresql-feature-reference",
       "installInputs": [
         "package.json",
         "pnpm-lock.yaml",
@@ -517,5 +517,6 @@
       "reason": "Native Cloudflare Worker/static site; use its own D1/email/security contracts rather than importing an authenticated Node stack."
     }
   ],
-  "maturity": "Complete stack-bound source references with scoped code checks; integration and production acceptance remain explicitly separate."
+  "maturity": "Complete stack-bound source references with scoped code checks; integration and production acceptance remain explicitly separate.",
+  "databasePolicy": "../architecture.json#databasePolicy"
 }
