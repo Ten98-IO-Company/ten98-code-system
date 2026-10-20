@@ -9,13 +9,14 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/ui": "file:vendor/ten98-ui-0.3.18.tgz",
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.2.tgz"
+    "@ten98/ui": "file:vendor/ten98-ui-0.3.19.tgz",
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.3.tgz"
   },
   "profiles": {
     "ten98-campaign": {
       "boundary": "Node HTTP, SQLite and openid-client; application owns sessions, authorization and paid-work accounting.",
       "dependencies": { "openid-client": "6.8.8", "qrcode-generator": "2.0.4" },
+      "devDependencies": {},
       "sharedDependencies": ["react", "react-dom", "@ten98/ui", "@ten98/runtime"],
       "sharedDevDependencies": ["typescript", "vite", "@types/react", "@types/react-dom"],
       "peerDependencies": {},
@@ -39,6 +40,7 @@
         "ua-parser-js": "1.0.41",
         "zod": "4.5.4"
       },
+      "devDependencies": {"@types/node": "24.10.1", "@types/pg": "8.15.6", "@types/ua-parser-js": "0.7.39", "@vitejs/plugin-react": "6.1.1", "nitro": "3.0.260903-beta"},
       "sharedDependencies": ["react", "react-dom", "@ten98/ui", "@ten98/runtime"],
       "sharedDevDependencies": ["typescript", "vite", "@types/react", "@types/react-dom"],
       "peerDependencies": {},
@@ -47,6 +49,7 @@
     "@ten98/ui": {
       "boundary": "React presentation only; routing, authentication, persistence and provider controllers remain in applications.",
       "dependencies": {},
+      "devDependencies": {"@playwright/test": "^1.64.1"},
       "sharedDependencies": [],
       "sharedDevDependencies": ["react", "react-dom", "typescript", "vite", "@types/react", "@types/react-dom", "@ten98/runtime"],
       "peerDependencies": { "react": "^18.3.0 || ^19.0.0", "react-dom": "^18.3.0 || ^19.0.0" },
@@ -55,6 +58,7 @@
     "@ten98/runtime": {
       "boundary": "Node standard library and web platform primitives only; no framework, database, session controller or provider accounting.",
       "dependencies": {},
+      "devDependencies": {},
       "sharedDependencies": [],
       "sharedDevDependencies": [],
       "peerDependencies": {},

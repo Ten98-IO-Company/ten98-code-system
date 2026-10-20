@@ -18,7 +18,7 @@ Import these functions from `@ten98/runtime`:
 
 ## Architecture contract
 
-[architecture.json](architecture.json) is the canonical declaration of shared versions, package pins and approved runtime dependencies. [check.mjs](check.mjs) checks those declarations and the test/build gates:
+[architecture.json](architecture.json) is the canonical declaration of shared versions, package pins and approved runtime and development dependencies. [check.mjs](check.mjs) checks those declarations and the test/build gates:
 
 ```sh
 node check.mjs ../ten98-design-system ../ten98-campaign ../ten98-discover .
@@ -28,6 +28,10 @@ Campaign, Discover and the design-system development tools share Node 24, React,
 
 Shared presentation belongs in `@ten98/ui`; common server mechanisms belong here. Frontends call their app's authenticated API. Provider keys, database access and paid dispatch stay on the server. Reuse installed frameworks and native platform capabilities before adding a library. Runtime dependency or version changes require updating this contract and checking affected consumers together.
 
+Apply the same review to development dependencies: a framework or server hidden in `devDependencies` still changes the stack. Each profile lists its approved tools and declared versions. Overrides, resolution substitutions, local dependency patches and bundled dependencies are rejected; introduce an intentional dependency change through this contract and an accepted immutable release. The existing UI browser-tool version range remains an explicit approved declaration, with its installed version fixed by the lockfile.
+
+Every required test/build script must begin with `npm run check:architecture &&`, `pnpm check:architecture &&` or `pnpm run check:architecture &&`, followed by its actual checks. Use a simple inline `&&` chain; optional pre-script hooks, echoed command names, background commands and failure-masking shell operators do not satisfy the gate. This validates the declared entrypoint, not the behavior of arbitrary commands or source code.
+
 Both Node apps reuse `@ten98/ui` authentication layout and sidebar keyboard/focus behavior. Their identity adapters implement the [feature contracts](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/docs/FEATURE-CONTRACTS.md), including permanent invitation revocation, explicit ownership transfer and fragment-based invitation links. Search uses explicit displayed fields while retaining each operation's native scope.
 
 Current retained adapters are explicit: Campaign uses Node HTTP, SQLite and `openid-client`; Discover uses TanStack Start/Nitro, PostgreSQL/Drizzle and Better Auth. Their storage, routing and identity controllers have not been unified. Shared primitives preserve their distinct security and accounting contracts. The checker verifies declared consistency; it does not prove framework equivalence, runtime call coverage, OIDC interoperability or release readiness.
@@ -35,6 +39,10 @@ Current retained adapters are explicit: Campaign uses Node HTTP, SQLite and `ope
 New authenticated Node applications use the existing Discover architecture by default: TanStack Start/Nitro, Better Auth, PostgreSQL/Drizzle and pg-boss, with shared runtime primitives and @ten98/ui presentation. Campaign's Node HTTP/SQLite/openid-client stack remains a retained migration adapter tracked in [issue #7](https://github.com/Ten98-IO-Company/ten98-code-system/issues/7). This is the target for new work, not a claim that current applications have equivalent capabilities.
 
 Docker applications use project-scoped volumes, private database networking, loopback host bindings, native `init`, bounded health probes and a 30-second stop grace. Discover's separate migration/worker lifecycle remains necessary. Image pins and service layout remain deployment-owned; there is no Compose generator or universal service template.
+
+Managed web applications target Docker Compose on OpenShip-managed Debian Linux. Prefer a reviewed, digest-pinned Node 24 Debian slim image for Node services and keep the same image across web, worker and migration entrypoints. Shared development tooling uses Node; any POSIX shell belongs to a documented Linux deployment boundary, never a Windows-only runtime requirement. Container and migration checks must run against the chosen image before adoption.
+
+Drizzle is the default TypeScript database integration for the PostgreSQL stack. Keep versioned SQL migrations for database constraints, triggers and routines that a schema declaration does not replace. An ORM or migration-runner change must preserve existing checksums, transaction and locking behavior, data, identities and upgrade tests. JavaScript ESM remains supported for the existing Node runtime, tooling and tests; changing a file extension alone does not improve typing or prove code is unused.
 
 `ten98-io` remains a native Cloudflare Worker/static site; its D1, email and rate-limiting bindings need no React, Node server controllers or Compose. Native Cloudflare applications remain an explicit exception to the authenticated Node default. Third-party infrastructure retains upstream stacks. `ten98-connect` is not built yet and has no implementation audit claim. Reuse this shared contract before building new apps; inventory their actual implementation and add the applicable profile before claiming suite coverage.
 
