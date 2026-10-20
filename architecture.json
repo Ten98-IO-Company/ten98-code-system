@@ -276,7 +276,9 @@
     "@ten98/runtime": {
       "boundary": "Node standard library and web platform primitives only; no framework, database, session controller or provider accounting.",
       "dependencies": {},
-      "devDependencies": {},
+      "devDependencies": {
+        "@types/node": "24.10.1"
+      },
       "sharedDependencies": [],
       "sharedDevDependencies": [
         "typescript"

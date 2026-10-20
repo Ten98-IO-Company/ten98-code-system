@@ -13,7 +13,9 @@
     "declaration": true,
     "rootDir": "src",
     "outDir": ".",
-    "types": [],
+    "types": [
+      "node"
+    ],
     "newLine": "lf"
   },
   "include": [
