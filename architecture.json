@@ -287,7 +287,7 @@
         "build",
         "typecheck"
       ],
-      "sourceBoundary": "Runtime API is authored in src/index.mts and strictly compiler checked; root index.mjs and index.d.mts are generated public entrypoints. Canonical checker and native tests remain an explicit authored JavaScript migration gap owned by the code-system integrator in issue14.",
+      "sourceBoundary": "Runtime API is authored in src/index.mts and strictly compiler checked; root index.mjs and index.d.mts are generated public entrypoints. The canonical checker is authored in src/check.mts with generated root check.mjs and check.d.mts; native tests remain an explicit authored JavaScript migration gap owned by the code-system integrator in issue14.",
       "sourceLanguage": {
         "default": "typescript",
         "roots": [
@@ -307,7 +307,8 @@
         "nativeFiles": {
           "index.mjs": "Generated public runtime executable from src/index.mts; build before test and pack.",
           "index.d.mts": "Generated public declarations from src/index.mts.",
-          "check.mjs": "Retained canonical native checker; authored JavaScript migration gap, code-system integrator, issue14.",
+          "check.mjs": "Generated architecture checker executable from src/check.mts; build before test and pack.",
+          "check.d.mts": "Generated declarations for the architecture checker.",
           "database-policy.mjs": "Generated internal database-policy checker from checked src/database-policy.mts.",
           "database-policy.d.mts": "Generated declarations for the internal database-policy checker."
         },

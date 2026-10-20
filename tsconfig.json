@@ -16,8 +16,10 @@
     "types": [],
     "newLine": "lf"
   },
-  "files": [
-    "src/index.mts",
-    "src/database-policy.mts"
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "node_modules"
   ]
 }

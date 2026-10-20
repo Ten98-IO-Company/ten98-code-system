@@ -19,11 +19,14 @@
     "README.md",
     "architecture.json",
     "check.mjs",
+    "check.d.mts",
     "src/index.mts",
     "tsconfig.json",
     "database-policy.mjs",
     "database-policy.d.mts",
-    "src/database-policy.mts"
+    "src/database-policy.mts",
+    "src/check.mts",
+    "src/node-builtins.d.ts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
