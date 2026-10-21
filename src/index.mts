@@ -63,3 +63,4 @@ export function oidcEndpoint(raw: string | URL, { allowHttp = false, issuer = fa
 }
 
 export * from './migration-ledger.mjs';
+export * from './client-address.mjs';
