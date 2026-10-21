@@ -43,6 +43,9 @@ export function openRouterFetch(path: string, { apiKey, title, body, signal, met
   if (decoded.includes('\\') || decoded.split('/').some(segment => segment === '.' || segment === '..')) throw new TypeError('OpenRouter path cannot traverse directories.');
   const url = new URL('https://openrouter.ai/api/v1' + path);
   if (url.origin !== 'https://openrouter.ai' || !url.pathname.startsWith('/api/v1/') || url.username || url.password || url.hash) throw new TypeError('Invalid OpenRouter API path.');
+  // Header validation errors quote the value, so refuse control characters first without echoing the key or title.
+  if (apiKey !== undefined && (typeof apiKey !== 'string' || /[\u0000-\u001f\u007f]/u.test(apiKey))) throw new TypeError('OpenRouter API key contains invalid characters.');
+  if (title !== undefined && (typeof title !== 'string' || /[\u0000-\u001f\u007f]/u.test(title))) throw new TypeError('OpenRouter title contains invalid characters.');
   const headers: Record<string, string> = { accept: 'application/json' };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   if (title) headers['x-openrouter-title'] = title;
