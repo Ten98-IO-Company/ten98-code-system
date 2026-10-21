@@ -47,6 +47,11 @@ export function openRouterFetch(path, { apiKey, title, body, signal, metadata } 
     const url = new URL('https://openrouter.ai/api/v1' + path);
     if (url.origin !== 'https://openrouter.ai' || !url.pathname.startsWith('/api/v1/') || url.username || url.password || url.hash)
         throw new TypeError('Invalid OpenRouter API path.');
+    // Header validation errors quote the value, so refuse control characters first without echoing the key or title.
+    if (apiKey !== undefined && (typeof apiKey !== 'string' || /[\u0000-\u001f\u007f]/u.test(apiKey)))
+        throw new TypeError('OpenRouter API key contains invalid characters.');
+    if (title !== undefined && (typeof title !== 'string' || /[\u0000-\u001f\u007f]/u.test(title)))
+        throw new TypeError('OpenRouter title contains invalid characters.');
     const headers = { accept: 'application/json' };
     if (apiKey)
         headers.Authorization = `Bearer ${apiKey}`;
@@ -70,3 +75,4 @@ export function oidcEndpoint(raw, { allowHttp = false, issuer = false } = {}) {
     return url;
 }
 export * from './migration-ledger.mjs';
+export * from './client-address.mjs';

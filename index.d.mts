@@ -19,3 +19,4 @@ export declare function oidcEndpoint(raw: string | URL, { allowHttp, issuer }?: 
     issuer?: boolean;
 }): URL;
 export * from './migration-ledger.mjs';
+export * from './client-address.mjs';
