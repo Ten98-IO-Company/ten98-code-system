@@ -9,20 +9,23 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.14.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.15.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
   },
   "profiles": {
     "ten98-campaign": {
-      "boundary": "Node HTTP, SQLite and openid-client; application owns sessions, authorization and paid-work accounting.",
+      "boundary": "Node HTTP, PostgreSQL with Drizzle, and openid-client; application owns sessions, authorization and paid-work accounting.",
       "dependencies": {
+        "drizzle-orm": "0.45.2",
         "openid-client": "6.8.8",
+        "pg": "8.23.0",
         "qrcode-generator": "2.0.4"
       },
       "devDependencies": {
-        "@types/node": "24.10.1"
+        "@types/node": "24.10.1",
+        "@types/pg": "8.15.6"
       },
       "sharedDependencies": [
         "react",
@@ -96,8 +99,7 @@
         ]
       },
       "database": {
-        "engine": "sqlite",
-        "transition": "campaign-to-postgresql"
+        "engine": "postgresql"
       }
     },
     "ten98-monitor": {
@@ -400,14 +402,6 @@
         "review": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/7#issuecomment-6283899904"
       }
     },
-    "transitions": {
-      "campaign-to-postgresql": {
-        "profile": "ten98-campaign",
-        "engine": "sqlite",
-        "target": "postgresql",
-        "reason": "Preserve the installed SQLite users, workspaces, projects, identities, operator grants, audit history and provider data until a verified Drizzle/PostgreSQL implementation and a tested ID-preserving SQLite import exist.",
-        "review": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/20"
-      }
-    }
+    "transitions": {}
   }
 }
