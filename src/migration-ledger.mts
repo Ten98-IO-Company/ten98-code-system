@@ -8,9 +8,10 @@ import { fileURLToPath } from 'node:url';
 
 /** The subset of a `pg` client or pool that the ledger uses. */
 export interface MigrationClient {
-  query<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: R[] }>;
+  // R is bounded like pg's QueryResultRow so a pg Client or PoolClient is assignable without a cast.
+  query<R extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: R[] }>;
 }
-export interface Migration { readonly version: string; readonly name: string; readonly sql: string; readonly checksum: string }
+export interface Migration { readonly version: string; readonly filename: string; readonly sql: string; readonly checksum: string }
 type AppliedMigration = Readonly<{ version: string; checksum: string }>;
 
 function schemaMismatch(): Error {
@@ -29,10 +30,10 @@ export function createMigrationLedger({ directory, files, lockKey }: {
   const folder = typeof directory === 'string' ? directory : fileURLToPath(directory);
 
   function sources(): Promise<readonly Migration[]> {
-    if (!migrations) migrations = Promise.all(files.map(async (name): Promise<Migration> => {
+    if (!migrations) migrations = Promise.all(files.map(async (filename): Promise<Migration> => {
       // Git line-ending conversion must not change a migration's identity across host operating systems.
-      const sql = (await readFile(join(folder, name), 'utf8')).replace(/\r\n?/g, '\n');
-      return Object.freeze({ version: name.slice(0, 4), name, sql, checksum: createHash('sha256').update(sql).digest('hex') });
+      const sql = (await readFile(join(folder, filename), 'utf8')).replace(/\r\n?/g, '\n');
+      return Object.freeze({ version: filename.slice(0, 4), filename, sql, checksum: createHash('sha256').update(sql).digest('hex') });
     })).then(loaded => Object.freeze(loaded)).catch(error => { migrations = undefined; throw error; });
     return migrations;
   }
