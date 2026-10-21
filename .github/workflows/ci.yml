@@ -27,5 +27,5 @@ jobs:
         run: node check.mjs --release . --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --event "$GITHUB_EVENT_PATH"
       - run: npm ci
       - run: npm test
-      - run: git diff --exit-code -- index.mjs index.d.mts database-policy.mjs database-policy.d.mts
+      - run: git diff --exit-code
       - run: npm pack --dry-run

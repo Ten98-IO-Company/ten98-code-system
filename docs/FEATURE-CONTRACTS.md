@@ -1,6 +1,6 @@
 # Identity, navigation and search contracts
 
-Use the [catalogue](../features/catalog.json) to obtain the complete versioned implementation and its tests. Shared imports own portable policy and presentation; application adapters retain transactions, identity and persistence. New stateful Node applications default to SQLite with Drizzle and checked TypeScript under the canonical `databasePolicy` in [architecture.json](../architecture.json). Stateless packages remain database-free; native Cloudflare D1 is an explicit platform exception. Discover is an existing PostgreSQL/pg-boss feature reference, not a ready SQLite adaptation; preserving accounts, atomic enqueue, paid-work receipts and recovery is required before conversion.
+Use the [catalogue](../features/catalog.json) to obtain the complete versioned implementation and its tests. Shared imports own portable policy and presentation; application adapters retain transactions, identity and persistence. Authenticated Node applications default to PostgreSQL with Drizzle and checked TypeScript under the canonical `databasePolicy` in [architecture.json](../architecture.json); Campaign and Discover both use it. Stateless packages remain database-free; native Cloudflare D1 is an explicit platform exception.
 
 ## Membership and invitations
 
