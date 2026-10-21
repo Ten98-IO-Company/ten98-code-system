@@ -13,3 +13,5 @@ For a shared change, run npm test with Node 24, inspect npm pack and run affecte
 Update the canonical architecture declaration instead of copying its versions into app-owned policy files. Consumers use an immutable vendored archive and lockfile. Preserve immutable releases and source/license notices; keep only actively pinned archives in application folders after verifying historical bytes in GitHub Releases. Preserve unrelated working-tree changes.
 
 Track defects and migration work in this repository's GitHub Issues and linked Project. Keep README and code comments focused on current operation and non-obvious constraints; put audit history, progress reports and historical evidence in GitHub instead of adding app-owned ledgers.
+
+Make decisions at the lowest level that has the authority and the facts, as set out in [docs/DECISIONS.md](docs/DECISIONS.md). Owners decide in-scope, reversible work themselves. The manager coordinates across sessions. The decision council answers high-level questions in issues labelled `decision`. The user decides anything irreversible or outward.
