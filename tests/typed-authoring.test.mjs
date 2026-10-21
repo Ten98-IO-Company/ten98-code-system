@@ -8,7 +8,7 @@ import test from 'node:test';
 import * as runtime from '../index.mjs';
 
 test('generated public entrypoint retains every frozen runtime export', () => {
-  assert.deepEqual(Object.keys(runtime).sort(), ['mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'oidcEndpoint', 'openRouterFetch', 'readResponseText', 'workspaceRoles'].sort());
+  assert.deepEqual(Object.keys(runtime).sort(), ['createMigrationLedger', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'oidcEndpoint', 'openRouterFetch', 'readResponseText', 'workspaceRoles'].sort());
 });
 
 test('actual compiler rejects an implementation type error and preserves last good output', () => {
@@ -24,6 +24,7 @@ test('actual compiler rejects an implementation type error and preserves last go
     const implementation = join(temporary, 'src/index.mts');
     writeFileSync(implementation, source);
     writeFileSync(join(temporary, 'src/database-policy.mts'), readFileSync(new URL('../src/database-policy.mts', import.meta.url)));
+    writeFileSync(join(temporary, 'src/migration-ledger.mts'), readFileSync(new URL('../src/migration-ledger.mts', import.meta.url)));
     let result = compile(); assert.equal(result.status, 0, result.stdout + result.stderr);
     const outputs = ['index.mjs', 'index.d.mts'].map(name => join(temporary, name));
     const before = outputs.map(hash);
