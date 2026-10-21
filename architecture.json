@@ -10,7 +10,7 @@
   },
   "sharedPackages": {
     "@ten98/ui": "file:vendor/ten98-ui-0.5.1.tgz",
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.11.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.12.tgz"
   },
   "profiles": {
     "ten98-campaign": {
@@ -309,6 +309,8 @@
         "nativeFiles": {
           "index.mjs": "Generated public runtime executable from src/index.mts; build before test and pack.",
           "index.d.mts": "Generated public declarations from src/index.mts.",
+          "migration-ledger.mjs": "Generated runtime executable from src/migration-ledger.mts, re-exported by index.mjs.",
+          "migration-ledger.d.mts": "Generated declarations from src/migration-ledger.mts.",
           "check.mjs": "Generated architecture checker executable from src/check.mts; build before test and pack.",
           "check.d.mts": "Generated declarations for the architecture checker.",
           "database-policy.mjs": "Generated internal database-policy checker from checked src/database-policy.mts.",
