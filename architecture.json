@@ -10,7 +10,7 @@
   },
   "sharedPackages": {
     "@ten98/ui": "file:vendor/ten98-ui-0.5.1.tgz",
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.11.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.12.tgz"
   },
   "profiles": {
     "ten98-campaign": {
