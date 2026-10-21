@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Shared HTTP, OpenRouter and OIDC primitives for ten98 applications",
   "type": "module",
   "license": "MIT",
@@ -19,11 +19,13 @@
     "README.md",
     "architecture.json",
     "check.mjs",
+    "check.d.mts",
     "src/index.mts",
     "tsconfig.json",
     "database-policy.mjs",
     "database-policy.d.mts",
-    "src/database-policy.mts"
+    "src/database-policy.mts",
+    "src/check.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
@@ -40,6 +42,7 @@
     "url": "https://github.com/Ten98-IO-Company/ten98-code-system.git"
   },
   "devDependencies": {
+    "@types/node": "24.10.1",
     "typescript": "7.0.2"
   }
 }
