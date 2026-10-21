@@ -9,8 +9,10 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/ui": "file:vendor/ten98-ui-0.5.2.tgz",
     "@ten98/runtime": "file:vendor/ten98-runtime-0.1.14.tgz"
+  },
+  "sharedPackageFloors": {
+    "@ten98/ui": "0.5.0"
   },
   "profiles": {
     "ten98-campaign": {

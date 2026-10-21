@@ -19,7 +19,7 @@ Import these functions from `@ten98/runtime`:
 
 ## Architecture contract
 
-[architecture.json](architecture.json) is the canonical declaration of shared versions, package pins and approved runtime and development dependencies. [check.mjs](check.mjs) checks those declarations and the test/build gates:
+[architecture.json](architecture.json) is the canonical declaration of shared versions, package pins and approved runtime and development dependencies. `@ten98/runtime` is an exact shared pin; `@ten98/ui` is a minimum version (`sharedPackageFloors`), and each app pins its own released UI archive at or above it, with only that release vendored ([decision #28](https://github.com/Ten98-IO-Company/ten98-code-system/issues/28)). [check.mjs](check.mjs) checks those declarations and the test/build gates:
 
 ```sh
 node check.mjs ../ten98-design-system ../ten98-campaign ../ten98-discover .

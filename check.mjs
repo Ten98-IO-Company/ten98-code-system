@@ -31,6 +31,23 @@ function hasRequiredGate(script) {
     return commands.length > 1 && commands.every(Boolean)
         && /^(?:npm\s+run|pnpm(?:\s+run)?)\s+check:architecture$/u.test(commands[0]);
 }
+// A floored package's pinned archive must exist, and only one release of it may be vendored.
+// Lockfile integrity is left to the package manager's frozen install, which rejects a mismatched archive.
+export function checkVendoredFloors(directory, manifest) {
+    const errors = [];
+    for (const name of Object.keys(contract.sharedPackageFloors ?? {})) {
+        const spec = manifest.dependencies?.[name] ?? manifest.devDependencies?.[name];
+        if (typeof spec !== 'string' || !spec.startsWith('file:vendor/'))
+            continue;
+        const prefix = `${name.replace(/^@/u, '').replace('/', '-')}-`;
+        if (!existsSync(resolve(directory, spec.slice('file:'.length))))
+            errors.push(`${name}: pinned archive ${spec.slice('file:'.length)} is missing.`);
+        const vendored = existsSync(resolve(directory, 'vendor')) ? readdirSync(resolve(directory, 'vendor')).filter(file => file.startsWith(prefix) && file.endsWith('.tgz')) : [];
+        if (vendored.length > 1)
+            errors.push(`${name}: vendor holds ${vendored.length} archives (${vendored.join(', ')}); keep only the pinned release.`);
+    }
+    return errors;
+}
 // This checks declared dependencies and build gates, not application security or behavior.
 export function checkManifest(manifest) {
     const profileName = String(manifest.name);
@@ -38,13 +55,34 @@ export function checkManifest(manifest) {
     if (!profile)
         return [`Unknown architecture profile: ${manifest.name ?? '(missing name)'}. Update architecture.json after review.`];
     const shared = { ...contract.sharedVersions, ...contract.sharedPackages };
+    const floors = contract.sharedPackageFloors ?? {};
     const same = (actual, expected, label) => { if (actual !== expected)
         errors.push(`${label}: expected ${expected}, found ${actual ?? '(missing)'}.`); };
+    // A floored package is pinned by the app to one vendored release archive at or above the canonical floor.
+    const atLeastFloor = (name, actual, label) => {
+        const archive = name.replace(/^@/u, '').replace('/', '-');
+        const version = typeof actual === 'string' ? new RegExp(`^file:vendor/${archive}-(\\d+)\\.(\\d+)\\.(\\d+)\\.tgz$`, 'u').exec(actual) : null;
+        const floor = /^(\d+)\.(\d+)\.(\d+)$/u.exec(floors[name] ?? '');
+        if (!version || !floor) {
+            errors.push(`${label}: expected file:vendor/${archive}-<version>.tgz at or above ${floors[name]}, found ${actual ?? '(missing)'}.`);
+            return;
+        }
+        const [major, minor, patch] = version.slice(1).map(Number), [floorMajor, floorMinor, floorPatch] = floor.slice(1).map(Number);
+        const below = major - floorMajor || minor - floorMinor || patch - floorPatch;
+        if (below < 0)
+            errors.push(`${label}: ${version.slice(1).join('.')} is below the supported floor ${floors[name]}.`);
+    };
+    const pinned = (name, actual, expected, label) => {
+        if (Object.hasOwn(floors, name))
+            atLeastFloor(name, actual, label);
+        else
+            same(actual, expected, label);
+    };
     same(manifest.engines?.node, contract.node, 'engines.node');
     same(manifest.type, 'module', 'type');
     const expected = { ...profile.dependencies, ...Object.fromEntries(profile.sharedDependencies.map(name => [name, shared[name]])) };
     for (const [name, version] of Object.entries(expected))
-        same(manifest.dependencies?.[name], version, `dependencies.${name}`);
+        pinned(name, manifest.dependencies?.[name], version, `dependencies.${name}`);
     for (const name of Object.keys(manifest.dependencies ?? {}))
         if (!Object.hasOwn(expected, name))
             errors.push(`Unapproved runtime dependency ${name}. Update architecture.json after review.`);
@@ -52,7 +90,7 @@ export function checkManifest(manifest) {
         errors.push(`Unapproved optional runtime dependency ${name}. Update architecture.json after review.`);
     const expectedDev = { ...profile.devDependencies, ...Object.fromEntries(profile.sharedDevDependencies.map(name => [name, shared[name]])) };
     for (const [name, version] of Object.entries(expectedDev))
-        same(manifest.devDependencies?.[name], version, `devDependencies.${name}`);
+        pinned(name, manifest.devDependencies?.[name], version, `devDependencies.${name}`);
     for (const name of Object.keys(manifest.devDependencies ?? {}))
         if (!Object.hasOwn(expectedDev, name))
             errors.push(`Unapproved development dependency ${name}. Update architecture.json after review.`);
@@ -419,6 +457,8 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
         try {
             const manifest = JSON.parse(readFileSync(resolve(directory, 'package.json'), 'utf8'));
             const errors = checkManifest(manifest);
+            if (!errors.length)
+                errors.push(...checkVendoredFloors(directory, manifest));
             if (!errors.length)
                 errors.push(...checkSourceLanguage(directory, String(manifest.name)));
             if (!errors.length)

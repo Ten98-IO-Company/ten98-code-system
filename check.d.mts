@@ -69,6 +69,7 @@ export interface ReleaseEvidence {
     };
 }
 export declare function checkRuntimeVersion(version?: unknown): string[];
+export declare function checkVendoredFloors(directory: string, manifest: PackageManifest): string[];
 export declare function checkManifest(manifest: PackageManifest): string[];
 export declare function inspectSourcePolicy(directory: string, policy: SourceLanguagePolicy, compilation: Compilation): string[];
 export declare function checkSourceLanguage(directory: string, name: string): string[];
