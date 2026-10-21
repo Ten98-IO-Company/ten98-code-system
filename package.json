@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Shared HTTP, OpenRouter and OIDC primitives for ten98 applications",
   "type": "module",
   "license": "MIT",
