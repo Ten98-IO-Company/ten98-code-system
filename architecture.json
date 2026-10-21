@@ -9,8 +9,8 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/ui": "file:vendor/ten98-ui-0.3.22.tgz",
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.8.tgz"
+    "@ten98/ui": "file:vendor/ten98-ui-0.4.0.tgz",
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.9.tgz"
   },
   "profiles": {
     "ten98-campaign": {
@@ -53,53 +53,8 @@
           "server",
           "shared"
         ],
-        "legacyJavaScript": [
-          "server/agent.mjs",
-          "server/approvals.mjs",
-          "server/auth.mjs",
-          "server/calendar.mjs",
-          "server/cli.mjs",
-          "server/contacts.mjs",
-          "server/database.mjs",
-          "server/direct-campaigns.mjs",
-          "server/direct-providers.mjs",
-          "server/google-ads.mjs",
-          "server/inbox.mjs",
-          "server/index.mjs",
-          "server/integration-settings.mjs",
-          "server/integrations.mjs",
-          "server/invitations.mjs",
-          "server/links.mjs",
-          "server/native-google-ads.mjs",
-          "server/native-microsoft-ads.mjs",
-          "server/ooh.mjs",
-          "server/operation-recovery.mjs",
-          "server/sms-inbox.mjs",
-          "server/webhooks.mjs",
-          "server/zernio-accounts.mjs",
-          "server/zernio-ad-events.mjs",
-          "server/zernio-admin.mjs",
-          "server/zernio-blogs.mjs",
-          "server/zernio-connections.mjs",
-          "server/zernio-contacts.mjs",
-          "server/zernio-google-conversions.mjs",
-          "server/zernio-insights.mjs",
-          "server/zernio-leads.mjs",
-          "server/zernio-measurement.mjs",
-          "server/zernio-media.mjs",
-          "server/zernio-products.mjs",
-          "server/zernio-publishing.mjs",
-          "server/zernio-queues.mjs",
-          "server/zernio-recycling.mjs",
-          "server/zernio-webhook-settings.mjs",
-          "server/zernio-whatsapp-templates.mjs"
-        ],
+        "legacyJavaScript": [],
         "generated": {},
-        "migration": {
-          "owner": "Campaign app owner",
-          "issue": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/14",
-          "status": "39 retained server JavaScript modules remain untyped after the shared, seed and schedule TypeScript conversion. The instance-operator transaction adapter is not yet adopted; it lands as checked TypeScript. Remove exact exceptions with checked TypeScript adoption."
-        },
         "artifactDirectories": [
           ".git",
           "node_modules",
