@@ -18,10 +18,10 @@ export function createMigrationLedger({ directory, files, lockKey }) {
     const folder = typeof directory === 'string' ? directory : fileURLToPath(directory);
     function sources() {
         if (!migrations)
-            migrations = Promise.all(files.map(async (name) => {
+            migrations = Promise.all(files.map(async (filename) => {
                 // Git line-ending conversion must not change a migration's identity across host operating systems.
-                const sql = (await readFile(join(folder, name), 'utf8')).replace(/\r\n?/g, '\n');
-                return Object.freeze({ version: name.slice(0, 4), name, sql, checksum: createHash('sha256').update(sql).digest('hex') });
+                const sql = (await readFile(join(folder, filename), 'utf8')).replace(/\r\n?/g, '\n');
+                return Object.freeze({ version: filename.slice(0, 4), filename, sql, checksum: createHash('sha256').update(sql).digest('hex') });
             })).then(loaded => Object.freeze(loaded)).catch(error => { migrations = undefined; throw error; });
         return migrations;
     }

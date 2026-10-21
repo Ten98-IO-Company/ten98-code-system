@@ -33,7 +33,7 @@ test('sources are ordered as listed, versioned by prefix and checksummed over LF
   const { ledger, cleanup } = fixture({ '0001_a.sql': 'one\r\ntwo\r\n', '0002_b.sql': 'three\n' });
   try {
     const sources = await ledger.sources();
-    assert.deepEqual(sources.map(({ version, name }) => [version, name]), [['0001', '0001_a.sql'], ['0002', '0002_b.sql']]);
+    assert.deepEqual(sources.map(({ version, filename }) => [version, filename]), [['0001', '0001_a.sql'], ['0002', '0002_b.sql']]);
     assert.equal(sources[0].sql, 'one\ntwo\n');
     assert.equal(sources[0].checksum, sha('one\ntwo\n'));
     assert.equal(Object.isFrozen(sources), true);

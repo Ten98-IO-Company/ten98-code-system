@@ -1,12 +1,12 @@
 /** The subset of a `pg` client or pool that the ledger uses. */
 export interface MigrationClient {
-    query<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{
+    query<R extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{
         rows: R[];
     }>;
 }
 export interface Migration {
     readonly version: string;
-    readonly name: string;
+    readonly filename: string;
     readonly sql: string;
     readonly checksum: string;
 }

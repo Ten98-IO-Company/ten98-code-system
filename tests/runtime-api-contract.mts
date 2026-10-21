@@ -5,3 +5,7 @@ type Assert<T extends true> = T;
 // Additions are allowed; every value exported by 0.1.4 must remain assignable.
 export type PublicValuesCompatible = Assert<typeof current extends typeof previous ? true : false>;
 export type PublicRoleUnchanged = Assert<Equal<current.WorkspaceRole, previous.WorkspaceRole>>;
+// A structural stand-in for pg's Client.query: generic rows bounded by QueryResultRow.
+interface PgLikeClient { query<R extends { [column: string]: any } = any>(text: string, values?: unknown[]): Promise<{ rows: R[]; rowCount: number | null }> }
+declare const pgClient: PgLikeClient;
+export const pgClientIsMigrationClient: current.MigrationClient = pgClient;
