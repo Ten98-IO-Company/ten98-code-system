@@ -94,7 +94,8 @@
         ]
       },
       "database": {
-        "engine": "sqlite"
+        "engine": "sqlite",
+        "transition": "campaign-to-postgresql"
       }
     },
     "ten98-monitor": {
@@ -197,8 +198,7 @@
         ]
       },
       "database": {
-        "engine": "postgresql",
-        "transition": "discover-to-sqlite"
+        "engine": "postgresql"
       }
     },
     "@ten98/ui": {
@@ -382,7 +382,7 @@
     }
   },
   "databasePolicy": {
-    "default": "sqlite",
+    "default": "postgresql",
     "integration": "drizzle",
     "stateless": "none",
     "exceptions": {
@@ -397,12 +397,12 @@
       }
     },
     "transitions": {
-      "discover-to-sqlite": {
-        "profile": "ten98-monitor",
-        "engine": "postgresql",
-        "target": "sqlite",
-        "reason": "Preserve the installed PostgreSQL, identity, ledger and durable-job contracts until complete SQLite import, transaction, queue and recovery parity is verified.",
-        "review": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/7#issuecomment-6283899904"
+      "campaign-to-postgresql": {
+        "profile": "ten98-campaign",
+        "engine": "sqlite",
+        "target": "postgresql",
+        "reason": "Preserve the installed SQLite users, workspaces, projects, identities, operator grants, audit history and provider data until a verified Drizzle/PostgreSQL implementation and a tested ID-preserving SQLite import exist.",
+        "review": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/20"
       }
     }
   }

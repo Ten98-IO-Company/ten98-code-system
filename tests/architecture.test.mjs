@@ -9,16 +9,16 @@ import { checkManifest, checkRuntimeVersion, inspectSourcePolicy } from '../chec
 import { inspectDatabasePolicy } from '../database-policy.mjs';
 
 const databaseFixture = () => ({
-  policy: { default: 'sqlite', integration: 'drizzle', stateless: 'none',
+  policy: { default: 'postgresql', integration: 'drizzle', stateless: 'none',
     exceptions: { native: { engine: 'd1', profiles: ['site'], purpose: 'native-platform-binding', requirement: 'Native D1 binding', review: 'issue7' } },
-    transitions: { existing: { profile: 'existing', engine: 'postgresql', target: 'sqlite', reason: 'Preserve installed data pending verified parity', review: 'issue7' } } },
-  profiles: { app: { database: { engine: 'sqlite' } }, library: { database: { engine: 'none' } },
-    site: { database: { engine: 'd1', exception: 'native' } }, existing: { database: { engine: 'postgresql', transition: 'existing' } } },
+    transitions: { existing: { profile: 'existing', engine: 'sqlite', target: 'postgresql', reason: 'Preserve installed data pending verified parity', review: 'issue7' } } },
+  profiles: { app: { database: { engine: 'postgresql' } }, library: { database: { engine: 'none' } },
+    site: { database: { engine: 'd1', exception: 'native' } }, existing: { database: { engine: 'sqlite', transition: 'existing' } } },
 });
 
-test('canonical database default is SQLite with Drizzle and no database in stateless packages', () => {
+test('canonical database default is PostgreSQL with Drizzle and no database in stateless packages', () => {
   const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
-  assert.equal(contract.databasePolicy.default, 'sqlite');
+  assert.equal(contract.databasePolicy.default, 'postgresql');
   assert.equal(contract.databasePolicy.integration, 'drizzle');
   assert.equal(contract.profiles['@ten98/runtime'].database.engine, 'none');
   assert.equal(contract.profiles['@ten98/ui'].database.engine, 'none');
@@ -29,16 +29,16 @@ test('canonical database default is SQLite with Drizzle and no database in state
 
 test('database choices need explicit declarations and centrally reviewed exceptions', () => {
   for (const mutate of [
-    f => { f.policy.default = 'postgresql'; },
+    f => { f.policy.default = 'sqlite'; },
     f => { delete f.profiles.app.database; },
-    f => { f.profiles.app.database = { engine: 'postgresql' }; },
-    f => { f.profiles.app.database = { engine: 'postgresql', exception: 'not-recorded' }; },
+    f => { f.profiles.app.database = { engine: 'sqlite' }; },
+    f => { f.profiles.app.database = { engine: 'sqlite', exception: 'not-recorded' }; },
     f => { f.profiles.app.database = { engine: 'd1', exception: 'native' }; },
     f => { f.policy.exceptions.native.purpose = 'vector-storage'; },
     f => { f.policy.exceptions.native.purpose = ['approved-requirement']; },
     f => { f.policy.exceptions.native.requirement = ''; },
     f => { f.policy.exceptions.native.review = ''; },
-    f => { f.policy.transitions.existing.target = 'postgresql'; },
+    f => { f.policy.transitions.existing.target = 'sqlite'; },
     f => { f.policy.transitions.existing.reason = ''; },
     f => { f.profiles.library.database = { engine: 'none', exception: 'native' }; },
     f => { f.profiles.app.database = []; },
@@ -56,7 +56,7 @@ test('canonical checker CLI enforces database policy before accepting a reviewed
     mkdirSync(checkerFolder, { recursive: true });
     for (const name of ['check.mjs', 'database-policy.mjs']) writeFileSync(join(checkerFolder, name), readFileSync(new URL('../' + name, import.meta.url)));
     const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
-    contract.profiles['fixture-stateful'] = { dependencies: {}, devDependencies: {}, sharedDependencies: [], sharedDevDependencies: [], peerDependencies: {}, checkScripts: ['test'], database: { engine: 'sqlite' } };
+    contract.profiles['fixture-stateful'] = { dependencies: {}, devDependencies: {}, sharedDependencies: [], sharedDevDependencies: [], peerDependencies: {}, checkScripts: ['test'], database: { engine: 'postgresql' } };
     const manifest = { name: 'fixture-stateful', type: 'module', engines: { node: '>=24.0.0 <25' },
       scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test' } };
     writeFileSync(join(directory, 'package.json'), JSON.stringify(manifest));
@@ -67,12 +67,12 @@ test('canonical checker CLI enforces database policy before accepting a reviewed
       return result;
     };
     assert.equal(run().status, 0);
-    contract.profiles['fixture-stateful'].database = { engine: 'postgresql' };
+    contract.profiles['fixture-stateful'].database = { engine: 'sqlite' };
     const denied = run();
     assert.equal(denied.status, 1);
-    assert.match(denied.stderr, /nondefault engine postgresql needs/);
-    contract.profiles['fixture-stateful'].database = { engine: 'sqlite' };
-    contract.databasePolicy.default = 'postgresql';
+    assert.match(denied.stderr, /nondefault engine sqlite needs/);
+    contract.profiles['fixture-stateful'].database = { engine: 'postgresql' };
+    contract.databasePolicy.default = 'sqlite';
     assert.equal(run().status, 1);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
