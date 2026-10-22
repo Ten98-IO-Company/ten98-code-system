@@ -93,6 +93,11 @@ test('Cloudflare suppression reasons map to actions, and unknown reasons are lef
     { recipient: 'cf@example.net', action: 'count-transient', reason: 'transient-bounce', expiresAt: '2026-10-27T00:00:00Z' },
   ]);
   assert.deepEqual(actions(row('greylisted')), [['cf@example.net', 'ignore', 'unknown-reason']]);
+  // A time-limited provider row keeps its expiry whatever the reason, so the caller can lift it when the provider does.
+  for (const reason of ['hard_bounce', 'complaint', 'manual', 'policy', 'greylisted']) {
+    assert.equal(classifyEmailFeedback(row(reason, '2026-10-27T00:00:00Z'), options)[0].expiresAt, '2026-10-27T00:00:00Z', reason);
+    assert.equal('expiresAt' in classifyEmailFeedback(row(reason), options)[0], false, reason);
+  }
 });
 
 test('other events are ignored, malformed input yields nothing and bad configuration throws', () => {
