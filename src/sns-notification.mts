@@ -120,6 +120,9 @@ export async function verifySnsMessage(rawBody: string, options: SnsVerifyOption
     if (typeof fields[name] !== 'string' && !(name === 'Subject' && fields[name] === undefined)) return reject('malformed');
   }
   const text = fields as Record<string, string>;
+  // Values are joined with newlines to form the string to sign, so a newline in any field but Message could move
+  // text between fields (for example fold Subject into MessageId) without changing the signature.
+  if (signed.some(name => name !== 'Message' && text[name]?.includes('\n'))) return reject('malformed');
   if (text.SignatureVersion !== '2') return reject('unsupported-signature-version');
 
   const certificate = snsRegion(text.SigningCertURL, allowedRegions);

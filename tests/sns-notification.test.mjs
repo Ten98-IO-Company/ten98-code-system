@@ -133,6 +133,16 @@ test('a verified duplicate MessageId short-circuits', async () => {
   assert.equal(seen.length, 1);
 });
 
+test('a field folded into MessageId cannot replay a signed message past de-duplication', async () => {
+  const original = JSON.parse(signed(notification({ Subject: 'Amazon SES Email Event Notification' })));
+  const { Subject, ...rest } = original;
+  // Same string to sign either way ("MessageId", id, "Subject", S on separate lines), so only the newline check stops it.
+  const folded = JSON.stringify({ ...rest, MessageId: `${original.MessageId}\nSubject\n${Subject}` });
+  const seen = [];
+  assert.deepEqual(await verifySnsMessage(folded, options({ isDuplicate: id => (seen.push(id), id === original.MessageId) })), { ok: false, reason: 'malformed' });
+  assert.deepEqual(seen, []);
+});
+
 test('malformed bodies, unsupported types and certificate failures are rejected without echoing input', async () => {
   for (const body of ['{', '[]', 'null', '"x"', JSON.stringify({ ...notification(), Timestamp: 1 }), JSON.stringify({ ...notification(), Subject: 5 })]) {
     assert.deepEqual(await verifySnsMessage(body, options()), { ok: false, reason: 'malformed' }, body);
