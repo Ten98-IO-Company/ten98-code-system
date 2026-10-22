@@ -94,13 +94,15 @@ function classifyComplaint(complaint: Json): EmailFeedbackOutcome[] {
 function classifyCloudflare(row: CloudflareSuppression): EmailFeedbackOutcome[] {
   const recipient = text(row.email);
   if (!recipient) return [];
+  // Any provider row can be time-limited; the caller must stop honouring it once the provider's expiry passes.
+  const expiry = text(row.expiresAt) ? { expiresAt: row.expiresAt! } : {};
   switch (row.reason) {
-    case 'hard_bounce': return [{ recipient, action: 'suppress', reason: 'permanent-bounce' }];
-    case 'complaint': return [{ recipient, action: 'suppress', reason: 'complaint' }];
-    case 'manual': return [{ recipient, action: 'suppress', reason: 'manual' }];
-    case 'soft_bounce': return [{ recipient, action: 'count-transient', reason: 'transient-bounce', ...(text(row.expiresAt) ? { expiresAt: row.expiresAt! } : {}) }];
-    case 'policy': return [{ recipient, action: 'deliverability-alert', reason: 'policy-block' }];
-    default: return [{ recipient, action: 'ignore', reason: 'unknown-reason' }];
+    case 'hard_bounce': return [{ recipient, action: 'suppress', reason: 'permanent-bounce', ...expiry }];
+    case 'complaint': return [{ recipient, action: 'suppress', reason: 'complaint', ...expiry }];
+    case 'manual': return [{ recipient, action: 'suppress', reason: 'manual', ...expiry }];
+    case 'soft_bounce': return [{ recipient, action: 'count-transient', reason: 'transient-bounce', ...expiry }];
+    case 'policy': return [{ recipient, action: 'deliverability-alert', reason: 'policy-block', ...expiry }];
+    default: return [{ recipient, action: 'ignore', reason: 'unknown-reason', ...expiry }];
   }
 }
 
