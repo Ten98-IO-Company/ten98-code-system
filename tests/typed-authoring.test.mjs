@@ -13,7 +13,9 @@ test('generated public entrypoint retains every frozen runtime export', () => {
 
 test('actual compiler rejects an implementation type error and preserves last good output', () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
-  const temporary = mkdtempSync(join(root, 'tests', '.typed-authoring-'));
+  // work/ is an ignored artifact directory inside the package, so node_modules types still resolve.
+  mkdirSync(join(root, 'work'), { recursive: true });
+  const temporary = mkdtempSync(join(root, 'work', '.typed-authoring-'));
   const source = readFileSync(new URL('../src/index.mts', import.meta.url), 'utf8');
   const compiler = join(root, 'node_modules/typescript/bin/tsc');
   const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex');

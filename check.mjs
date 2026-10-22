@@ -126,6 +126,7 @@ export function inspectSourcePolicy(directory, policy, compilation) {
     const errors = [];
     if (policy.default !== 'typescript')
         return ['Unknown source language policy.'];
+    const nameOf = (file) => relative(directory, resolve(directory, file)).replaceAll('\\', '/');
     for (const project of compilation.projects ?? [compilation]) {
         const options = project.compilerOptions ?? {};
         if (options.strict !== true)
@@ -136,6 +137,10 @@ export function inspectSourcePolicy(directory, policy, compilation) {
             if (options[name] === false)
                 errors.push(`The source compiler must not disable ${name}.`);
         }
+        // Node 24 strips types from tests and scripts without checking them; erasable syntax keeps the run and checked programs identical.
+        const stripped = (project.files ?? []).map(nameOf).find(name => /^(?:tests|scripts)\//u.test(name) && /\.[cm]?ts$/u.test(name) && !/\.d\.[cm]?ts$/u.test(name));
+        if (stripped && options.erasableSyntaxOnly !== true)
+            errors.push(`${stripped}: a compiler project covering tests or scripts must enable erasableSyntaxOnly.`);
     }
     const checked = new Set(compilation.files.map(file => resolve(directory, file)));
     const legacy = new Set(policy.legacyJavaScript), files = [];
@@ -169,6 +174,9 @@ export function inspectSourcePolicy(directory, policy, compilation) {
         }
         for (const entry of readdirSync(folder, { withFileTypes: true })) {
             const file = resolve(folder, entry.name);
+            // Nested artifact directories such as tests/fixtures hold checker inputs and recorded payloads, not authored source.
+            if (entry.isDirectory() && artifacts.has(nameOf(file)))
+                continue;
             if (entry.isDirectory())
                 walk(file);
             else if (entry.isSymbolicLink())
@@ -179,11 +187,19 @@ export function inspectSourcePolicy(directory, policy, compilation) {
     };
     for (const root of policy.roots)
         walk(resolve(directory, root));
+    // The legacy list only shrinks: entries for removed, converted or relocated files must be deleted.
+    const found = new Set(files.map(nameOf).filter(name => /\.(?:[cm]?js|jsx)$/iu.test(name)));
+    for (const name of legacy)
+        if (!found.has(name))
+            errors.push(`${name}: stale legacyJavaScript entry; no such authored JavaScript under a source root.`);
     for (const file of files) {
-        const name = relative(directory, file).replaceAll('\\', '/');
-        if (/\.(?:[cm]?js|jsx)$/u.test(name) && !legacy.has(name))
+        const name = nameOf(file);
+        if (found.has(name) && !legacy.has(name))
             errors.push(`${name}: new authored JavaScript is not approved; use checked TypeScript.`);
-        if (!/\.(?:[cm]?ts|tsx)$/u.test(name))
+        // Roots skip the whole-app inventory above, so native scripts inside them need the same explicit classification.
+        if (/\.(?:ps1|cmd|bat)$/iu.test(name) && !Object.hasOwn(native, name))
+            errors.push(`${name}: code outside declared production roots needs a canonical source classification.`);
+        if (!/\.(?:[cm]?ts|tsx)$/iu.test(name))
             continue;
         if (!checked.has(file))
             errors.push(`${name}: TypeScript is absent from the configured compiler program.`);
@@ -219,8 +235,9 @@ export function checkSourceLanguage(directory, name) {
     const projects = [], files = [];
     // Resolve the actual import closure as well as configured roots; callers cannot submit a synthetic program.
     for (const project of policy.compilerProjects) {
-        projects.push(JSON.parse(run(project, ['--showConfig'])));
-        files.push(...run(project, ['--listFilesOnly', '--pretty', 'false']).trim().split(/\r?\n/u).filter(Boolean));
+        const program = run(project, ['--listFilesOnly', '--pretty', 'false']).trim().split(/\r?\n/u).filter(Boolean);
+        projects.push({ ...JSON.parse(run(project, ['--showConfig'])), files: program });
+        files.push(...program);
     }
     const errors = inspectSourcePolicy(directory, policy, { projects, files });
     if (!errors.length)
