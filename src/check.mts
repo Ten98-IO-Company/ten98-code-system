@@ -232,7 +232,7 @@ export function inspectSourcePolicy(directory: string, policy: SourceLanguagePol
     for (const entry of readdirSync(folder, { withFileTypes: true })) {
       const file = resolve(folder, entry.name);
       // Nested artifact directories such as tests/fixtures hold checker inputs and recorded payloads, not authored source.
-      if (artifacts.has(nameOf(file))) continue;
+      if (entry.isDirectory() && artifacts.has(nameOf(file))) continue;
       if (entry.isDirectory()) walk(file);
       else if (entry.isSymbolicLink()) errors.push(`Source links need explicit review: ${relative(directory, file)}`);
       else if (entry.isFile()) files.push(file);
@@ -240,12 +240,14 @@ export function inspectSourcePolicy(directory: string, policy: SourceLanguagePol
   };
   for (const root of policy.roots) walk(resolve(directory, root));
   // The legacy list only shrinks: entries for removed, converted or relocated files must be deleted.
-  const found = new Set(files.map(nameOf).filter(name => /\.(?:[cm]?js|jsx)$/u.test(name)));
+  const found = new Set(files.map(nameOf).filter(name => /\.(?:[cm]?js|jsx)$/iu.test(name)));
   for (const name of legacy) if (!found.has(name)) errors.push(`${name}: stale legacyJavaScript entry; no such authored JavaScript under a source root.`);
   for (const file of files) {
     const name = nameOf(file);
     if (found.has(name) && !legacy.has(name)) errors.push(`${name}: new authored JavaScript is not approved; use checked TypeScript.`);
-    if (!/\.(?:[cm]?ts|tsx)$/u.test(name)) continue;
+    // Roots skip the whole-app inventory above, so native scripts inside them need the same explicit classification.
+    if (/\.(?:ps1|cmd|bat)$/iu.test(name) && !Object.hasOwn(native, name)) errors.push(`${name}: code outside declared production roots needs a canonical source classification.`);
+    if (!/\.(?:[cm]?ts|tsx)$/iu.test(name)) continue;
     if (!checked.has(file)) errors.push(`${name}: TypeScript is absent from the configured compiler program.`);
     const source = readFileSync(file, 'utf8'), generated = policy.generated[name];
     if (generated && !source.includes(generated)) errors.push(`${name}: reviewed generated-file provenance marker is missing.`);

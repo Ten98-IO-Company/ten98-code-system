@@ -100,6 +100,21 @@ test('nested artifact directories under a source root hold checker inputs, not a
   assert.deepEqual(inspectSourcePolicy(root, policy, program), []);
 }));
 
+test('source roots still catch upper-case JavaScript, unclassified native scripts and file-named artifact entries', () => fixture((root, policy, program) => {
+  policy.roots.push('scripts');
+  mkdirSync(join(root, 'scripts'));
+  writeFileSync(join(root, 'scripts/run.ps1'), 'Write-Output run');
+  writeFileSync(join(root, 'scripts/tool.JS'), 'export const tool = true;');
+  writeFileSync(join(root, 'scripts/hidden.mjs'), 'export const hidden = true;');
+  policy.artifactDirectories = ['scripts/hidden.mjs'];
+  const errors = inspectSourcePolicy(root, policy, program).join('\n');
+  assert.match(errors, /scripts\/run.ps1: code outside/);
+  assert.match(errors, /scripts\/tool.JS: new authored JavaScript/);
+  assert.match(errors, /scripts\/hidden.mjs: new authored JavaScript/);
+  policy.nativeFiles = { 'scripts/run.ps1': 'Reviewed Windows runner' };
+  assert.doesNotMatch(inspectSourcePolicy(root, policy, program).join('\n'), /run.ps1/);
+}));
+
 test('compiler projects covering TypeScript tests or scripts require erasableSyntaxOnly', () => fixture((root, policy, program) => {
   policy.roots.push('tests');
   mkdirSync(join(root, 'tests'));
