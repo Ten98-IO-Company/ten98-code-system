@@ -8,7 +8,7 @@ import test from 'node:test';
 import * as runtime from '../index.mjs';
 
 test('generated public entrypoint retains every frozen runtime export', () => {
-  assert.deepEqual(Object.keys(runtime).sort(), ['createMigrationLedger', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'normalizeClientAddress', 'oidcEndpoint', 'openRouterFetch', 'parseTrustedProxies', 'readResponseText', 'resolveClientAddress', 'workspaceRoles'].sort());
+  assert.deepEqual(Object.keys(runtime).sort(), ['createMigrationLedger', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'normalizeClientAddress', 'oidcEndpoint', 'openRouterFetch', 'parseTrustedProxies', 'readResponseText', 'resolveClientAddress', 'workspaceRoles', 'SES_REGIONS', 'classifyEmailFeedback', 'deriveAwsV4SigningKey', 'sendSesEmail', 'sesOrigin', 'signAwsV4Request', 'verifySnsMessage'].sort());
 });
 
 test('actual compiler rejects an implementation type error and preserves last good output', () => {
@@ -25,7 +25,7 @@ test('actual compiler rejects an implementation type error and preserves last go
     writeFileSync(implementation, source);
     writeFileSync(join(temporary, 'src/database-policy.mts'), readFileSync(new URL('../src/database-policy.mts', import.meta.url)));
     writeFileSync(join(temporary, 'src/migration-ledger.mts'), readFileSync(new URL('../src/migration-ledger.mts', import.meta.url)));
-    writeFileSync(join(temporary, 'src/client-address.mts'), readFileSync(new URL('../src/client-address.mts', import.meta.url)));
+    for (const module of ['client-address', 'ses-email', 'sns-notification', 'email-feedback']) writeFileSync(join(temporary, `src/${module}.mts`), readFileSync(new URL(`../src/${module}.mts`, import.meta.url)));
     let result = compile(); assert.equal(result.status, 0, result.stdout + result.stderr);
     const outputs = ['index.mjs', 'index.d.mts'].map(name => join(temporary, name));
     const before = outputs.map(hash);

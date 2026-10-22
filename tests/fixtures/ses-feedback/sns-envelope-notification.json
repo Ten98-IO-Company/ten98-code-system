@@ -1,0 +1,11 @@
+{
+  "Type": "Notification",
+  "MessageId": "22b80b92-fdea-4c2c-8f9d-bdfb0c7bf324",
+  "TopicArn": "arn:aws:sns:us-east-1:123456789012:ses-feedback",
+  "Message": "{\"notificationType\":\"Bounce\",\"bounce\":{\"bounceType\":\"Permanent\",\"bounceSubType\":\"General\",\"bouncedRecipients\":[{\"emailAddress\":\"unknown-user@example.net\",\"action\":\"failed\",\"status\":\"5.1.1\",\"diagnosticCode\":\"smtp; 550 5.1.1 user unknown\"}],\"timestamp\":\"2026-10-20T12:00:05.000Z\",\"feedbackId\":\"0100019a0b1c2d40-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-000000\",\"remoteMtaIp\":\"198.51.100.25\",\"reportingMTA\":\"dns; a1-2.smtp-out.amazonses.com\"},\"mail\":{\"timestamp\":\"2026-10-20T12:00:00.000Z\",\"source\":\"notices@example.com\",\"sourceArn\":\"arn:aws:ses:us-east-1:123456789012:identity/example.com\",\"sourceIp\":\"192.0.2.10\",\"sendingAccountId\":\"123456789012\",\"messageId\":\"0100019a0b1c2d3e-11111111-2222-3333-4444-555555555555-000000\",\"destination\":[\"unknown-user@example.net\"]}}",
+  "Timestamp": "2026-10-20T12:00:06.000Z",
+  "SignatureVersion": "2",
+  "Signature": "",
+  "SigningCertURL": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-9c6465fa7f48f5cacd23014631ec1136.pem",
+  "UnsubscribeURL": "https://sns.us-east-1.amazonaws.com/?Action=Unsubscribe&SubscriptionArn=arn:aws:sns:us-east-1:123456789012:ses-feedback:c9135db0-26c4-47ec-8998-413945fb5a96"
+}

@@ -1,0 +1,30 @@
+{
+  "notificationType": "Bounce",
+  "bounce": {
+    "bounceType": "Permanent",
+    "bounceSubType": "Suppressed",
+    "bouncedRecipients": [
+      {
+        "emailAddress": "suppressed@example.net",
+        "action": "failed",
+        "status": "5.1.1",
+        "diagnosticCode": "Amazon SES has suppressed sending to this address because it has a recent history of bouncing as an invalid address."
+      }
+    ],
+    "timestamp": "2026-10-20T12:00:05.000Z",
+    "feedbackId": "0100019a0b1c2d40-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-000000",
+    "remoteMtaIp": "198.51.100.25",
+    "reportingMTA": "dns; a1-2.smtp-out.amazonses.com"
+  },
+  "mail": {
+    "timestamp": "2026-10-20T12:00:00.000Z",
+    "source": "notices@example.com",
+    "sourceArn": "arn:aws:ses:us-east-1:123456789012:identity/example.com",
+    "sourceIp": "192.0.2.10",
+    "sendingAccountId": "123456789012",
+    "messageId": "0100019a0b1c2d3e-11111111-2222-3333-4444-555555555555-000000",
+    "destination": [
+      "suppressed@example.net"
+    ]
+  }
+}

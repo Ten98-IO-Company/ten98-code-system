@@ -1,0 +1,37 @@
+{
+  "notificationType": "Bounce",
+  "bounce": {
+    "bounceType": "Permanent",
+    "bounceSubType": "General",
+    "reportingMTA": "example.net",
+    "timestamp": "2026-10-20T12:00:05.000Z",
+    "feedbackId": "0100019a0b1c2d42-12121212-3434-5656-7878-909090909090-000000",
+    "remoteMtaIp": "198.51.100.25",
+    "bouncedRecipients": [
+      {
+        "status": "5.0.0",
+        "action": "failed",
+        "diagnosticCode": "smtp; 550 user unknown",
+        "emailAddress": "first@example.net"
+      },
+      {
+        "status": "5.7.1",
+        "action": "failed",
+        "diagnosticCode": "smtp; 550 5.7.1 relaying denied",
+        "emailAddress": "second@example.net"
+      }
+    ]
+  },
+  "mail": {
+    "timestamp": "2026-10-20T12:00:00.000Z",
+    "source": "notices@example.com",
+    "sourceArn": "arn:aws:ses:us-east-1:123456789012:identity/example.com",
+    "sourceIp": "192.0.2.10",
+    "sendingAccountId": "123456789012",
+    "messageId": "0100019a0b1c2d3e-11111111-2222-3333-4444-555555555555-000000",
+    "destination": [
+      "first@example.net",
+      "second@example.net"
+    ]
+  }
+}
