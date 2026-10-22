@@ -20,3 +20,6 @@ export declare function oidcEndpoint(raw: string | URL, { allowHttp, issuer }?: 
 }): URL;
 export * from './migration-ledger.mjs';
 export * from './client-address.mjs';
+export * from './ses-email.mjs';
+export * from './sns-notification.mjs';
+export * from './email-feedback.mjs';
