@@ -126,7 +126,7 @@ test('native static profile checks every new tooling source and retains only nam
     const files = ['scripts/build.mts', 'scripts/css-tokens.mts', 'scripts/css-tokens.test.mts'];
     const legacy = ['src/worker.js', 'public/enquiry.js', 'public/tracking-preferences.js', 'scripts/check.mjs', 'scripts/check-self-test.mjs', 'scripts/enquiry-test.mjs', 'scripts/turnstile-frontend-test.mjs', 'scripts/tracking-preferences-test.mjs'];
     for (const name of [...files, ...legacy]) { mkdirSync(dirname(join(directory, name)), { recursive: true }); writeFileSync(join(directory, name), 'export {};\n'); }
-    const compilation = { compilerOptions: { strict: true }, files };
+    const compilation = { compilerOptions: { strict: true, erasableSyntaxOnly: true }, files };
     assert.deepEqual(policy.compilerProjects, ['tsconfig.tooling.json']);
     assert.deepEqual(inspectSourcePolicy(directory, policy, compilation), []);
     assert.match(inspectSourcePolicy(directory, policy, { ...compilation, files: files.filter(file => !file.endsWith('css-tokens.mts')) }).join('\n'), /css-tokens.mts: TypeScript is absent/);

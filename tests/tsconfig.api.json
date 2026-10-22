@@ -10,7 +10,8 @@
     ],
     "strict": true,
     "noEmit": true,
-    "types": []
+    "types": [],
+    "erasableSyntaxOnly": true
   },
   "files": [
     "runtime-api-contract.mts"

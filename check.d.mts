@@ -32,6 +32,7 @@ export interface PackageManifest {
 }
 interface CompilerProject {
     compilerOptions?: Record<string, unknown>;
+    files?: string[];
 }
 export interface Compilation extends CompilerProject {
     projects?: CompilerProject[];

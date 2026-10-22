@@ -64,6 +64,8 @@ export interface PackageManifest {
 
 interface CompilerProject {
   compilerOptions?: Record<string, unknown>;
+  // Resolved program files; a single-project Compilation's own files list serves this role.
+  files?: string[];
 }
 
 export interface Compilation extends CompilerProject {
@@ -194,6 +196,7 @@ export function checkManifest(manifest: PackageManifest): string[] {
 export function inspectSourcePolicy(directory: string, policy: SourceLanguagePolicy, compilation: Compilation): string[] {
   const errors: string[] = [];
   if (policy.default !== 'typescript') return ['Unknown source language policy.'];
+  const nameOf = (file: string): string => relative(directory, resolve(directory, file)).replaceAll('\\', '/');
   for (const project of compilation.projects ?? [compilation]) {
     const options = project.compilerOptions ?? {};
     if (options.strict !== true) errors.push('The source compiler must enable strict.');
@@ -201,6 +204,9 @@ export function inspectSourcePolicy(directory: string, policy: SourceLanguagePol
     for (const name of ['noImplicitAny', 'noImplicitThis', 'strictNullChecks', 'strictFunctionTypes', 'strictBindCallApply', 'strictPropertyInitialization', 'strictBuiltinIteratorReturn', 'alwaysStrict', 'useUnknownInCatchVariables']) {
       if (options[name] === false) errors.push(`The source compiler must not disable ${name}.`);
     }
+    // Node 24 strips types from tests and scripts without checking them; erasable syntax keeps the run and checked programs identical.
+    const stripped = (project.files ?? []).map(nameOf).find(name => /^(?:tests|scripts)\//u.test(name) && /\.[cm]?ts$/u.test(name) && !/\.d\.[cm]?ts$/u.test(name));
+    if (stripped && options.erasableSyntaxOnly !== true) errors.push(`${stripped}: a compiler project covering tests or scripts must enable erasableSyntaxOnly.`);
   }
   const checked = new Set(compilation.files.map(file => resolve(directory, file)));
   const legacy = new Set(policy.legacyJavaScript), files: string[] = [];
@@ -225,15 +231,20 @@ export function inspectSourcePolicy(directory: string, policy: SourceLanguagePol
     if (lstatSync(folder).isSymbolicLink()) { errors.push(`Source links need explicit review: ${relative(directory, folder)}`); return; }
     for (const entry of readdirSync(folder, { withFileTypes: true })) {
       const file = resolve(folder, entry.name);
+      // Nested artifact directories such as tests/fixtures hold checker inputs and recorded payloads, not authored source.
+      if (artifacts.has(nameOf(file))) continue;
       if (entry.isDirectory()) walk(file);
       else if (entry.isSymbolicLink()) errors.push(`Source links need explicit review: ${relative(directory, file)}`);
       else if (entry.isFile()) files.push(file);
     }
   };
   for (const root of policy.roots) walk(resolve(directory, root));
+  // The legacy list only shrinks: entries for removed, converted or relocated files must be deleted.
+  const found = new Set(files.map(nameOf).filter(name => /\.(?:[cm]?js|jsx)$/u.test(name)));
+  for (const name of legacy) if (!found.has(name)) errors.push(`${name}: stale legacyJavaScript entry; no such authored JavaScript under a source root.`);
   for (const file of files) {
-    const name = relative(directory, file).replaceAll('\\', '/');
-    if (/\.(?:[cm]?js|jsx)$/u.test(name) && !legacy.has(name)) errors.push(`${name}: new authored JavaScript is not approved; use checked TypeScript.`);
+    const name = nameOf(file);
+    if (found.has(name) && !legacy.has(name)) errors.push(`${name}: new authored JavaScript is not approved; use checked TypeScript.`);
     if (!/\.(?:[cm]?ts|tsx)$/u.test(name)) continue;
     if (!checked.has(file)) errors.push(`${name}: TypeScript is absent from the configured compiler program.`);
     const source = readFileSync(file, 'utf8'), generated = policy.generated[name];
@@ -263,8 +274,9 @@ export function checkSourceLanguage(directory: string, name: string): string[] {
   const projects: CompilerProject[] = [], files: string[] = [];
   // Resolve the actual import closure as well as configured roots; callers cannot submit a synthetic program.
   for (const project of policy.compilerProjects) {
-    projects.push(JSON.parse(run(project, ['--showConfig'])));
-    files.push(...run(project, ['--listFilesOnly', '--pretty', 'false']).trim().split(/\r?\n/u).filter(Boolean));
+    const program = run(project, ['--listFilesOnly', '--pretty', 'false']).trim().split(/\r?\n/u).filter(Boolean);
+    projects.push({ ...JSON.parse(run(project, ['--showConfig'])), files: program });
+    files.push(...program);
   }
   const errors = inspectSourcePolicy(directory, policy, { projects, files });
   if (!errors.length) for (const project of policy.compilerProjects) run(project, ['--noEmit', '--pretty', 'false']);
