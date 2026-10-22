@@ -1,0 +1,26 @@
+{
+  "notificationType": "Complaint",
+  "complaint": {
+    "userAgent": "ExampleCorp Feedback Loop (V0.01)",
+    "complainedRecipients": [
+      {
+        "emailAddress": "abuse@example.net"
+      }
+    ],
+    "complaintFeedbackType": "abuse",
+    "arrivalDate": "2026-10-20T12:30:00.000Z",
+    "timestamp": "2026-10-20T12:31:00.000Z",
+    "feedbackId": "0100019a0b1c2d41-ffffffff-1111-2222-3333-444444444444-000000"
+  },
+  "mail": {
+    "timestamp": "2026-10-20T12:00:00.000Z",
+    "source": "notices@example.com",
+    "sourceArn": "arn:aws:ses:us-east-1:123456789012:identity/example.com",
+    "sourceIp": "192.0.2.10",
+    "sendingAccountId": "123456789012",
+    "messageId": "0100019a0b1c2d3e-11111111-2222-3333-4444-555555555555-000000",
+    "destination": [
+      "abuse@example.net"
+    ]
+  }
+}
