@@ -1,6 +1,6 @@
 # ten98 code system
 
-Read README.md and architecture.json before editing. This is the canonical home for shared technical mechanisms; @ten98/ui remains the presentation package.
+Read README.md, the wiki (https://github.com/Ten98-IO-Company/ten98-code-system/wiki) and architecture.json before editing. This is the canonical home for shared technical mechanisms; @ten98/ui remains the presentation package.
 
 Before implementing a repeated feature, inspect features/catalog.json and follow docs/FEATURE-ADOPTION.md. Prefer imports; copy a pinned complete implementation only when its stack integration requires it. Include every required migration, configuration, frontend/server entrypoint and dependency, the runnable source checks, provenance and known issues. Register the receiving app and version in its adoption issue. Never call a feature complete or battle-tested from helpers or synthetic tests alone.
 
@@ -12,6 +12,6 @@ For a shared change, run npm test with Node 24, inspect npm pack and run affecte
 
 Update the canonical architecture declaration instead of copying its versions into app-owned policy files. Consumers use an immutable vendored archive and lockfile. Preserve immutable releases and source/license notices; keep only actively pinned archives in application folders after verifying historical bytes in GitHub Releases. Preserve unrelated working-tree changes.
 
-Track defects and migration work in this repository's GitHub Issues and linked Project. Keep README and code comments focused on current operation and non-obvious constraints; put audit history, progress reports and historical evidence in GitHub instead of adding app-owned ledgers.
+Track defects and migration work in this repository's GitHub Issues and linked Project. Write documentation to the wiki, not to docs/ or the README; keep the README to what the project is, who it's for, community and legal links. Keep only files that tools read (catalog, architecture declaration, adoption guide) in the repository, and inline explanations in code comments. Put audit history, progress reports and historical evidence in GitHub instead of adding app-owned ledgers.
 
-Make decisions at the lowest level that has the authority and the facts, as set out in [docs/DECISIONS.md](docs/DECISIONS.md). Owners decide in-scope, reversible work themselves. The manager coordinates across sessions. The decision council answers high-level questions in issues labelled `decision`. The user decides anything irreversible or outward.
+Make decisions at the lowest level that has the authority and the facts, as set out in the [Decisions](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Decisions) wiki page. Owners decide in-scope, reversible work themselves. The manager coordinates across sessions. The decision council answers high-level questions in issues labelled `decision`. The user decides anything irreversible or outward.
