@@ -23,7 +23,7 @@ jobs:
       - name: Verify new release tag identity
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         run: node check.mjs --release . --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --event "$GITHUB_EVENT_PATH"
-      - run: npm ci
-      - run: npm test
+      - run: npx --yes pnpm@11.19.0 install --frozen-lockfile
+      - run: npx --yes pnpm@11.19.0 test
       - run: git diff --exit-code
-      - run: npm pack --dry-run
+      - run: npx --yes pnpm@11.19.0 pack --dry-run

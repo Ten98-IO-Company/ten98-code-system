@@ -413,12 +413,21 @@ export function collectReleaseIdentity(directory, { tag = '', commit = '', tagOb
         }
     }
     const manifest = JSON.parse(git('show', `${commit}:package.json`));
-    const lock = JSON.parse(git('show', `${commit}:package-lock.json`));
     const version = tag.slice(1), name = manifest.name;
     if (typeof name !== 'string' || !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/u.test(name) || manifest.version !== version)
         throw Error('Committed package name/version does not match the release tag.');
-    if (lock.name !== name || lock.version !== version || lock.packages?.['']?.name !== name || lock.packages[''].version !== version)
-        throw Error('Committed root lock name/version differs from the package.');
+    const tracked = git('ls-tree', '--name-only', commit, '--', 'package-lock.json', 'pnpm-lock.yaml').split('\n').filter(Boolean);
+    if (tracked.length !== 1)
+        throw Error('Release commit must track exactly one lockfile: package-lock.json or pnpm-lock.yaml.');
+    // npm records the root name and version in its lock; pnpm's lock records neither, so package.json alone carries them.
+    if (tracked[0] === 'package-lock.json') {
+        const lock = JSON.parse(git('show', `${commit}:package-lock.json`));
+        if (lock.name !== name || lock.version !== version || lock.packages?.['']?.name !== name || lock.packages[''].version !== version)
+            throw Error('Committed root lock name/version differs from the package.');
+    }
+    else if (!/^importers:\r?\n(?:\r?\n)? {2}\.:\r?$/mu.test(git('show', `${commit}:pnpm-lock.yaml`))) {
+        throw Error('Committed pnpm lock has no root importer.');
+    }
     const evidence = { name, version, tag, commit: actualCommit, tagObject: actualObject, tagHistory: event ? 'new-tag push event' : tagObject ? 'independent tag-object receipt' : 'unverified; no prior tag-object receipt or push event' };
     if (archiveSha256 !== undefined && (!archive || !/^[0-9a-f]{64}$/u.test(archiveSha256)))
         throw Error('Archive digest comparison needs an archive and a full SHA256.');

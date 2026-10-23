@@ -87,6 +87,20 @@ test('rejects committed package and both root lock identity mismatches', t => {
   assert.throws(() => f.check(), /root lock/u);
 });
 
+test('accepts exactly one lockfile: an npm lock with matching root identity, or a pnpm lock with a root importer', t => {
+  const f = fixture(t);
+  const retag = () => { f.options.commit = f.commit(); f.git('tag', '-f', '-a', f.options.tag, '-m', 'Lockfile fixture'); };
+  const pnpmLock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    devDependencies: {}\n";
+  writeFileSync(join(f.directory, 'pnpm-lock.yaml'), pnpmLock); retag();
+  assert.throws(() => f.check(), /exactly one lockfile/u);
+  f.git('rm', '--quiet', 'package-lock.json'); retag();
+  assert.equal(f.check().version, '1.2.3');
+  writeFileSync(join(f.directory, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n\npackages: {}\n"); retag();
+  assert.throws(() => f.check(), /root importer/u);
+  f.git('rm', '--quiet', 'pnpm-lock.yaml'); retag();
+  assert.throws(() => f.check(), /exactly one lockfile/u);
+});
+
 test('rejects archive filename, actual packed identity and retained-byte mismatches', t => {
   const f = fixture(t), archive = f.pack(), digest = f.check({ archive }).archive.sha256;
   const wrongName = join(f.directory, 'wrong.tgz'); copyFileSync(archive, wrongName);
