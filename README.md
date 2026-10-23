@@ -2,52 +2,45 @@
 
 Shared server-side building blocks for Ten98 apps, so every app gets the same tested behaviour instead of its own copy.
 
-`@ten98/runtime` is the common code behind [Ten98 Campaign](https://github.com/Ten98-IO-Company/ten98-campaign) and [Ten98 Discover](https://github.com/Ten98-IO-Company/ten98-discover). It also holds the architecture contract that keeps their versions, dependencies and source rules consistent. Shared React presentation lives in the [Ten98 Design System](https://github.com/Ten98-IO-Company/ten98-design-system).
+`@ten98/runtime` is the common code behind [Ten98 Campaign](https://github.com/Ten98-IO-Company/ten98-campaign) and [Ten98 Discover](https://github.com/Ten98-IO-Company/ten98-discover), for Ten98 apps and their developers. It also holds the architecture contract that keeps their versions, dependencies and source rules consistent. Shared React presentation lives in the [Ten98 Design System](https://github.com/Ten98-IO-Company/ten98-design-system).
 
-## Why it exists
+## Why Code System
 
-- **Fix once, fixed everywhere.** Email delivery, workspace roles, migrations, client addresses behind proxies and safe network reads are written, reviewed and tested in one place.
-- **No hidden dependencies.** The runtime has no third-party runtime dependencies; apps install it from an immutable, checksummed release archive.
+- **Fix once, fixed everywhere.** Workspace roles, safe network reads, database migrations, client addresses behind proxies, Amazon SES email and its bounce and complaint feedback are written, reviewed and tested in one place.
+- **No hidden dependencies.** The runtime has no third-party runtime dependencies. Apps install it from an immutable, checksummed release archive.
 - **Consistent stack.** One checker keeps Node, TypeScript, React and dependency versions aligned across apps, and blocks new untyped source.
-- **Open source** under the MIT licence.
-
-## What's inside
-
-| Area | Exports |
-|---|---|
-| Workspace roles | `workspaceRoles`, `mayGrantWorkspaceRole`, `mayManageWorkspaceMember` |
-| Network reads | `readResponseText`, `openRouterFetch`, `oidcEndpoint` |
-| Database migrations | `createMigrationLedger` |
-| Client address behind proxies | `parseTrustedProxies`, `resolveClientAddress`, `normalizeClientAddress` |
-| Email through Amazon SES | `sendSesEmail`, `verifySnsMessage`, `classifyEmailFeedback` |
-| Architecture checks | `check.mjs` and [architecture.json](architecture.json) |
-
-Each function's options and guarantees are in the [Runtime API](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Runtime-API) guide and in the type declarations shipped with the package.
+- **Reuse before rebuilding.** A [feature catalogue](features/catalog.json) points to the maintained implementation of features that already exist in a Ten98 app.
+- Open source under the MIT licence.
 
 ## Get started
 
-Guides are in the [wiki](https://github.com/Ten98-IO-Company/ten98-code-system/wiki):
+- Install a release archive from [GitHub Releases](https://github.com/Ten98-IO-Company/ten98-code-system/releases) into the app's `vendor/` folder, and update the manifest and lockfile together.
+- Import functions from `@ten98/runtime`. Their types ship with the package.
+- Run `node node_modules/@ten98/runtime/check.mjs .` as the app's `check:architecture` script, first in every `test` and `build` script. [architecture.json](architecture.json) declares the shared versions and dependencies.
+- Apps keep their own authorization, storage, credentials and paid-work accounting. The runtime owns only the shared mechanism.
 
-- [Runtime API](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Runtime-API)
-- [Architecture contract](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Architecture-Contract)
-- [Verify and release](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Verify-and-Release)
-- [Feature contracts](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Feature-Contracts)
+Installation, configuration and guides are in the [wiki](https://github.com/Ten98-IO-Company/ten98-code-system/wiki):
 
-Building a feature that already exists in a Ten98 app? Start with the [feature catalogue](features/catalog.json) and the [adoption guide](docs/FEATURE-ADOPTION.md).
+- [Development](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Development): work on the runtime locally, run the tests and contribute code.
+- [Usage](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Usage): install a release in an app and run the architecture check.
+- [Releases](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Releases): cut, verify and upgrade a release.
+- [Reference](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Reference): every exported function and what it guarantees.
 
 ## Community
 
 - Questions and ideas: [Discussions](https://github.com/Ten98-IO-Company/ten98-code-system/discussions)
-- Bugs and adoption work: [Issues](https://github.com/Ten98-IO-Company/ten98-code-system/issues), tracked on the [ten98-code-system project](https://github.com/orgs/Ten98-IO-Company/projects/5)
+- Bugs and feature requests: [Issues](https://github.com/Ten98-IO-Company/ten98-code-system/issues)
+- Roadmap: [Ten98 Code System Project](https://github.com/orgs/Ten98-IO-Company/projects/5)
 - Releases: [GitHub Releases](https://github.com/Ten98-IO-Company/ten98-code-system/releases)
-- Contributing: [contributing guide](https://github.com/Ten98-IO-Company/.github/blob/main/CONTRIBUTING.md) and [Code of Conduct](https://github.com/Ten98-IO-Company/.github/blob/main/CODE_OF_CONDUCT.md)
+- Contributing: [contributing guide](https://github.com/Ten98-IO-Company/.github/blob/main/CONTRIBUTING.md) · [Code of Conduct](https://github.com/Ten98-IO-Company/.github/blob/main/CODE_OF_CONDUCT.md)
 
 ## Security
 
-Please report vulnerabilities privately through [GitHub private vulnerability reporting](https://github.com/Ten98-IO-Company/ten98-code-system/security/advisories/new), not in public issues. See the [security policy](https://github.com/Ten98-IO-Company/.github/blob/main/SECURITY.md).
+Report vulnerabilities privately through [GitHub private vulnerability reporting](https://github.com/Ten98-IO-Company/ten98-code-system/security/advisories/new); see the [security policy](https://github.com/Ten98-IO-Company/.github/blob/main/SECURITY.md). Please don't open public issues for security problems.
 
 ## Legal
 
-- **Licence:** [MIT](LICENSE). The software is provided "as is", without warranty, as the licence states.
-- **Trademarks:** Ten98 and the Ten98 logo are trademarks of Ten98 Technologies Ltd. The MIT licence covers the code, not the name or logo: forks must use their own name and branding.
-- **Privacy:** The hosted apps at *.ten98.io are covered by the [Ten98 privacy policy](https://ten98.io/legal/privacy). Self-hosted installs are run by their operator and send no data to Ten98.
+- Licence: [MIT](LICENSE).
+- Provided "as is", without warranty, as stated in the licence.
+- Ten98 and the Ten98 logo are trademarks of Ten98 Technologies Ltd. The MIT licence covers the code, not the name or logo: forks must use their own name and branding.
+- The hosted apps at *.ten98.io are covered by the Ten98 privacy policy (https://ten98.io/legal/privacy). Self-hosted installs are run by their operator and send no data to Ten98.
