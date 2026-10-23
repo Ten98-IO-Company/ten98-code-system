@@ -7,9 +7,13 @@ export function mayManageWorkspaceMember(actor, previousRole, nextRole) {
     return mayGrantWorkspaceRole(actor, previousRole) && (nextRole === undefined || mayGrantWorkspaceRole(actor, nextRole));
 }
 const lengthError = (code, message) => Object.assign(new TypeError(message), { code });
-export async function readResponseText(response, { maxBytes, signal, preserveBOM = false, contentLength = false } = {}) {
+export async function readResponseText(response, { maxBytes, signal, preserveBOM = false, contentLength = false, maxChunks } = {}) {
     if (typeof maxBytes !== 'number' || !Number.isSafeInteger(maxBytes) || maxBytes < 0)
         throw new TypeError('maxBytes must be a nonnegative safe integer.');
+    if (maxChunks !== undefined && (!Number.isSafeInteger(maxChunks) || maxChunks < 1))
+        throw new TypeError('maxChunks must be a positive safe integer.');
+    if (![false, true, 'limit', 'exact'].includes(contentLength))
+        throw new TypeError("contentLength must be true, false, 'limit' or 'exact'.");
     const tooLarge = () => Object.assign(new RangeError('Response exceeds the byte limit.'), { code: 'RESPONSE_TOO_LARGE' });
     let declared;
     if (contentLength) {
@@ -25,7 +29,7 @@ export async function readResponseText(response, { maxBytes, signal, preserveBOM
             }
             // Fetch decodes compressed bodies, so only an identity-encoded body can be compared byte for byte.
             const encoding = response.headers.get('content-encoding');
-            if (encoding === null || encoding.trim().toLowerCase() === 'identity')
+            if (contentLength !== 'limit' && (encoding === null || encoding.trim().toLowerCase() === 'identity'))
                 declared = Number(header);
         }
     }
@@ -41,21 +45,31 @@ export async function readResponseText(response, { maxBytes, signal, preserveBOM
     try {
         signal?.throwIfAborted();
         const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: preserveBOM });
-        let bytes = 0, text = '';
+        const decode = (value) => {
+            try {
+                return value ? decoder.decode(value, { stream: true }) : decoder.decode();
+            }
+            catch {
+                throw lengthError('RESPONSE_DECODE_INVALID', 'Response body is not valid UTF-8.');
+            }
+        };
+        let bytes = 0, chunks = 0, text = '';
         while (true) {
             const { value, done } = await reader.read();
             signal?.throwIfAborted();
             if (done) {
                 if (declared !== undefined && bytes !== declared)
                     throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
-                return text + decoder.decode();
+                return text + decode();
             }
             bytes += value.byteLength;
             if (bytes > maxBytes)
                 throw tooLarge();
+            if (maxChunks !== undefined && ++chunks > maxChunks)
+                throw Object.assign(new RangeError('Response arrived in too many chunks.'), { code: 'RESPONSE_TOO_MANY_CHUNKS' });
             if (declared !== undefined && bytes > declared)
                 throw lengthError('RESPONSE_INCOMPLETE', 'Response body is longer than its Content-Length.');
-            text += decoder.decode(value, { stream: true });
+            text += decode(value);
         }
     }
     finally {
