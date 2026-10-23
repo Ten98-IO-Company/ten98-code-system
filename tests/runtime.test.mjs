@@ -57,6 +57,26 @@ test('a declared Content-Length is checked before reading and matched exactly fo
   await assert.rejects(readResponseText(new Response('okay'), { maxBytes: 2 }), code('RESPONSE_TOO_LARGE'));
 });
 
+test("contentLength 'limit' checks the declaration without an exact match; maxChunks bounds trickled bodies; decode failures have their own code", async () => {
+  const code = expected => error => error.code === expected;
+  // 'limit': a body shorter than its declaration is accepted, but an over-limit or malformed declaration is still refused.
+  assert.equal(await readResponseText(new Response('ok', { headers: { 'content-length': '5' } }), { maxBytes: 5, contentLength: 'limit' }), 'ok');
+  await assert.rejects(readResponseText(new Response('ok', { headers: { 'content-length': '6' } }), { maxBytes: 5, contentLength: 'limit' }), code('RESPONSE_TOO_LARGE'));
+  await assert.rejects(readResponseText(new Response('ok', { headers: { 'content-length': 'x' } }), { maxBytes: 5, contentLength: 'limit' }), code('CONTENT_LENGTH_INVALID'));
+  await assert.rejects(readResponseText(new Response('ok', { headers: { 'content-length': '5' } }), { maxBytes: 5, contentLength: 'exact' }), code('RESPONSE_INCOMPLETE'));
+  await assert.rejects(readResponseText(new Response('ok'), { maxBytes: 5, contentLength: 'sometimes' }), TypeError);
+  // maxChunks: counted per delivered chunk, independent of the byte total.
+  const trickle = count => new Response(new ReadableStream({ start(controller) { for (let i = 0; i < count; i++) controller.enqueue(Uint8Array.of(0x61)); controller.close(); } }));
+  assert.equal(await readResponseText(trickle(3), { maxBytes: 10, maxChunks: 3 }), 'aaa');
+  await assert.rejects(readResponseText(trickle(4), { maxBytes: 10, maxChunks: 3 }), code('RESPONSE_TOO_MANY_CHUNKS'));
+  await assert.rejects(readResponseText(trickle(1), { maxBytes: 10, maxChunks: 0 }), TypeError);
+  // Malformed UTF-8 is distinguishable from a stream failure.
+  await assert.rejects(readResponseText(new Response(Uint8Array.of(0xc0, 0xaf)), { maxBytes: 2 }), code('RESPONSE_DECODE_INVALID'));
+  await assert.rejects(readResponseText(new Response(Uint8Array.of(0xe2)), { maxBytes: 1 }), code('RESPONSE_DECODE_INVALID'));
+  const broken = new Response(new ReadableStream({ start(controller) { controller.error(new TypeError('network lost')); } }));
+  await assert.rejects(readResponseText(broken, { maxBytes: 5 }), error => error instanceof TypeError && error.code === undefined && error.message === 'network lost');
+});
+
 test('BOM preservation is explicit, including split BOM bytes and exact-empty JSON semantics', async () => {
   for (const suffix of ['', '{}']) for (const preserveBOM of [false, true]) {
     const response = new Response(new ReadableStream({ start(controller) {

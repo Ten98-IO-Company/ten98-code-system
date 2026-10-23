@@ -8,16 +8,32 @@ export function mayManageWorkspaceMember(actor: unknown, previousRole: unknown, 
   return mayGrantWorkspaceRole(actor, previousRole) && (nextRole === undefined || mayGrantWorkspaceRole(actor, nextRole));
 }
 
-const lengthError = (code: 'CONTENT_LENGTH_INVALID' | 'RESPONSE_INCOMPLETE', message: string) => Object.assign(new TypeError(message), { code });
+const lengthError = (code: 'CONTENT_LENGTH_INVALID' | 'RESPONSE_INCOMPLETE' | 'RESPONSE_DECODE_INVALID', message: string) => Object.assign(new TypeError(message), { code });
+
+/** Options for {@link readResponseText}. */
+export interface ReadResponseTextOptions {
+  maxBytes: number;
+  signal?: AbortSignal;
+  preserveBOM?: boolean;
+  /**
+   * `'limit'` checks a declared Content-Length (plain decimal, at most `maxBytes`) before reading. `'exact'`, or `true`,
+   * also requires an identity-encoded body to match the declaration exactly.
+   */
+  contentLength?: boolean | 'limit' | 'exact';
+  /** Refuse a body delivered in more than this many chunks, so a slow trickle of tiny chunks cannot hold the reader. */
+  maxChunks?: number;
+}
 
 /**
- * With `contentLength: true`, a declared Content-Length must be a plain decimal, a declaration above `maxBytes` is refused
- * before any byte is read, and an identity-encoded body must match the declaration exactly. Errors carry `code`:
- * `RESPONSE_TOO_LARGE` (RangeError), `CONTENT_LENGTH_INVALID` or `RESPONSE_INCOMPLETE` (TypeError); malformed UTF-8 is a plain TypeError.
+ * Errors carry `code`: `RESPONSE_TOO_LARGE` or `RESPONSE_TOO_MANY_CHUNKS` (RangeError); `CONTENT_LENGTH_INVALID`,
+ * `RESPONSE_INCOMPLETE` or `RESPONSE_DECODE_INVALID` for malformed UTF-8 (TypeError). Stream and network failures are
+ * rethrown as they are, so a caller can tell an unreadable body from an interrupted one.
  */
-export function readResponseText(response: Response, options: { maxBytes: number; signal?: AbortSignal; preserveBOM?: boolean; contentLength?: boolean }): Promise<string>;
-export async function readResponseText(response: Response, { maxBytes, signal, preserveBOM = false, contentLength = false }: { maxBytes?: number; signal?: AbortSignal; preserveBOM?: boolean; contentLength?: boolean } = {}): Promise<string> {
+export function readResponseText(response: Response, options: ReadResponseTextOptions): Promise<string>;
+export async function readResponseText(response: Response, { maxBytes, signal, preserveBOM = false, contentLength = false, maxChunks }: Partial<ReadResponseTextOptions> = {}): Promise<string> {
   if (typeof maxBytes !== 'number' || !Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError('maxBytes must be a nonnegative safe integer.');
+  if (maxChunks !== undefined && (!Number.isSafeInteger(maxChunks) || maxChunks < 1)) throw new TypeError('maxChunks must be a positive safe integer.');
+  if (![false, true, 'limit', 'exact'].includes(contentLength)) throw new TypeError("contentLength must be true, false, 'limit' or 'exact'.");
   const tooLarge = () => Object.assign(new RangeError('Response exceeds the byte limit.'), { code: 'RESPONSE_TOO_LARGE' });
   let declared: number | undefined;
   if (contentLength) {
@@ -27,7 +43,7 @@ export async function readResponseText(response: Response, { maxBytes, signal, p
       if (Number(header) > maxBytes) { void response.body?.cancel().catch(() => {}); throw tooLarge(); }
       // Fetch decodes compressed bodies, so only an identity-encoded body can be compared byte for byte.
       const encoding = response.headers.get('content-encoding');
-      if (encoding === null || encoding.trim().toLowerCase() === 'identity') declared = Number(header);
+      if (contentLength !== 'limit' && (encoding === null || encoding.trim().toLowerCase() === 'identity')) declared = Number(header);
     }
   }
   const reader = response.body?.getReader();
@@ -41,18 +57,23 @@ export async function readResponseText(response: Response, { maxBytes, signal, p
   try {
     signal?.throwIfAborted();
     const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: preserveBOM });
-    let bytes = 0, text = '';
+    const decode = (value?: Uint8Array): string => {
+      try { return value ? decoder.decode(value, { stream: true }) : decoder.decode(); }
+      catch { throw lengthError('RESPONSE_DECODE_INVALID', 'Response body is not valid UTF-8.'); }
+    };
+    let bytes = 0, chunks = 0, text = '';
     while (true) {
       const { value, done } = await reader.read();
       signal?.throwIfAborted();
       if (done) {
         if (declared !== undefined && bytes !== declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
-        return text + decoder.decode();
+        return text + decode();
       }
       bytes += value.byteLength;
       if (bytes > maxBytes) throw tooLarge();
+      if (maxChunks !== undefined && ++chunks > maxChunks) throw Object.assign(new RangeError('Response arrived in too many chunks.'), { code: 'RESPONSE_TOO_MANY_CHUNKS' });
       if (declared !== undefined && bytes > declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is longer than its Content-Length.');
-      text += decoder.decode(value, { stream: true });
+      text += decode(value);
     }
   } finally {
     signal?.removeEventListener('abort', abort);

@@ -2,17 +2,25 @@ export declare const workspaceRoles: readonly ['owner', 'admin', 'editor', 'view
 export type WorkspaceRole = typeof workspaceRoles[number];
 export declare function mayGrantWorkspaceRole(actor: unknown, role: unknown): boolean;
 export declare function mayManageWorkspaceMember(actor: unknown, previousRole: unknown, nextRole?: unknown): boolean;
-/**
- * With `contentLength: true`, a declared Content-Length must be a plain decimal, a declaration above `maxBytes` is refused
- * before any byte is read, and an identity-encoded body must match the declaration exactly. Errors carry `code`:
- * `RESPONSE_TOO_LARGE` (RangeError), `CONTENT_LENGTH_INVALID` or `RESPONSE_INCOMPLETE` (TypeError); malformed UTF-8 is a plain TypeError.
- */
-export declare function readResponseText(response: Response, options: {
+/** Options for {@link readResponseText}. */
+export interface ReadResponseTextOptions {
     maxBytes: number;
     signal?: AbortSignal;
     preserveBOM?: boolean;
-    contentLength?: boolean;
-}): Promise<string>;
+    /**
+     * `'limit'` checks a declared Content-Length (plain decimal, at most `maxBytes`) before reading. `'exact'`, or `true`,
+     * also requires an identity-encoded body to match the declaration exactly.
+     */
+    contentLength?: boolean | 'limit' | 'exact';
+    /** Refuse a body delivered in more than this many chunks, so a slow trickle of tiny chunks cannot hold the reader. */
+    maxChunks?: number;
+}
+/**
+ * Errors carry `code`: `RESPONSE_TOO_LARGE` or `RESPONSE_TOO_MANY_CHUNKS` (RangeError); `CONTENT_LENGTH_INVALID`,
+ * `RESPONSE_INCOMPLETE` or `RESPONSE_DECODE_INVALID` for malformed UTF-8 (TypeError). Stream and network failures are
+ * rethrown as they are, so a caller can tell an unreadable body from an interrupted one.
+ */
+export declare function readResponseText(response: Response, options: ReadResponseTextOptions): Promise<string>;
 export declare function openRouterFetch(path: string, { apiKey, title, body, signal, metadata }?: {
     apiKey?: string;
     title?: string;
