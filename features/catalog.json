@@ -166,9 +166,6 @@
         },
         {
           "source": "campaign",
-          "issues": [
-            4
-          ],
           "entrypoints": [
             "src/main.tsx",
             "server/index.ts",
@@ -181,7 +178,11 @@
           ]
         }
       ],
-      "acceptance": "Host-held setup capability, first-owner transaction, concurrent claim rejection, rollback/retry, existing-installation handling and no public self-registration."
+      "acceptance": "First sign-up claims the install; concurrent claims rejected; no public sign-up after. One locked transaction marks the install claimed and creates the instance operator with its audit row, the owner of the named workspace and the session; the setup route is rate limited per client address; no setup token and no OIDC for now.",
+      "contract": "https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Feature-Contracts#first-boot-setup",
+      "portable": [
+        "resolveClientAddress"
+      ]
     },
     {
       "id": "local-signin-account-security",
