@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.20.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.21.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -109,7 +109,6 @@
           "tests/google-ads-tools.test.mjs",
           "tests/google-rsa-review.test.mjs",
           "tests/health.test.mjs",
-          "tests/import-sqlite.test.mjs",
           "tests/inbox-contacts-webhooks.test.mjs",
           "tests/inbox-http.test.mjs",
           "tests/inbox-item-state.test.mjs",
