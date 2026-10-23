@@ -15,7 +15,7 @@
     "campaign": {
       "repository": "ten98-campaign",
       "asset": "ten98-campaign-source.zip",
-      "stack": "React/Vite SPA, Node HTTP, SQLite, openid-client",
+      "stack": "React/Vite SPA, Node HTTP, openid-client; this 2026-10-20 bundle predates Campaign's PostgreSQL/Drizzle storage (v0.12.0)",
       "adoption": "retained-stack-reference",
       "installInputs": [
         "package.json",

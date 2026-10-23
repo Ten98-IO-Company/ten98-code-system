@@ -1,12 +1,12 @@
 # Adopt a complete feature
 
-Start with [the feature catalogue](../features/catalog.json) and the canonical `databasePolicy` in [architecture.json](../architecture.json). New stateful Node applications default to SQLite with Drizzle and checked TypeScript; stateless packages need no database. Discover supplies existing framework, identity and feature source, but its PostgreSQL/pg-boss storage and jobs need a complete verified SQLite adaptation. Campaign already uses SQLite; its retained identity and routing adapters have separate adoption gaps. Native Cloudflare D1 is an explicit platform exception; other nondefault engines require a recorded purpose and review. Connect is not built yet.
+Start with [the feature catalogue](../features/catalog.json) and the canonical `databasePolicy` in [architecture.json](../architecture.json). New stateful Node applications default to PostgreSQL with Drizzle and checked TypeScript; stateless packages need no database. Discover supplies the default framework, identity and feature source on PostgreSQL, Drizzle and pg-boss. Campaign also runs PostgreSQL and Drizzle; its retained identity and routing adapters have separate adoption gaps. Native Cloudflare D1 is an explicit platform exception; other nondefault engines require a recorded purpose and review. Connect is not built yet.
 
 The catalogue retains `defaultAuthenticatedNodeStack` as its framework-source selector for compatibility; database choice comes from the canonical policy. The engine in an existing source bundle is not the default for a new application.
 
 The source release is [feature-library-2026-10-20](https://github.com/Ten98-IO-Company/ten98-code-system/releases/tag/feature-library-2026-10-20). The published `feature-source-manifest.json` records exact bundle/file hashes, executed checks, skips and verification limits. Verify the chosen bundle against that manifest before adoption. Use Node 24 and the bundle's existing package manager and lockfile.
 
-For example, download the existing framework/feature source reference into a fresh working folder; this PostgreSQL implementation is not a ready SQLite adapter:
+For example, download the existing framework/feature source reference into a fresh working folder; it is a complete reference to adopt into the same stack, not a drop-in package:
 
 ```sh
 gh release download feature-library-2026-10-20 --repo Ten98-IO-Company/ten98-code-system --pattern feature-source-manifest.json --pattern ten98-discover-source.zip --dir work/ten98-feature-reference
