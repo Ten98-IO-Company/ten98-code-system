@@ -46,6 +46,8 @@ Building a feature that already exists in a Ten98 app? Start with the [feature c
 
 Please report vulnerabilities privately through [GitHub private vulnerability reporting](https://github.com/Ten98-IO-Company/ten98-code-system/security/advisories/new), not in public issues. See the [security policy](https://github.com/Ten98-IO-Company/.github/blob/main/SECURITY.md).
 
-## Licence
+## Legal
 
-[MIT](LICENSE). The software is provided "as is", without warranty, as the licence states.
+- **Licence:** [MIT](LICENSE). The software is provided "as is", without warranty, as the licence states.
+- **Trademarks:** Ten98 and the Ten98 logo are trademarks of Ten98 Technologies Ltd. The MIT licence covers the code, not the name or logo: forks must use their own name and branding.
+- **Privacy:** The hosted apps at *.ten98.io are covered by the [Ten98 privacy policy](https://ten98.io/legal/privacy). Self-hosted installs are run by their operator and send no data to Ten98.
