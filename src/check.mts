@@ -11,6 +11,8 @@ type StringMap = Record<string, string>;
 interface SourceLanguagePolicy {
   default: string;
   roots: string[];
+  /** Roots that a build context such as a Docker image may omit entirely (tests, scripts); production roots stay required. */
+  optionalRoots?: string[];
   legacyJavaScript: string[];
   generated: StringMap;
   artifactDirectories?: string[];
@@ -193,9 +195,15 @@ export function checkManifest(manifest: PackageManifest): string[] {
 }
 
 // Pure inspection is testable independently; CLI evidence always comes from the installed compiler below.
+/** Optional roots absent from this checkout. Their ratchet runs where they exist (repository CI), not in build contexts. */
+export function omittedRoots(directory: string, policy: SourceLanguagePolicy | undefined): string[] {
+  return (policy?.optionalRoots ?? []).filter(root => policy!.roots.includes(root) && !existsSync(resolve(directory, root)));
+}
+
 export function inspectSourcePolicy(directory: string, policy: SourceLanguagePolicy, compilation: Compilation): string[] {
   const errors: string[] = [];
   if (policy.default !== 'typescript') return ['Unknown source language policy.'];
+  const omitted = omittedRoots(directory, policy);
   const nameOf = (file: string): string => relative(directory, resolve(directory, file)).replaceAll('\\', '/');
   for (const project of compilation.projects ?? [compilation]) {
     const options = project.compilerOptions ?? {};
@@ -238,10 +246,12 @@ export function inspectSourcePolicy(directory: string, policy: SourceLanguagePol
       else if (entry.isFile()) files.push(file);
     }
   };
-  for (const root of policy.roots) walk(resolve(directory, root));
+  for (const root of policy.roots) if (!omitted.includes(root)) walk(resolve(directory, root));
   // The legacy list only shrinks: entries for removed, converted or relocated files must be deleted.
   const found = new Set(files.map(nameOf).filter(name => /\.(?:[cm]?js|jsx)$/iu.test(name)));
-  for (const name of legacy) if (!found.has(name)) errors.push(`${name}: stale legacyJavaScript entry; no such authored JavaScript under a source root.`);
+  for (const name of legacy) {
+    if (!found.has(name) && !omitted.some(root => name.startsWith(`${root}/`))) errors.push(`${name}: stale legacyJavaScript entry; no such authored JavaScript under a source root.`);
+  }
   for (const file of files) {
     const name = nameOf(file);
     if (found.has(name) && !legacy.has(name)) errors.push(`${name}: new authored JavaScript is not approved; use checked TypeScript.`);
@@ -464,6 +474,9 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
       const errors = checkManifest(manifest);
       if (!errors.length) errors.push(...checkVendoredFloors(directory, manifest));
       if (!errors.length) errors.push(...checkSourceLanguage(directory, String(manifest.name)));
+      if (!errors.length) for (const root of omittedRoots(resolve(directory), contract.profiles[String(manifest.name)]?.sourceLanguage)) {
+        console.log(`${directory}: ${root}/ is absent from this build context; its legacyJavaScript and coverage checks were skipped (repository CI runs them).`);
+      }
       if (!errors.length) errors.push(...(update ? updatePresentationBaseline : checkPresentation)(directory, String(manifest.name)));
       for (const error of errors) console.error(`${directory}: ${error}`);
       failures += errors.length;

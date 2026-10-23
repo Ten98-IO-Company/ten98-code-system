@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { inspectSourcePolicy } from '../check.mjs';
+import { inspectSourcePolicy, omittedRoots } from '../check.mjs';
 
 function fixture(run) {
   const root = mkdtempSync(join(tmpdir(), 'ten98-source-'));
@@ -98,6 +98,23 @@ test('nested artifact directories under a source root hold checker inputs, not a
   assert.match(errors, /tests\/fixtures\/payload.mjs: new authored JavaScript/);
   policy.artifactDirectories = ['tests/fixtures'];
   assert.deepEqual(inspectSourcePolicy(root, policy, program), []);
+}));
+
+test('a build context without optional tests/scripts roots skips their ratchet; present roots and production roots stay strict', () => fixture((root, policy, program) => {
+  policy.roots.push('tests', 'scripts');
+  policy.legacyJavaScript = ['tests/old.test.mjs', 'scripts/build.mjs'];
+  // Docker build contexts copy production roots only, so neither optional root exists here.
+  assert.match(inspectSourcePolicy(root, policy, program).join('\n'), /Required source root missing: tests/);
+  policy.optionalRoots = ['tests', 'scripts'];
+  assert.deepEqual(omittedRoots(root, policy), ['tests', 'scripts']);
+  assert.deepEqual(inspectSourcePolicy(root, policy, program), []);
+  // Once a root is present, as in repository CI, its stale entries fail again.
+  mkdirSync(join(root, 'tests'));
+  assert.match(inspectSourcePolicy(root, policy, program).join('\n'), /tests\/old.test.mjs: stale legacyJavaScript/);
+  assert.doesNotMatch(inspectSourcePolicy(root, policy, program).join('\n'), /scripts\/build.mjs/);
+  // A production root is never optional.
+  policy.roots.push('server');
+  assert.match(inspectSourcePolicy(root, policy, program).join('\n'), /Required source root missing: server/);
 }));
 
 test('source roots still catch upper-case JavaScript, unclassified native scripts and file-named artifact entries', () => fixture((root, policy, program) => {

@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.20.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.21.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -57,6 +57,10 @@
           "src",
           "server",
           "shared",
+          "tests",
+          "scripts"
+        ],
+        "optionalRoots": [
           "tests",
           "scripts"
         ],
@@ -307,6 +311,10 @@
           "tests",
           "scripts"
         ],
+        "optionalRoots": [
+          "tests",
+          "scripts"
+        ],
         "legacyJavaScript": [
           "scripts/analytics-geo.mjs",
           "scripts/check-plan.mjs",
@@ -506,6 +514,10 @@
           "tests",
           "scripts"
         ],
+        "optionalRoots": [
+          "tests",
+          "scripts"
+        ],
         "legacyJavaScript": [
           "scripts/build.mjs",
           "scripts/serve-browser.mjs",
@@ -601,6 +613,9 @@
         "default": "typescript",
         "roots": [
           "src",
+          "tests"
+        ],
+        "optionalRoots": [
           "tests"
         ],
         "legacyJavaScript": [

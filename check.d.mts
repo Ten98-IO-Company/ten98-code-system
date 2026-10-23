@@ -2,6 +2,8 @@ type StringMap = Record<string, string>;
 interface SourceLanguagePolicy {
     default: string;
     roots: string[];
+    /** Roots that a build context such as a Docker image may omit entirely (tests, scripts); production roots stay required. */
+    optionalRoots?: string[];
     legacyJavaScript: string[];
     generated: StringMap;
     artifactDirectories?: string[];
@@ -72,6 +74,8 @@ export interface ReleaseEvidence {
 export declare function checkRuntimeVersion(version?: unknown): string[];
 export declare function checkVendoredFloors(directory: string, manifest: PackageManifest): string[];
 export declare function checkManifest(manifest: PackageManifest): string[];
+/** Optional roots absent from this checkout. Their ratchet runs where they exist (repository CI), not in build contexts. */
+export declare function omittedRoots(directory: string, policy: SourceLanguagePolicy | undefined): string[];
 export declare function inspectSourcePolicy(directory: string, policy: SourceLanguagePolicy, compilation: Compilation): string[];
 export declare function checkSourceLanguage(directory: string, name: string): string[];
 export declare function checkPresentation(directory: string, name: string, { parseAst }?: {
