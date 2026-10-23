@@ -39,6 +39,24 @@ test('bounded response reading counts bytes and decodes split UTF-8 strictly', a
   assert.equal(await readResponseText(new Response('ok', { headers: { 'content-length': '9999999' } }), { maxBytes: 2 }), 'ok');
 });
 
+test('a declared Content-Length is checked before reading and matched exactly for identity bodies when requested', async () => {
+  const code = expected => error => error.code === expected;
+  const untouched = () => new ReadableStream({ pull() { assert.fail('An over-limit declaration must refuse before reading.'); } });
+  await assert.rejects(readResponseText(new Response(untouched(), { headers: { 'content-length': '9999999' } }), { maxBytes: 2, contentLength: true }), code('RESPONSE_TOO_LARGE'));
+  for (const header of ['-1', '1.5', '01', '2, 2', '0x2', '99999999999999999']) {
+    await assert.rejects(readResponseText(new Response('ok', { headers: { 'content-length': header } }), { maxBytes: 2, contentLength: true }), code('CONTENT_LENGTH_INVALID'), header);
+  }
+  assert.equal(await readResponseText(new Response('ok', { headers: { 'content-length': '2' } }), { maxBytes: 2, contentLength: true }), 'ok');
+  await assert.rejects(readResponseText(new Response('o', { headers: { 'content-length': '2' } }), { maxBytes: 2, contentLength: true }), code('RESPONSE_INCOMPLETE'));
+  await assert.rejects(readResponseText(new Response('ok!', { headers: { 'content-length': '2' } }), { maxBytes: 5, contentLength: true }), code('RESPONSE_INCOMPLETE'));
+  await assert.rejects(readResponseText(new Response(null, { headers: { 'content-length': '2' } }), { maxBytes: 2, contentLength: true }), code('RESPONSE_INCOMPLETE'));
+  // A decoded (compressed) body can't be compared with the encoded length, but the declared limit still applies.
+  assert.equal(await readResponseText(new Response('okay', { headers: { 'content-length': '2', 'content-encoding': 'gzip' } }), { maxBytes: 5, contentLength: true }), 'okay');
+  await assert.rejects(readResponseText(new Response('ok', { headers: { 'content-length': '9', 'content-encoding': 'gzip' } }), { maxBytes: 5, contentLength: true }), code('RESPONSE_TOO_LARGE'));
+  assert.equal(await readResponseText(new Response('ok'), { maxBytes: 2, contentLength: true }), 'ok');
+  await assert.rejects(readResponseText(new Response('okay'), { maxBytes: 2 }), code('RESPONSE_TOO_LARGE'));
+});
+
 test('BOM preservation is explicit, including split BOM bytes and exact-empty JSON semantics', async () => {
   for (const suffix of ['', '{}']) for (const preserveBOM of [false, true]) {
     const response = new Response(new ReadableStream({ start(controller) {

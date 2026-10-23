@@ -6,12 +6,34 @@ export function mayGrantWorkspaceRole(actor, role) {
 export function mayManageWorkspaceMember(actor, previousRole, nextRole) {
     return mayGrantWorkspaceRole(actor, previousRole) && (nextRole === undefined || mayGrantWorkspaceRole(actor, nextRole));
 }
-export async function readResponseText(response, { maxBytes, signal, preserveBOM = false } = {}) {
+const lengthError = (code, message) => Object.assign(new TypeError(message), { code });
+export async function readResponseText(response, { maxBytes, signal, preserveBOM = false, contentLength = false } = {}) {
     if (typeof maxBytes !== 'number' || !Number.isSafeInteger(maxBytes) || maxBytes < 0)
         throw new TypeError('maxBytes must be a nonnegative safe integer.');
+    const tooLarge = () => Object.assign(new RangeError('Response exceeds the byte limit.'), { code: 'RESPONSE_TOO_LARGE' });
+    let declared;
+    if (contentLength) {
+        const header = response.headers.get('content-length');
+        if (header !== null) {
+            if (!/^(?:0|[1-9]\d{0,15})$/u.test(header)) {
+                void response.body?.cancel().catch(() => { });
+                throw lengthError('CONTENT_LENGTH_INVALID', 'Response Content-Length is invalid.');
+            }
+            if (Number(header) > maxBytes) {
+                void response.body?.cancel().catch(() => { });
+                throw tooLarge();
+            }
+            // Fetch decodes compressed bodies, so only an identity-encoded body can be compared byte for byte.
+            const encoding = response.headers.get('content-encoding');
+            if (encoding === null || encoding.trim().toLowerCase() === 'identity')
+                declared = Number(header);
+        }
+    }
     const reader = response.body?.getReader();
     if (!reader) {
         signal?.throwIfAborted();
+        if (declared)
+            throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
         return '';
     }
     const abort = () => { void reader.cancel(signal?.reason).catch(() => { }); };
@@ -23,11 +45,16 @@ export async function readResponseText(response, { maxBytes, signal, preserveBOM
         while (true) {
             const { value, done } = await reader.read();
             signal?.throwIfAborted();
-            if (done)
+            if (done) {
+                if (declared !== undefined && bytes !== declared)
+                    throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
                 return text + decoder.decode();
+            }
             bytes += value.byteLength;
             if (bytes > maxBytes)
-                throw new RangeError('Response exceeds the byte limit.');
+                throw tooLarge();
+            if (declared !== undefined && bytes > declared)
+                throw lengthError('RESPONSE_INCOMPLETE', 'Response body is longer than its Content-Length.');
             text += decoder.decode(value, { stream: true });
         }
     }

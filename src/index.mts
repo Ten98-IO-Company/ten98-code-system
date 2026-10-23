@@ -8,11 +8,34 @@ export function mayManageWorkspaceMember(actor: unknown, previousRole: unknown, 
   return mayGrantWorkspaceRole(actor, previousRole) && (nextRole === undefined || mayGrantWorkspaceRole(actor, nextRole));
 }
 
-export function readResponseText(response: Response, options: { maxBytes: number; signal?: AbortSignal; preserveBOM?: boolean }): Promise<string>;
-export async function readResponseText(response: Response, { maxBytes, signal, preserveBOM = false }: { maxBytes?: number; signal?: AbortSignal; preserveBOM?: boolean } = {}): Promise<string> {
+const lengthError = (code: 'CONTENT_LENGTH_INVALID' | 'RESPONSE_INCOMPLETE', message: string) => Object.assign(new TypeError(message), { code });
+
+/**
+ * With `contentLength: true`, a declared Content-Length must be a plain decimal, a declaration above `maxBytes` is refused
+ * before any byte is read, and an identity-encoded body must match the declaration exactly. Errors carry `code`:
+ * `RESPONSE_TOO_LARGE` (RangeError), `CONTENT_LENGTH_INVALID` or `RESPONSE_INCOMPLETE` (TypeError); malformed UTF-8 is a plain TypeError.
+ */
+export function readResponseText(response: Response, options: { maxBytes: number; signal?: AbortSignal; preserveBOM?: boolean; contentLength?: boolean }): Promise<string>;
+export async function readResponseText(response: Response, { maxBytes, signal, preserveBOM = false, contentLength = false }: { maxBytes?: number; signal?: AbortSignal; preserveBOM?: boolean; contentLength?: boolean } = {}): Promise<string> {
   if (typeof maxBytes !== 'number' || !Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError('maxBytes must be a nonnegative safe integer.');
+  const tooLarge = () => Object.assign(new RangeError('Response exceeds the byte limit.'), { code: 'RESPONSE_TOO_LARGE' });
+  let declared: number | undefined;
+  if (contentLength) {
+    const header = response.headers.get('content-length');
+    if (header !== null) {
+      if (!/^(?:0|[1-9]\d{0,15})$/u.test(header)) { void response.body?.cancel().catch(() => {}); throw lengthError('CONTENT_LENGTH_INVALID', 'Response Content-Length is invalid.'); }
+      if (Number(header) > maxBytes) { void response.body?.cancel().catch(() => {}); throw tooLarge(); }
+      // Fetch decodes compressed bodies, so only an identity-encoded body can be compared byte for byte.
+      const encoding = response.headers.get('content-encoding');
+      if (encoding === null || encoding.trim().toLowerCase() === 'identity') declared = Number(header);
+    }
+  }
   const reader = response.body?.getReader();
-  if (!reader) { signal?.throwIfAborted(); return ''; }
+  if (!reader) {
+    signal?.throwIfAborted();
+    if (declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
+    return '';
+  }
   const abort = () => { void reader.cancel(signal?.reason).catch(() => {}); };
   signal?.addEventListener('abort', abort, { once: true });
   try {
@@ -22,9 +45,13 @@ export async function readResponseText(response: Response, { maxBytes, signal, p
     while (true) {
       const { value, done } = await reader.read();
       signal?.throwIfAborted();
-      if (done) return text + decoder.decode();
+      if (done) {
+        if (declared !== undefined && bytes !== declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
+        return text + decoder.decode();
+      }
       bytes += value.byteLength;
-      if (bytes > maxBytes) throw new RangeError('Response exceeds the byte limit.');
+      if (bytes > maxBytes) throw tooLarge();
+      if (declared !== undefined && bytes > declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is longer than its Content-Length.');
       text += decoder.decode(value, { stream: true });
     }
   } finally {
