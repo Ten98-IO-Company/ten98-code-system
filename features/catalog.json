@@ -1,38 +1,32 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "purpose": "Find working feature source and its verification boundary before importing shared code or adopting a stack-bound implementation.",
   "architectureContract": "../architecture.json",
   "adoptionGuide": "../docs/FEATURE-ADOPTION.md",
   "defaultAuthenticatedNodeStack": "discover",
-  "release": {
-    "tag": "feature-library-2026-10-20",
-    "url": "https://github.com/Ten98-IO-Company/ten98-code-system/releases/tag/feature-library-2026-10-20",
-    "manifestAsset": "feature-source-manifest.json",
-    "verification": "checks-and-hashes-recorded-in-manifest",
-    "manifestSHA256": "f12bd9e13c83358e1d5927cbd6992467e24ed54111d4a2378cb90d3883cf8950"
-  },
-  "bundles": {
+  "databasePolicy": "../architecture.json#databasePolicy",
+  "sources": {
     "campaign": {
       "repository": "ten98-campaign",
-      "asset": "ten98-campaign-source.zip",
-      "stack": "React/Vite SPA, Node HTTP, openid-client; this 2026-10-20 bundle predates Campaign's PostgreSQL/Drizzle storage (v0.12.0)",
+      "tag": "v0.20.0",
+      "stack": "React/Vite SPA, Node HTTP, PostgreSQL/Drizzle, openid-client",
       "adoption": "retained-stack-reference",
       "installInputs": [
         "package.json",
         "package-lock.json",
-        "vendor/"
+        "vendor/",
+        "migrations/"
       ],
       "applicationChecks": [
         "npm run check:architecture",
         "npm test",
         "npm run build"
       ],
-      "sha256": "7e6e920d9ca2b5b19663f790d2f980ccaa02cd262057095a5669e71ebe508e19",
-      "sourceTreeSHA256": "d44eebcd8925bad63549c9469bb58978aca7fd12d44052d308d88bd49c671d01"
+      "integrationPrerequisites": "A disposable PostgreSQL in TEST_DATABASE_URL; provider tests use mocks only.",
+      "url": "https://github.com/Ten98-IO-Company/ten98-campaign/tree/v0.20.0"
     },
     "discover": {
       "repository": "ten98-discover",
-      "asset": "ten98-discover-source.zip",
       "stack": "React, TanStack Start/Router, Nitro, Better Auth, PostgreSQL/Drizzle, pg-boss",
       "adoption": "existing-postgresql-feature-reference",
       "installInputs": [
@@ -49,12 +43,12 @@
         "pnpm build"
       ],
       "integrationPrerequisites": "Isolated PostgreSQL, approved public configuration and the selected test's documented fixture setup; never production credentials.",
-      "sha256": "7cca7504b9a5a66b6cf10ebb613dbd9a0c7c1acd4d1e6ed93fbb0b0c7668d978",
-      "sourceTreeSHA256": "d6a146a1bbddce5e046a7c870019824cf7241c9179ead0b49f76d057e40b2a0b"
+      "tag": "v0.2.1",
+      "url": "https://github.com/Ten98-IO-Company/ten98-discover/tree/v0.2.1"
     },
     "ui": {
       "repository": "ten98-design-system",
-      "asset": "ten98-design-system-source.zip",
+      "tag": "v0.22.0",
       "stack": "React presentation and semantic CSS; no authentication or persistence controller",
       "adoption": "shared-presentation-source",
       "installInputs": [
@@ -65,9 +59,13 @@
       "applicationChecks": [
         "npm run check:all"
       ],
-      "sha256": "59a05e04996239d8355a61453ad20dc7a3b7eff0690c2c2d6d023a8a9d2d51cb",
-      "sourceTreeSHA256": "9b655995e998eeb6554c4ae59c7f00ef1d608b449842d3eae189b03b463269c6"
+      "url": "https://github.com/Ten98-IO-Company/ten98-design-system/tree/v0.22.0"
     }
+  },
+  "archivedSourceRelease": {
+    "tag": "feature-library-2026-10-20",
+    "url": "https://github.com/Ten98-IO-Company/ten98-code-system/releases/tag/feature-library-2026-10-20",
+    "note": "Historical source bundles from 2026-10-20. They predate Campaign on PostgreSQL, Amazon SES and account closure; use the tagged sources above."
   },
   "portableImports": {
     "runtime": {
@@ -77,31 +75,77 @@
         "index.d.mts"
       ],
       "exports": [
+        "workspaceRoles",
+        "mayGrantWorkspaceRole",
+        "mayManageWorkspaceMember",
         "readResponseText",
         "openRouterFetch",
         "oidcEndpoint",
-        "workspaceRoles",
-        "mayGrantWorkspaceRole",
-        "mayManageWorkspaceMember"
+        "createMigrationLedger",
+        "parseTrustedProxies",
+        "resolveClientAddress",
+        "normalizeClientAddress",
+        "SES_REGIONS",
+        "sesOrigin",
+        "signAwsV4Request",
+        "deriveAwsV4SigningKey",
+        "sendSesEmail",
+        "verifySnsMessage",
+        "classifyEmailFeedback"
       ],
       "tests": [
-        "tests/runtime.test.mjs"
+        "tests/runtime.test.mjs",
+        "tests/migration-ledger.test.mjs",
+        "tests/client-address.test.mjs",
+        "tests/ses-email.test.mjs",
+        "tests/sns-notification.test.mjs",
+        "tests/email-feedback.test.mjs"
       ],
-      "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence."
+      "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
+      "version": "v0.1.21"
     },
     "presentation": {
       "package": "@ten98/ui",
-      "bundle": "ui",
       "entrypoints": [
         "src/lib/index.ts",
         "src/lib/app.tsx"
       ],
       "tests": [
-        "tests/library.test.mjs",
+        "tests/account-flows.test.mjs",
+        "tests/account-menu.test.mjs",
+        "tests/adoption-gaps.test.mjs",
+        "tests/analytics.test.mjs",
+        "tests/assets-audience.test.mjs",
+        "tests/auth-flows.test.mjs",
+        "tests/auth-layout.test.mjs",
         "tests/catalogue.test.mjs",
-        "tests/browser/auth-layout.spec.ts"
+        "tests/chart-scale.test.mjs",
+        "tests/charts.test.mjs",
+        "tests/composition.test.mjs",
+        "tests/controls.test.mjs",
+        "tests/coordination.test.mjs",
+        "tests/data-table.test.mjs",
+        "tests/evidence.test.mjs",
+        "tests/feature-layout.test.mjs",
+        "tests/field-list.test.mjs",
+        "tests/inspection.test.mjs",
+        "tests/library.test.mjs",
+        "tests/measurement.test.mjs",
+        "tests/player-frame.test.mjs",
+        "tests/primitives-extensions.test.mjs",
+        "tests/reporting.test.mjs",
+        "tests/review-confirm.test.mjs",
+        "tests/sandbox.test.mjs",
+        "tests/shell.test.mjs",
+        "tests/sidebar-react18.test.mjs",
+        "tests/sidebar.test.mjs",
+        "tests/spatial.test.mjs",
+        "tests/structure.test.mjs",
+        "tests/templates.test.mjs",
+        "tests/workspace-flows.test.mjs"
       ],
-      "boundary": "Typed controls, branding, layouts and interaction patterns. Application controllers retain data, authorization, requests and draft identity."
+      "boundary": "Typed controls, branding, layouts and interaction patterns. Application controllers retain data, authorization, requests and draft identity. Includes isolated player and sandboxed-preview hosts; apps own player scripts, recording data and provider requests.",
+      "source": "ui"
     }
   },
   "features": [
@@ -109,7 +153,7 @@
       "id": "first-user-bootstrap",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/routes/index.tsx",
             "src/server/api.ts",
@@ -121,19 +165,19 @@
           ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
+          "issues": [
+            4
+          ],
           "entrypoints": [
             "src/main.tsx",
-            "server/index.mjs",
-            "server/auth.mjs",
-            "server/database.mjs"
+            "server/index.ts",
+            "server/auth.ts",
+            "server/database.ts"
           ],
           "tests": [
             "tests/bootstrap.test.mjs",
             "tests/workspace-onboarding.test.mjs"
-          ],
-          "issues": [
-            4
           ]
         }
       ],
@@ -143,7 +187,7 @@
       "id": "local-signin-account-security",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/server/auth.ts",
             "src/server/account-security.ts",
@@ -155,19 +199,19 @@
           ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
+          "issues": [
+            7
+          ],
           "entrypoints": [
-            "server/auth.mjs",
-            "server/cli.mjs",
+            "server/auth.ts",
+            "server/cli.ts",
             "src/AccountSettings.tsx"
           ],
           "tests": [
             "tests/auth-races.test.mjs",
             "tests/account.test.mjs",
             "tests/session-revocation-http.test.mjs"
-          ],
-          "issues": [
-            7
           ]
         }
       ],
@@ -177,7 +221,7 @@
       "id": "oidc-signin-linking",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/server/oidc.ts",
             "src/server/account-security.ts",
@@ -190,18 +234,18 @@
           ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
+          "issues": [
+            7,
+            8
+          ],
           "entrypoints": [
-            "server/auth.mjs",
-            "server/index.mjs",
+            "server/auth.ts",
+            "server/index.ts",
             "src/main.tsx"
           ],
           "tests": [
             "tests/auth-races.test.mjs"
-          ],
-          "issues": [
-            7,
-            8
           ]
         }
       ],
@@ -211,7 +255,7 @@
       "id": "workspaces-projects-rbac-invitations",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/server/api.ts",
             "src/server/teams.ts",
@@ -224,22 +268,21 @@
           ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
+          "issues": [
+            7
+          ],
           "entrypoints": [
-            "server/index.mjs",
-            "server/invitations.mjs",
-            "server/database.mjs",
-            "src/TeamPanel.tsx",
-            "src/WorkspaceInvitations.tsx",
+            "server/index.ts",
+            "server/invitations.ts",
+            "server/database.ts",
+            "src/TeamSettings.tsx",
             "src/AcceptInvitation.tsx"
           ],
           "tests": [
             "tests/invitations.test.mjs",
             "tests/collaboration-http.test.mjs",
             "tests/workspace-onboarding.test.mjs"
-          ],
-          "issues": [
-            7
           ]
         }
       ],
@@ -249,7 +292,7 @@
       "id": "provider-settings-credential-lifecycle",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/server/providers.ts",
             "src/server/credential-vault.ts",
@@ -262,20 +305,20 @@
           ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
+          "issues": [
+            6,
+            8
+          ],
           "entrypoints": [
-            "server/integration-settings.mjs",
-            "server/integrations.mjs",
+            "server/integration-settings.ts",
+            "server/integrations.ts",
             "src/IntegrationSettings.tsx"
           ],
           "tests": [
             "tests/integration-settings.test.mjs",
             "tests/settings-http.test.mjs",
             "tests/provider-response.test.mjs"
-          ],
-          "issues": [
-            6,
-            8
           ]
         }
       ],
@@ -285,7 +328,7 @@
       "id": "openrouter-execution-model-settings",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/server/openrouter.ts",
             "src/server/openrouter-models.ts",
@@ -300,10 +343,10 @@
           ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
           "entrypoints": [
-            "server/agent.mjs",
-            "server/integration-settings.mjs",
+            "server/agent.ts",
+            "server/integration-settings.ts",
             "src/CampaignAgent.tsx",
             "src/IntegrationSettings.tsx"
           ],
@@ -320,7 +363,7 @@
       "id": "native-api-keys",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/server/api-keys.ts",
             "src/server/api.ts",
@@ -342,7 +385,7 @@
       "id": "native-mcp-server",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/server/mcp.ts",
             "src/server/mcp-tools.ts",
@@ -361,17 +404,18 @@
       "id": "search-and-filter-presentation",
       "implementations": [
         {
-          "bundle": "ui",
+          "source": "ui",
+          "scope": "Declared column values in a loaded local table.",
           "entrypoints": [
             "src/lib/patterns.tsx"
           ],
           "tests": [
             "tests/library.test.mjs"
-          ],
-          "scope": "Declared column values in a loaded local table."
+          ]
         },
         {
-          "bundle": "discover",
+          "source": "discover",
+          "scope": "Tool navigation search and separate applied report filters.",
           "entrypoints": [
             "src/routes/index.tsx",
             "src/components/ExplorerFilters.tsx",
@@ -380,20 +424,19 @@
           "tests": [
             "tests/advanced-filters-browser.mjs",
             "tests/navigation.test.ts"
-          ],
-          "scope": "Tool navigation search and separate applied report filters."
+          ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
+          "scope": "Loaded-view whole-record search; explicit display-field migration remains open.",
+          "issues": [
+            8
+          ],
           "entrypoints": [
             "src/main.tsx"
           ],
           "tests": [
             "tests/navigation-editor-ui.test.mjs"
-          ],
-          "scope": "Loaded-view whole-record search; explicit display-field migration remains open.",
-          "issues": [
-            8
           ]
         }
       ],
@@ -403,7 +446,7 @@
       "id": "account-preferences",
       "implementations": [
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/components/AccountPreferencesPanel.tsx",
             "src/lib/account-preferences.ts",
@@ -417,18 +460,18 @@
           ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
+          "issues": [
+            8
+          ],
           "entrypoints": [
             "src/AccountSettings.tsx",
             "public/theme.js",
-            "server/auth.mjs"
+            "server/auth.ts"
           ],
           "tests": [
             "tests/account.test.mjs",
             "tests/theme.test.mjs"
-          ],
-          "issues": [
-            8
           ]
         }
       ],
@@ -438,7 +481,7 @@
       "id": "application-shell-auth-presentation",
       "implementations": [
         {
-          "bundle": "ui",
+          "source": "ui",
           "entrypoints": [
             "src/lib/workspace.tsx",
             "src/lib/patterns.tsx",
@@ -450,7 +493,7 @@
           ]
         },
         {
-          "bundle": "discover",
+          "source": "discover",
           "entrypoints": [
             "src/routes/index.tsx",
             "src/components/AuthLayout.tsx",
@@ -462,28 +505,88 @@
           ]
         },
         {
-          "bundle": "campaign",
+          "source": "campaign",
+          "issues": [
+            5,
+            8
+          ],
           "entrypoints": [
-            "src/main.tsx",
-            "src/styles.css"
+            "src/main.tsx"
           ],
           "tests": [
             "tests/navigation-editor-ui.test.mjs",
             "tests/design-system.test.mjs"
-          ],
-          "issues": [
-            5,
-            8
           ]
         }
       ],
       "boundary": "Shared layout does not implement routing or dirty-state guards. Campaign mobile focus exclusion/Escape/return behavior remains an open defect; do not use it as the canonical drawer."
+    },
+    {
+      "id": "amazon-ses-email",
+      "implementations": [
+        {
+          "source": "campaign",
+          "entrypoints": [
+            "server/direct-providers.ts",
+            "server/direct-campaigns.ts",
+            "server/integration-settings.ts",
+            "server/index.ts"
+          ],
+          "tests": [
+            "tests/ses-feedback.test.ts",
+            "tests/direct-providers.test.mjs"
+          ]
+        },
+        {
+          "source": "discover",
+          "entrypoints": [
+            "src/server/email.ts",
+            "src/server/ses-feedback.ts"
+          ],
+          "tests": [
+            "tests/ses-email.test.ts",
+            "tests/email.test.ts",
+            "tests/email-suppression-integration.ts"
+          ]
+        }
+      ],
+      "portable": [
+        "sendSesEmail",
+        "verifySnsMessage",
+        "classifyEmailFeedback"
+      ],
+      "acceptance": "Signed SES v2 sends on a constant regional origin with the uncertain-outcome contract; SNS signature, topic and replay checks before any feedback is applied; permanent bounces and complaints suppress, transient and undetermined bounces suppress only after the app threshold, and X.7.x policy rejections alert instead of suppressing. Campaign uses SES for campaigns and platform mail; Discover for platform mail only."
+    },
+    {
+      "id": "account-closure",
+      "implementations": [
+        {
+          "source": "discover",
+          "entrypoints": [
+            "src/server/account-closure.ts",
+            "src/server/account-closure-inventory.ts",
+            "src/server/account-closure-retention.ts",
+            "migrations/0070_account_closure.sql",
+            "src/components/AccountClosurePanel.tsx"
+          ],
+          "tests": [
+            "tests/account-closure-inventory.test.ts",
+            "tests/account-closure-integration.ts",
+            "tests/account-closure-retention.test.ts",
+            "tests/closed-account-retention-integration.ts"
+          ],
+          "issues": [
+            39
+          ]
+        }
+      ],
+      "acceptance": "Tombstone, not erasure; step-up proof; refusal for the last owner or operator; scrub by inventory with a coverage test; financial rows kept 7 years without personal data, audit rows 7 years or until the workspace is deleted. Campaign has not implemented closure yet."
     }
   ],
   "knownIssues": [
     {
       "number": 4,
-      "status": "fixed-and-verified-in-snapshot",
+      "status": "closed",
       "scope": "Campaign host-held bootstrap proof"
     },
     {
@@ -493,7 +596,7 @@
     },
     {
       "number": 6,
-      "status": "fixed-and-verified-in-snapshot",
+      "status": "closed",
       "scope": "Campaign shared provider response reader"
     },
     {
@@ -518,6 +621,5 @@
       "reason": "Native Cloudflare Worker/static site; use its own D1/email/security contracts rather than importing an authenticated Node stack."
     }
   ],
-  "maturity": "Complete stack-bound source references with scoped code checks; integration and production acceptance remain explicitly separate.",
-  "databasePolicy": "../architecture.json#databasePolicy"
+  "maturity": "Complete stack-bound source references with scoped code checks; integration and production acceptance remain explicitly separate."
 }
