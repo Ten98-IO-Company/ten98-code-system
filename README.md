@@ -38,7 +38,7 @@ Building a feature that already exists in a Ten98 app? Start with the [feature c
 ## Community
 
 - Questions and ideas: [Discussions](https://github.com/Ten98-IO-Company/ten98-code-system/discussions)
-- Bugs and adoption work: [Issues](https://github.com/Ten98-IO-Company/ten98-code-system/issues), tracked on the [Ten98 project](https://github.com/orgs/Ten98-IO-Company/projects/1)
+- Bugs and adoption work: [Issues](https://github.com/Ten98-IO-Company/ten98-code-system/issues), tracked on the [ten98-code-system project](https://github.com/orgs/Ten98-IO-Company/projects/5)
 - Releases: [GitHub Releases](https://github.com/Ten98-IO-Company/ten98-code-system/releases)
 - Contributing: [contributing guide](https://github.com/Ten98-IO-Company/.github/blob/main/CONTRIBUTING.md) and [Code of Conduct](https://github.com/Ten98-IO-Company/.github/blob/main/CODE_OF_CONDUCT.md)
 
