@@ -1,9 +1,7 @@
 name: Checks
 on:
   push:
-    paths-ignore: ["README.md", "AGENTS.md", "LICENSE"]
   pull_request:
-    paths-ignore: ["README.md", "AGENTS.md", "LICENSE"]
 permissions:
   contents: read
 concurrency:
