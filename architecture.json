@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.3.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.4.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -639,6 +639,8 @@
           "sns-notification.d.mts": "Generated declarations from src/sns-notification.mts.",
           "email-feedback.mjs": "Generated runtime executable from src/email-feedback.mts, re-exported by index.mjs.",
           "email-feedback.d.mts": "Generated declarations from src/email-feedback.mts.",
+          "bootstrap-token.mjs": "Generated runtime executable from src/bootstrap-token.mts, re-exported by index.mjs.",
+          "bootstrap-token.d.mts": "Generated declarations from src/bootstrap-token.mts.",
           "check.mjs": "Generated architecture checker executable from src/check.mts; build before test and pack.",
           "check.d.mts": "Generated declarations for the architecture checker.",
           "database-policy.mjs": "Generated internal database-policy checker from checked src/database-policy.mts.",
@@ -646,7 +648,8 @@
         },
         "compilerProjects": [
           "tsconfig.json",
-          "tests/tsconfig.api.json"
+          "tests/tsconfig.api.json",
+          "tests/tsconfig.tests.json"
         ]
       },
       "database": {

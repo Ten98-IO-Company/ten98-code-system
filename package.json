@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Shared HTTP, OpenRouter and OIDC primitives for ten98 applications",
   "type": "module",
   "license": "MIT",
@@ -25,6 +25,8 @@
     "sns-notification.d.mts",
     "email-feedback.mjs",
     "email-feedback.d.mts",
+    "bootstrap-token.mjs",
+    "bootstrap-token.d.mts",
     "LICENSE",
     "README.md",
     "architecture.json",
@@ -36,6 +38,7 @@
     "src/ses-email.mts",
     "src/sns-notification.mts",
     "src/email-feedback.mts",
+    "src/bootstrap-token.mts",
     "tsconfig.json",
     "database-policy.mjs",
     "database-policy.d.mts",
@@ -46,7 +49,7 @@
     "check:architecture": "node check.mjs .",
     "typecheck": "npm run check:architecture && tsc --project tsconfig.json --noEmit",
     "build": "npm run check:architecture && tsc --project tsconfig.json",
-    "test": "npm run check:architecture && tsc --project tsconfig.json && tsc --project tests/tsconfig.api.json && node --test tests/*.test.mjs",
+    "test": "npm run check:architecture && tsc --project tsconfig.json && tsc --project tests/tsconfig.api.json && tsc --project tests/tsconfig.tests.json && node --test tests/*.test.mjs tests/*.test.mts",
     "prepack": "npm run build"
   },
   "engines": {

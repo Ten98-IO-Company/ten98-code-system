@@ -91,7 +91,11 @@
         "deriveAwsV4SigningKey",
         "sendSesEmail",
         "verifySnsMessage",
-        "classifyEmailFeedback"
+        "classifyEmailFeedback",
+        "BOOTSTRAP_TOKEN_FILE",
+        "isValidBootstrapToken",
+        "loadBootstrapToken",
+        "bootstrapTokenMatches"
       ],
       "tests": [
         "tests/runtime.test.mjs",
@@ -99,7 +103,8 @@
         "tests/client-address.test.mjs",
         "tests/ses-email.test.mjs",
         "tests/sns-notification.test.mjs",
-        "tests/email-feedback.test.mjs"
+        "tests/email-feedback.test.mjs",
+        "tests/bootstrap-token.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
       "version": "v0.1.21"
@@ -181,7 +186,15 @@
           ]
         }
       ],
-      "acceptance": "Host-held setup capability, first-owner transaction, concurrent claim rejection, rollback/retry, existing-installation handling and no public self-registration."
+      "acceptance": "One first-boot contract for both apps: optional BOOTSTRAP_TOKEN, otherwise a host-held token file generated in the data directory (0600, exclusive create); token 32-512 characters, no whitespace, compared in constant time and accepted only while unclaimed; POST /api/auth/setup and GET /api/session setupRequired; 10 attempts per client address per 15 minutes; @ten98/ui FirstUserSetupFlow; the first account becomes instance operator and owner of its named workspace, with the operator audit row and session in the claim transaction; then the create-first-project onboarding step.",
+      "portable": [
+        "loadBootstrapToken",
+        "isValidBootstrapToken",
+        "bootstrapTokenMatches",
+        "BOOTSTRAP_TOKEN_FILE",
+        "resolveClientAddress"
+      ],
+      "contract": "https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Feature-Contracts#first-boot-setup"
     },
     {
       "id": "local-signin-account-security",
