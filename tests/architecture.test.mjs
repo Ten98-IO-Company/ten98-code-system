@@ -86,7 +86,7 @@ test('running Node must satisfy the canonical range, not just manifest declarati
 // Independent fixture: do not derive the expected application from architecture.json.
 const campaign = () => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.0.0 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.19.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.20.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
@@ -100,7 +100,7 @@ test('architecture accepts independent manifests with reviewed tools and mandato
 test('native static site uses shared build tools without application runtime dependencies', () => {
   const site = () => ({
     name: 'ten98-io', type: 'module', engines: { node: '>=24.0.0 <25' },
-    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.19.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.20.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', build: 'npm run check:architecture && tsc --project tsconfig.tooling.json && node scripts/build.mts', check: 'npm run check:architecture && npm run build && node scripts/check.mjs', test: 'npm run check:architecture && node scripts/enquiry-test.mjs' },
   });
   assert.deepEqual(checkManifest(site()), []);
@@ -161,7 +161,7 @@ test('approved profile-specific development tools keep their reviewed declaratio
   const { '@types/node': _campaignNode, '@types/pg': _campaignPg, ...sharedDevDependencies } = campaign().devDependencies;
   const manifest = {
     name: '@ten98/ui', type: 'module', engines: { node: '>=24.0.0 <25' },
-    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.19.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.1.20.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };

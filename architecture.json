@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.19.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.1.20.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -478,7 +478,8 @@
       "boundary": "React presentation only; routing, authentication, persistence and provider controllers remain in applications.",
       "dependencies": {},
       "devDependencies": {
-        "@playwright/test": "^1.64.1"
+        "@playwright/test": "^1.64.1",
+        "@types/node": "24.10.1"
       },
       "sharedDependencies": [],
       "sharedDevDependencies": [
