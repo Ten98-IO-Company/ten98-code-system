@@ -95,7 +95,8 @@
         "verifySnsMessage",
         "classifyEmailFeedback",
         "signCapability",
-        "readCapability"
+        "readCapability",
+        "readJsonBody"
       ],
       "tests": [
         "tests/runtime.test.mjs",
@@ -106,10 +107,11 @@
         "tests/email-feedback.test.mjs",
         "tests/read-bytes.test.mts",
         "tests/client-limit-key.test.mts",
-        "tests/capability-token.test.mts"
+        "tests/capability-token.test.mts",
+        "tests/json-body.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.7.0"
+      "version": "v0.8.0"
     },
     "presentation": {
       "package": "@ten98/ui",
