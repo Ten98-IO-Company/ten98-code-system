@@ -92,20 +92,39 @@ export function resolveClientAddress(peerAddress, forwardedFor, trustedProxies) 
     }
     return null;
 }
+// The leading `prefix` bits of an IPv6 address as hex, with the remaining bits dropped.
+function ipv6Network(address, prefix) {
+    let text = address;
+    const dotted = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/u.exec(text);
+    if (dotted) {
+        const [a, b, c, d] = dotted.slice(1).map(Number);
+        text = `${text.slice(0, dotted.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+    }
+    const [head, tail] = text.includes('::') ? text.split('::') : [text, undefined];
+    const left = head ? head.split(':') : [], right = tail ? tail.split(':') : [];
+    const groups = tail === undefined ? left : [...left, ...Array(8 - left.length - right.length).fill('0'), ...right];
+    const bits = groups.map(group => parseInt(group, 16).toString(2).padStart(16, '0')).join('').slice(0, prefix);
+    return BigInt(`0b${bits}`).toString(16);
+}
 /**
  * A rate-limit key for one client within `scope`, derived with HMAC so the stored key never reveals the address.
- * Pass the result of {@link resolveClientAddress}. A null (unresolved) address gets the dedicated key `<scope>:unresolved`,
- * kept apart from every resolved client; give it its own, stricter limit rather than letting it share a client's bucket.
+ * Pass the result of {@link resolveClientAddress}. IPv4 clients are keyed per address; IPv6 clients per network of
+ * `ipv6Prefix` bits (default 56, allowed 48 to 64), because one IPv6 host normally controls at least a /64.
+ * A null (unresolved) address gets the dedicated key `<scope>:unresolved`, kept apart from every resolved client;
+ * give it its own, stricter limit rather than letting it share a client's bucket.
  */
-export function clientLimitKey(scope, address, secret) {
+export function clientLimitKey(scope, address, secret, { ipv6Prefix = 56 } = {}) {
     if (typeof scope !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(scope))
         throw new TypeError('scope must be 1 to 64 lowercase letters, digits, dots, hyphens or underscores.');
     if (typeof secret !== 'string' || secret.length < 32)
         throw new TypeError('secret must contain at least 32 characters.');
+    if (!Number.isInteger(ipv6Prefix) || ipv6Prefix < 48 || ipv6Prefix > 64)
+        throw new TypeError('ipv6Prefix must be an integer from 48 to 64.');
     if (address === null)
         return `${scope}:unresolved`;
     const canonical = normalizeClientAddress(address);
     if (canonical === null)
         throw new TypeError('address must be a client address from resolveClientAddress, or null.');
-    return `${scope}:${createHmac('sha256', secret).update(`${scope}\0${canonical}`).digest('base64url')}`;
+    const client = isIP(canonical) === 6 ? `v6/${ipv6Prefix}:${ipv6Network(canonical, ipv6Prefix)}` : `v4:${canonical}`;
+    return `${scope}:${createHmac('sha256', secret).update(`${scope}\0${client}`).digest('base64url')}`;
 }

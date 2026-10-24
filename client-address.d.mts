@@ -15,7 +15,11 @@ export declare function parseTrustedProxies(raw: unknown): TrustedProxies;
 export declare function resolveClientAddress(peerAddress: unknown, forwardedFor: string | null | undefined, trustedProxies: TrustedProxies): string | null;
 /**
  * A rate-limit key for one client within `scope`, derived with HMAC so the stored key never reveals the address.
- * Pass the result of {@link resolveClientAddress}. A null (unresolved) address gets the dedicated key `<scope>:unresolved`,
- * kept apart from every resolved client; give it its own, stricter limit rather than letting it share a client's bucket.
+ * Pass the result of {@link resolveClientAddress}. IPv4 clients are keyed per address; IPv6 clients per network of
+ * `ipv6Prefix` bits (default 56, allowed 48 to 64), because one IPv6 host normally controls at least a /64.
+ * A null (unresolved) address gets the dedicated key `<scope>:unresolved`, kept apart from every resolved client;
+ * give it its own, stricter limit rather than letting it share a client's bucket.
  */
-export declare function clientLimitKey(scope: string, address: string | null, secret: string): string;
+export declare function clientLimitKey(scope: string, address: string | null, secret: string, { ipv6Prefix }?: {
+    ipv6Prefix?: number;
+}): string;
