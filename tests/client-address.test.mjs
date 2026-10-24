@@ -36,10 +36,24 @@ test('mapped IPv4 and IPv6 use canonical forms and matching proxy ranges', () =>
   assert.equal(resolveClientAddress('10.0.0.4', '192.0.2.1', exact), '10.0.0.4');
 });
 
+test('entries left of the client hop are never read, so placeholders there cannot make the client unknown', () => {
+  // Forward proxies sometimes add placeholders such as "unknown" before the hop our trusted proxy recorded.
+  assert.equal(resolveClientAddress('10.0.0.3', 'garbage,192.0.2.1', proxies), '192.0.2.1');
+  assert.equal(resolveClientAddress('10.0.0.3', 'unknown, 192.0.2.1', proxies), '192.0.2.1');
+  assert.equal(resolveClientAddress('10.0.0.3', 'unknown, 198.51.100.4, 10.0.0.2', proxies), '198.51.100.4');
+  assert.equal(resolveClientAddress('10.0.0.3', '"x", 010.0.0.1, 192.0.2.1:80, 198.51.100.4', proxies), '198.51.100.4');
+  // A malformed entry at or before the client hop still means the client is unknown.
+  assert.equal(resolveClientAddress('10.0.0.3', '198.51.100.4, unknown', proxies), null);
+  assert.equal(resolveClientAddress('10.0.0.3', '198.51.100.4, unknown, 10.0.0.2', proxies), null);
+  assert.equal(resolveClientAddress('10.0.0.3', 'unknown, 10.0.0.2', proxies), null);
+  // The size and hop-count limits still apply to the whole header.
+  assert.equal(resolveClientAddress('10.0.0.3', `${'x,'.repeat(20)}192.0.2.1`, proxies), null);
+});
+
 test('malformed, non-literal and oversized forwarding chains stay unknown', () => {
   for (const value of [
     'unknown', '192.0.2.1:80', '[2001:db8::1]:80', '"192.0.2.1"', 'fe80::1%eth0',
-    '010.0.0.1', 'example.test', '192.0.2.1,,10.0.0.2', 'garbage,192.0.2.1', ' 192.0.2.1',
+    '010.0.0.1', 'example.test', '192.0.2.1,,10.0.0.2', ' 192.0.2.1',
     '192.0.2.1,' + ' '.repeat(4096) + '10.0.0.2', Array(21).fill('192.0.2.1').join(','),
   ]) assert.equal(resolveClientAddress('10.0.0.3', value, proxies), null);
   assert.equal(resolveClientAddress('10.0.0.3', Array(20).fill('192.0.2.1').join(','), proxies), '192.0.2.1');

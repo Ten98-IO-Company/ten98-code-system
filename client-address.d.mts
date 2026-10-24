@@ -8,8 +8,10 @@ export declare function normalizeClientAddress(value: unknown): string | null;
 export declare function parseTrustedProxies(raw: unknown): TrustedProxies;
 /**
  * The connecting client's address. A peer outside `trustedProxies` is the client itself and its headers are ignored.
- * A trusted peer yields the right-most X-Forwarded-For hop that is not itself trusted.
- * Returns null when the address is unknown: an invalid peer, or a trusted peer with a missing, malformed, oversized or all-trusted chain.
+ * A trusted peer yields the right-most X-Forwarded-For hop that is not itself trusted. The walk goes right to left
+ * through trusted hops and stops at that client hop, so entries further left (which the client itself controls) are
+ * never read. Returns null when the address is unknown: an invalid peer, or a trusted peer whose chain is missing,
+ * oversized, all-trusted, or malformed at or before the client hop.
  * Callers must give null a conservative key of their own rather than sharing one bucket across clients.
  */
 export declare function resolveClientAddress(peerAddress: unknown, forwardedFor: string | null | undefined, trustedProxies: TrustedProxies): string | null;
