@@ -133,10 +133,33 @@ export function openRouterFetch(path: string, { apiKey, title, body, signal, met
   });
 }
 
-export function oidcEndpoint(raw: string | URL, { allowHttp = false, issuer = false }: { allowHttp?: boolean; issuer?: boolean } = {}): URL {
+// Hosts where plain http stays on this machine. Both apps already use exactly this set for APP_URL and local OIDC tests.
+const loopbackHosts = new Set(['localhost', '127.0.0.1', '[::1]']);
+const httpAllowed = (url: URL, allowHttp: boolean | 'loopback') => url.protocol === 'http:' && (allowHttp === true || allowHttp === 'loopback' && loopbackHosts.has(url.hostname));
+
+/**
+ * An https OIDC endpoint without credentials or a fragment; issuers also refuse a query. `allowHttp: 'loopback'` admits
+ * plain http only on localhost, 127.0.0.1 and [::1], for local providers; `allowHttp: true` admits it on any host.
+ */
+export function oidcEndpoint(raw: string | URL, { allowHttp = false, issuer = false }: { allowHttp?: boolean | 'loopback'; issuer?: boolean } = {}): URL {
+  if (![true, false, 'loopback'].includes(allowHttp)) throw new TypeError("allowHttp must be true, false or 'loopback'.");
   const url = new URL(raw);
-  if ((url.protocol !== 'https:' && !(allowHttp && url.protocol === 'http:')) || url.username || url.password || url.href.includes('#') || issuer && url.href.includes('?')) throw new TypeError('Invalid OIDC endpoint URL.');
+  if ((url.protocol !== 'https:' && !httpAllowed(url, allowHttp)) || url.username || url.password || url.href.includes('#') || issuer && url.href.includes('?')) throw new TypeError('Invalid OIDC endpoint URL.');
   return url;
+}
+
+/**
+ * The origin of an application's public URL (APP_URL): https, or http on localhost, 127.0.0.1 or [::1]; no credentials,
+ * path, query or fragment; a single trailing slash is accepted. Throws a TypeError with `code: 'APP_URL_INVALID'`.
+ */
+export function appOrigin(raw: string): string {
+  const invalid = (message: string) => Object.assign(new TypeError(message), { code: 'APP_URL_INVALID' });
+  let url: URL;
+  try { url = new URL(raw); } catch { throw invalid('APP_URL must be an absolute http(s) URL.'); }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw invalid('APP_URL must use https.');
+  if (url.username || url.password || url.search || raw.includes('#') || url.pathname !== '/') throw invalid('APP_URL must be an origin, without credentials, path, query or fragment.');
+  if (!httpAllowed(url, 'loopback') && url.protocol !== 'https:') throw invalid('APP_URL must use https outside localhost, 127.0.0.1 and [::1].');
+  return url.origin;
 }
 
 export * from './migration-ledger.mjs';
