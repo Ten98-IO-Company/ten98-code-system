@@ -32,7 +32,7 @@ for (const [key, { repository, tag }] of Object.entries(catalog.sources)) {
   const checkout = new URL(`${repository}/`, repos);
   const tree = (() => {
     if (!existsSync(new URL('.git', checkout))) return null;
-    try { return new Set(execFileSync('git', ['-C', fileURLToPath(checkout), 'ls-tree', '-r', '--name-only', tag], { encoding: 'utf8', maxBuffer: 64 << 20 }).split('\n')); }
+    try { return new Set(execFileSync('git', ['-C', fileURLToPath(checkout), 'ls-tree', '-r', '--name-only', `refs/tags/${tag}`], { encoding: 'utf8', maxBuffer: 64 << 20 }).split('\n')); }
     catch { return null; }
   })();
   test(`catalogue paths for ${key} exist at ${repository}@${tag}`, { skip: tree ? false : `no local ${repository} checkout with ${tag}` }, () => {

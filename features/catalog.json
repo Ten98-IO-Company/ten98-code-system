@@ -8,7 +8,7 @@
   "sources": {
     "campaign": {
       "repository": "ten98-campaign",
-      "tag": "v0.20.0",
+      "tag": "v0.32.1",
       "stack": "React/Vite SPA, Node HTTP, PostgreSQL/Drizzle, openid-client",
       "adoption": "retained-stack-reference",
       "installInputs": [
@@ -23,7 +23,7 @@
         "npm run build"
       ],
       "integrationPrerequisites": "A disposable PostgreSQL in TEST_DATABASE_URL; provider tests use mocks only.",
-      "url": "https://github.com/Ten98-IO-Company/ten98-campaign/tree/v0.20.0"
+      "url": "https://github.com/Ten98-IO-Company/ten98-campaign/tree/v0.32.1"
     },
     "discover": {
       "repository": "ten98-discover",
@@ -43,12 +43,12 @@
         "pnpm build"
       ],
       "integrationPrerequisites": "Isolated PostgreSQL, approved public configuration and the selected test's documented fixture setup; never production credentials.",
-      "tag": "v0.2.1",
-      "url": "https://github.com/Ten98-IO-Company/ten98-discover/tree/v0.2.1"
+      "tag": "v0.7.4",
+      "url": "https://github.com/Ten98-IO-Company/ten98-discover/tree/v0.7.4"
     },
     "ui": {
       "repository": "ten98-design-system",
-      "tag": "v0.22.0",
+      "tag": "v0.25.0",
       "stack": "React presentation and semantic CSS; no authentication or persistence controller",
       "adoption": "shared-presentation-source",
       "installInputs": [
@@ -59,7 +59,7 @@
       "applicationChecks": [
         "npm run check:all"
       ],
-      "url": "https://github.com/Ten98-IO-Company/ten98-design-system/tree/v0.22.0"
+      "url": "https://github.com/Ten98-IO-Company/ten98-design-system/tree/v0.25.0"
     }
   },
   "archivedSourceRelease": {
@@ -102,7 +102,7 @@
         "tests/email-feedback.test.mjs"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.1.21"
+      "version": "v0.4.2"
     },
     "presentation": {
       "package": "@ten98/ui",
