@@ -113,7 +113,7 @@
         "tests/loopback-origin.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.9.0"
+      "version": "v0.10.0"
     },
     "presentation": {
       "package": "@ten98/ui",
