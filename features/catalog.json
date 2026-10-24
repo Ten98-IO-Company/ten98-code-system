@@ -48,7 +48,7 @@
     },
     "ui": {
       "repository": "ten98-design-system",
-      "tag": "v0.25.0",
+      "tag": "v0.26.0",
       "stack": "React presentation and semantic CSS; no authentication or persistence controller",
       "adoption": "shared-presentation-source",
       "installInputs": [
@@ -59,7 +59,7 @@
       "applicationChecks": [
         "npm run check:all"
       ],
-      "url": "https://github.com/Ten98-IO-Company/ten98-design-system/tree/v0.25.0"
+      "url": "https://github.com/Ten98-IO-Company/ten98-design-system/tree/v0.26.0"
     }
   },
   "archivedSourceRelease": {
