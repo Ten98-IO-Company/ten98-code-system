@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.10.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.11.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
