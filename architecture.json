@@ -646,7 +646,8 @@
         },
         "compilerProjects": [
           "tsconfig.json",
-          "tests/tsconfig.api.json"
+          "tests/tsconfig.api.json",
+          "tests/tsconfig.tests.json"
         ]
       },
       "database": {

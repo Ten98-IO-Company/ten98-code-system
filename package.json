@@ -47,7 +47,7 @@
     "check:architecture": "node check.mjs .",
     "typecheck": "pnpm run check:architecture && tsc --project tsconfig.json --noEmit",
     "build": "pnpm run check:architecture && tsc --project tsconfig.json",
-    "test": "pnpm run check:architecture && tsc --project tsconfig.json && tsc --project tests/tsconfig.api.json && node --test tests/*.test.mjs",
+    "test": "pnpm run check:architecture && tsc --project tsconfig.json && tsc --project tests/tsconfig.api.json && tsc --project tests/tsconfig.tests.json && node --test tests/*.test.mjs tests/*.test.mts",
     "prepack": "pnpm run build"
   },
   "engines": {
