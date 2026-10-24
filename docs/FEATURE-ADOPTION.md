@@ -7,7 +7,7 @@ The catalogue retains `defaultAuthenticatedNodeStack` as its framework-source se
 Each catalogue `sources` entry names the app's current release tag. Check out that tag in a fresh working folder, install through its lockfile with Node 24 and the app's own package manager, and run its listed checks before adopting anything. It is a complete reference to adopt into the same stack, not a drop-in package:
 
 ```sh
-git clone --depth 1 --branch v0.2.1 https://github.com/Ten98-IO-Company/ten98-discover.git work/ten98-feature-reference
+git clone --depth 1 --branch v0.7.4 https://github.com/Ten98-IO-Company/ten98-discover.git work/ten98-feature-reference
 ```
 
 Entry-point paths in the catalogue are navigation aids, not a list of independently copyable files. A tag carries the complete source closure: routes, UI, controllers, schema and migrations, jobs, public configuration examples, lockfiles, pinned runtime and UI archives, tests, licences and notices. The 2026-10-20 source bundles are archived history and predate Campaign on PostgreSQL, Amazon SES and account closure.
