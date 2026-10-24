@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.4.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.4.1.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -260,13 +260,13 @@
         "detect-browser": "5.3.0",
         "drizzle-orm": "0.45.2",
         "mmdb-lib": "3.0.3",
-        "nodemailer": "10.1.1",
+        "nodemailer": "10.1.4",
         "parse5": "8.0.1",
         "pg": "8.23.0",
         "pg-boss": "12.37.1",
         "saxes": "6.0.0",
         "ua-parser-js": "1.0.41",
-        "zod": "4.5.4"
+        "zod": "4.6.6"
       },
       "devDependencies": {
         "@types/node": "24.10.1",
