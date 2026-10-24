@@ -2,7 +2,7 @@
 // Every request goes to a constant regional origin chosen from an allowlist; no host is built from input.
 // Callers retain credentials, sender identity, suppression/consent policy, retries and send accounting.
 import { createHash, createHmac } from 'node:crypto';
-import { readResponseText } from './index.mjs';
+import { readResponseText } from './browser.mjs';
 /** SES v2 API origins for the commercial partition, from https://docs.aws.amazon.com/general/latest/gr/ses.html. */
 const SES_ORIGINS = Object.freeze({
     'us-east-1': 'https://email.us-east-1.amazonaws.com',

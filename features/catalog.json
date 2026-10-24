@@ -72,7 +72,9 @@
       "package": "@ten98/runtime",
       "entrypoints": [
         "index.mjs",
-        "index.d.mts"
+        "index.d.mts",
+        "browser.mjs",
+        "browser.d.mts"
       ],
       "exports": [
         "workspaceRoles",
@@ -111,10 +113,11 @@
         "tests/capability-token.test.mts",
         "tests/json-body.test.mts",
         "tests/loopback-origin.test.mts",
-        "tests/ledger-guards.test.mts"
+        "tests/ledger-guards.test.mts",
+        "tests/browser-entry.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.11.0"
+      "version": "v0.12.0"
     },
     "presentation": {
       "package": "@ten98/ui",

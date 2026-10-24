@@ -15,7 +15,7 @@ Shared server-side building blocks for Ten98 apps, so every app gets the same te
 ## Get started
 
 - Install a release archive from [GitHub Releases](https://github.com/Ten98-IO-Company/ten98-code-system/releases) into the app's `vendor/` folder, and update the manifest and lockfile together.
-- Import functions from `@ten98/runtime`. Their types ship with the package.
+- Import functions from `@ten98/runtime`. Their types ship with the package. Browser code imports from `@ten98/runtime/browser`, which has the workspace roles and response readers and needs no Node built-ins.
 - Run `node node_modules/@ten98/runtime/check.mjs .` as the app's `check:architecture` script, first in every `test` and `build` script. [architecture.json](architecture.json) declares the shared versions and dependencies.
 - Apps keep their own authorization, storage, credentials and paid-work accounting. The runtime owns only the shared mechanism.
 
