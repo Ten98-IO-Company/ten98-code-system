@@ -44,3 +44,4 @@ export * from './client-address.mjs';
 export * from './ses-email.mjs';
 export * from './sns-notification.mjs';
 export * from './email-feedback.mjs';
+export * from './capability-token.mjs';

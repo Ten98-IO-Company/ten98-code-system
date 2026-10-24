@@ -93,7 +93,9 @@
         "deriveAwsV4SigningKey",
         "sendSesEmail",
         "verifySnsMessage",
-        "classifyEmailFeedback"
+        "classifyEmailFeedback",
+        "signCapability",
+        "readCapability"
       ],
       "tests": [
         "tests/runtime.test.mjs",
@@ -103,10 +105,11 @@
         "tests/sns-notification.test.mjs",
         "tests/email-feedback.test.mjs",
         "tests/read-bytes.test.mts",
-        "tests/client-limit-key.test.mts"
+        "tests/client-limit-key.test.mts",
+        "tests/capability-token.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.6.0"
+      "version": "v0.7.0"
     },
     "presentation": {
       "package": "@ten98/ui",
