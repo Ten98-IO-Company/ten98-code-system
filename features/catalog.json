@@ -110,10 +110,11 @@
         "tests/client-limit-key.test.mts",
         "tests/capability-token.test.mts",
         "tests/json-body.test.mts",
-        "tests/loopback-origin.test.mts"
+        "tests/loopback-origin.test.mts",
+        "tests/ledger-guards.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.10.0"
+      "version": "v0.11.0"
     },
     "presentation": {
       "package": "@ten98/ui",

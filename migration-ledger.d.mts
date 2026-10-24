@@ -27,8 +27,9 @@ export declare function createMigrationLedger({ directory, files, lockKey }: {
     sources: () => Promise<readonly Migration[]>;
     pending: (applied: readonly AppliedMigration[]) => Promise<readonly Migration[]>;
     assertCurrent: (client: MigrationClient) => Promise<void>;
-    migrate: (client: MigrationClient, { afterApply }?: {
+    migrate: (client: MigrationClient, { afterApply, lockTimeoutMs }?: {
         afterApply?(client: MigrationClient, applied: readonly string[]): Promise<void>;
+        lockTimeoutMs?: number;
     }) => Promise<readonly string[]>;
 };
 export {};
