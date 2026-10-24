@@ -51,19 +51,25 @@ export function createMigrationLedger({ directory, files, lockKey }) {
      * Applies every pending migration in one locked transaction and returns the applied versions.
      * `client` must be a dedicated connection (such as `pool.connect()`), never a pool, because BEGIN/COMMIT must share a session.
      * `afterApply` runs inside the transaction, only when something was applied; its failure rolls everything back.
-     * `lockTimeoutMs` bounds the wait for another instance's migration lock; when it expires, nothing is applied and the
-     * error has `code: 'MIGRATION_LOCK_TIMEOUT'`. Without it the wait is unbounded, as before.
+     * `lockTimeoutMs` bounds only the wait for another instance's migration lock; when it expires, nothing is applied and the
+     * error has `code: 'MIGRATION_LOCK_TIMEOUT'`. The connection's own lock_timeout then applies to the migrations themselves.
+     * Without it the wait is unbounded, as before.
      */
     async function migrate(client, { afterApply, lockTimeoutMs } = {}) {
-        if (lockTimeoutMs !== undefined && (!Number.isSafeInteger(lockTimeoutMs) || lockTimeoutMs < 1))
-            throw new TypeError('lockTimeoutMs must be a positive safe integer.');
+        // PostgreSQL's lock_timeout is an int of milliseconds.
+        if (lockTimeoutMs !== undefined && (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 2147483647)) {
+            throw new TypeError('lockTimeoutMs must be an integer from 1 to 2147483647.');
+        }
         await sources();
         const applied = [];
         try {
             await client.query('BEGIN');
-            // SET LOCAL lasts until COMMIT or ROLLBACK, so the timeout never leaks into the connection's later use.
-            if (lockTimeoutMs !== undefined)
-                await client.query(`SET LOCAL lock_timeout = ${lockTimeoutMs}`);
+            let previous;
+            if (lockTimeoutMs !== undefined) {
+                previous = (await client.query("SELECT current_setting('lock_timeout') AS lock_timeout")).rows[0].lock_timeout;
+                // is_local: the value lasts only until COMMIT or ROLLBACK, so it never leaks into the connection's later use.
+                await client.query("SELECT set_config('lock_timeout', $1, true)", [String(lockTimeoutMs)]);
+            }
             try {
                 await client.query('SELECT pg_advisory_xact_lock($1, $2)', [lockKey[0], lockKey[1]]);
             }
@@ -74,6 +80,9 @@ export function createMigrationLedger({ directory, files, lockKey }) {
                 }
                 throw error;
             }
+            // The bound covers only the advisory lock; migration statements wait for table locks as they did before.
+            if (previous !== undefined)
+                await client.query("SELECT set_config('lock_timeout', $1, true)", [previous]);
             await client.query('CREATE TABLE IF NOT EXISTS schema_version (version text PRIMARY KEY, checksum text NOT NULL)');
             const current = await client.query('SELECT version, checksum FROM schema_version ORDER BY version');
             for (const migration of await pending(current.rows)) {
