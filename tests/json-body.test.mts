@@ -34,8 +34,14 @@ test('media type, size, length, encoding and JSON refusals carry a code and stat
 test('allowEmpty returns undefined for a request without a body, before the media type is checked', async () => {
   assert.equal(await readJsonBody(null, new Headers(), { maxBytes: 64, allowEmpty: true }), undefined);
   assert.equal(await readJsonBody(stream(''), new Headers({ 'content-length': '0' }), { maxBytes: 64, allowEmpty: true }), undefined);
-  assert.equal(await readJsonBody(stream(' '), new Headers(json), { maxBytes: 64, allowEmpty: true }), undefined);
-  await assert.rejects(readJsonBody(stream('{}'), new Headers(), { maxBytes: 64, allowEmpty: true }), refused('BODY_MEDIA_TYPE', 415));
+  // RFC 9112: neither Content-Length nor Transfer-Encoding means no body, even when a Node handler passes a stream.
+  assert.equal(await readJsonBody(stream(''), new Headers(), { maxBytes: 64, allowEmpty: true }), undefined);
+  assert.equal(await readJsonBody(stream(' '), new Headers({ ...json, 'content-length': '1' }), { maxBytes: 64, allowEmpty: true }), undefined);
+  // A body that is present still needs the JSON media type.
+  await assert.rejects(readJsonBody(stream('{}'), new Headers({ 'transfer-encoding': 'chunked' }), { maxBytes: 64, allowEmpty: true }), refused('BODY_MEDIA_TYPE', 415));
+  await assert.rejects(readJsonBody(stream('{}'), new Headers({ 'content-length': '2' }), { maxBytes: 64, allowEmpty: true }), refused('BODY_MEDIA_TYPE', 415));
+  // Without allowEmpty a body-less request is still refused.
+  await assert.rejects(readJsonBody(stream(''), new Headers(json), { maxBytes: 64 }), refused('BODY_EMPTY', 400));
 });
 
 test('configuration errors throw a TypeError', async () => {

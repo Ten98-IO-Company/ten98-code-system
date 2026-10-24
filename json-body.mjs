@@ -6,8 +6,9 @@ const refuse = (code, status, message) => Object.assign(new Error(message), { co
 /**
  * Reads a JSON request body of at most `maxBytes`. The media type must be `application/json` (parameters allowed), a
  * declared Content-Length must be a plain decimal no larger than `maxBytes`, and the body must be strict UTF-8 JSON.
- * With `allowEmpty`, a request without a body (no stream, or Content-Length 0) returns `undefined` before the media
- * type is checked. Every refusal throws a {@link JsonBodyError} carrying `code` and `status`.
+ * With `allowEmpty`, a request without a body returns `undefined` before the media type is checked: no stream,
+ * Content-Length 0, or neither Content-Length nor Transfer-Encoding (RFC 9112 §6.3; Node handlers always pass a
+ * stream). Every refusal throws a {@link JsonBodyError} carrying `code` and `status`.
  */
 export async function readJsonBody(body, headers, { maxBytes, allowEmpty = false }) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
@@ -15,7 +16,7 @@ export async function readJsonBody(body, headers, { maxBytes, allowEmpty = false
     if (!(headers instanceof Headers))
         throw new TypeError('headers must be a Headers object.');
     const length = headers.get('content-length');
-    if (allowEmpty && (body === null || length === '0')) {
+    if (allowEmpty && (body === null || length === '0' || (length === null && !headers.has('transfer-encoding')))) {
         void body?.cancel().catch(() => { });
         return undefined;
     }
