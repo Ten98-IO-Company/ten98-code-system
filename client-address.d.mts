@@ -13,3 +13,9 @@ export declare function parseTrustedProxies(raw: unknown): TrustedProxies;
  * Callers must give null a conservative key of their own rather than sharing one bucket across clients.
  */
 export declare function resolveClientAddress(peerAddress: unknown, forwardedFor: string | null | undefined, trustedProxies: TrustedProxies): string | null;
+/**
+ * A rate-limit key for one client within `scope`, derived with HMAC so the stored key never reveals the address.
+ * Pass the result of {@link resolveClientAddress}. A null (unresolved) address gets the dedicated key `<scope>:unresolved`,
+ * kept apart from every resolved client; give it its own, stricter limit rather than letting it share a client's bucket.
+ */
+export declare function clientLimitKey(scope: string, address: string | null, secret: string): string;

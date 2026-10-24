@@ -26,6 +26,12 @@ test('readResponseBytes applies the same limits and codes as readResponseText', 
   await assert.rejects(readResponseBytes(new Response('ab'), { maxBytes: 9, signal: controller.signal }), /stop/u);
 });
 
+test('a body stream that yields non-byte chunks is refused instead of bypassing the byte limit', async () => {
+  const strings = () => new Response(new ReadableStream({ start(controller) { controller.enqueue('x'.repeat(100)); controller.close(); } }));
+  await assert.rejects(readResponseBytes(strings(), { maxBytes: 10 }), /chunks must be bytes/u);
+  await assert.rejects(readResponseText(strings(), { maxBytes: 10 }), /chunks must be bytes/u);
+});
+
 test('readResponseText keeps its error precedence after sharing the read loop', async () => {
   // Invalid UTF-8 in the first chunk is reported before a later chunk crosses the byte limit, as before.
   await assert.rejects(readResponseText(chunked([0xc0, 0xaf], [0x61, 0x61, 0x61]), { maxBytes: 3 }), code('RESPONSE_DECODE_INVALID'));

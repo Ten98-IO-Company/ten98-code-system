@@ -1,6 +1,7 @@
 // Client address behind trusted reverse proxies, for per-client rate limits and similar keys.
 // Promoted from ten98-discover src/server/analytics-network.ts @ 61c3154 (normalizeIp, addressList, the X-Forwarded-For walk).
 // Callers retain what the address is used for; it is ephemeral input, never something to log or store.
+import { createHmac } from 'node:crypto';
 import { BlockList, isIP, SocketAddress } from 'node:net';
 
 /** Parsed proxy list. Structural, so the public declarations need no Node type definitions. */
@@ -78,4 +79,18 @@ export function resolveClientAddress(peerAddress: unknown, forwardedFor: string 
     if (!isTrusted(address)) return address;
   }
   return null;
+}
+
+/**
+ * A rate-limit key for one client within `scope`, derived with HMAC so the stored key never reveals the address.
+ * Pass the result of {@link resolveClientAddress}. A null (unresolved) address gets the dedicated key `<scope>:unresolved`,
+ * kept apart from every resolved client; give it its own, stricter limit rather than letting it share a client's bucket.
+ */
+export function clientLimitKey(scope: string, address: string | null, secret: string): string {
+  if (typeof scope !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(scope)) throw new TypeError('scope must be 1 to 64 lowercase letters, digits, dots, hyphens or underscores.');
+  if (typeof secret !== 'string' || secret.length < 32) throw new TypeError('secret must contain at least 32 characters.');
+  if (address === null) return `${scope}:unresolved`;
+  const canonical = normalizeClientAddress(address);
+  if (canonical === null) throw new TypeError('address must be a client address from resolveClientAddress, or null.');
+  return `${scope}:${createHmac('sha256', secret).update(`${scope}\0${canonical}`).digest('base64url')}`;
 }
