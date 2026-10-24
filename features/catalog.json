@@ -86,6 +86,7 @@
         "parseTrustedProxies",
         "resolveClientAddress",
         "normalizeClientAddress",
+        "clientLimitKey",
         "SES_REGIONS",
         "sesOrigin",
         "signAwsV4Request",
@@ -101,10 +102,11 @@
         "tests/ses-email.test.mjs",
         "tests/sns-notification.test.mjs",
         "tests/email-feedback.test.mjs",
-        "tests/read-bytes.test.mts"
+        "tests/read-bytes.test.mts",
+        "tests/client-limit-key.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.5.0"
+      "version": "v0.6.0"
     },
     "presentation": {
       "package": "@ten98/ui",

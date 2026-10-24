@@ -93,6 +93,8 @@ async function readBounded(response: Response, { maxBytes, signal, contentLength
         if (declared !== undefined && bytes !== declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
         return bytes;
       }
+      // A stream of strings or other objects has no byteLength, which would silently disable every byte limit.
+      if (!(value instanceof Uint8Array)) throw new TypeError('Response body chunks must be bytes.');
       bytes += value.byteLength;
       if (bytes > maxBytes) throw tooLarge();
       if (maxChunks !== undefined && ++chunks > maxChunks) throw Object.assign(new RangeError('Response arrived in too many chunks.'), { code: 'RESPONSE_TOO_MANY_CHUNKS' });
