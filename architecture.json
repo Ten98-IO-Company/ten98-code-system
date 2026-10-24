@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.11.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.12.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -629,6 +629,8 @@
         "nativeFiles": {
           "index.mjs": "Generated public runtime executable from src/index.mts; build before test and pack.",
           "index.d.mts": "Generated public declarations from src/index.mts.",
+          "browser.mjs": "Generated browser entry executable from src/browser.mts, exported as ./browser and re-exported by index.mjs; imports no Node built-ins.",
+          "browser.d.mts": "Generated declarations from src/browser.mts.",
           "migration-ledger.mjs": "Generated runtime executable from src/migration-ledger.mts, re-exported by index.mjs.",
           "migration-ledger.d.mts": "Generated declarations from src/migration-ledger.mts.",
           "client-address.mjs": "Generated runtime executable from src/client-address.mts, re-exported by index.mjs.",

@@ -1,7 +1,7 @@
 // Byte-limited JSON request bodies. Promoted from Discover src/server/validation.ts readJson (v0.7.4), generalised to take
 // a body stream and headers so Campaign's Node handlers can pass `Readable.toWeb(req)`. Apps keep schema validation and
 // how a coded error becomes their HTTP response.
-import { readResponseText } from './index.mjs';
+import { readResponseText } from './browser.mjs';
 const refuse = (code, status, message) => Object.assign(new Error(message), { code, status });
 /**
  * Reads a JSON request body of at most `maxBytes`. The media type must be `application/json` (parameters allowed), a
