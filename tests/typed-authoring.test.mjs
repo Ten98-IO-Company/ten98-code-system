@@ -8,7 +8,7 @@ import test from 'node:test';
 import * as runtime from '../index.mjs';
 
 test('generated public entrypoint retains every frozen runtime export', () => {
-  assert.deepEqual(Object.keys(runtime).sort(), ['createMigrationLedger', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'normalizeClientAddress', 'oidcEndpoint', 'openRouterFetch', 'parseTrustedProxies', 'readResponseText', 'resolveClientAddress', 'workspaceRoles', 'SES_REGIONS', 'classifyEmailFeedback', 'deriveAwsV4SigningKey', 'sendSesEmail', 'sesOrigin', 'signAwsV4Request', 'verifySnsMessage'].sort());
+  assert.deepEqual(Object.keys(runtime).sort(), ['createMigrationLedger', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'normalizeClientAddress', 'oidcEndpoint', 'openRouterFetch', 'parseTrustedProxies', 'readResponseText', 'resolveClientAddress', 'workspaceRoles', 'readResponseBytes', 'SES_REGIONS', 'classifyEmailFeedback', 'deriveAwsV4SigningKey', 'sendSesEmail', 'sesOrigin', 'signAwsV4Request', 'verifySnsMessage'].sort());
 });
 
 test('actual compiler rejects an implementation type error and preserves last good output', () => {

@@ -79,6 +79,7 @@
         "mayGrantWorkspaceRole",
         "mayManageWorkspaceMember",
         "readResponseText",
+        "readResponseBytes",
         "openRouterFetch",
         "oidcEndpoint",
         "createMigrationLedger",
@@ -99,10 +100,11 @@
         "tests/client-address.test.mjs",
         "tests/ses-email.test.mjs",
         "tests/sns-notification.test.mjs",
-        "tests/email-feedback.test.mjs"
+        "tests/email-feedback.test.mjs",
+        "tests/read-bytes.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.4.2"
+      "version": "v0.5.0"
     },
     "presentation": {
       "package": "@ten98/ui",

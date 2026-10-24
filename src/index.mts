@@ -10,7 +10,7 @@ export function mayManageWorkspaceMember(actor: unknown, previousRole: unknown, 
 
 const lengthError = (code: 'CONTENT_LENGTH_INVALID' | 'RESPONSE_INCOMPLETE' | 'RESPONSE_DECODE_INVALID', message: string) => Object.assign(new TypeError(message), { code });
 
-/** Options for {@link readResponseText}. */
+/** Options for {@link readResponseText}; {@link readResponseBytes} takes the same limits. */
 export interface ReadResponseTextOptions {
   maxBytes: number;
   signal?: AbortSignal;
@@ -30,7 +30,36 @@ export interface ReadResponseTextOptions {
  * rethrown as they are, so a caller can tell an unreadable body from an interrupted one.
  */
 export function readResponseText(response: Response, options: ReadResponseTextOptions): Promise<string>;
-export async function readResponseText(response: Response, { maxBytes, signal, preserveBOM = false, contentLength = false, maxChunks }: Partial<ReadResponseTextOptions> = {}): Promise<string> {
+export async function readResponseText(response: Response, { preserveBOM = false, ...options }: Partial<ReadResponseTextOptions> = {}): Promise<string> {
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: preserveBOM });
+  const decode = (value?: Uint8Array): string => {
+    try { return value ? decoder.decode(value, { stream: true }) : decoder.decode(); }
+    catch { throw lengthError('RESPONSE_DECODE_INVALID', 'Response body is not valid UTF-8.'); }
+  };
+  let text = '';
+  await readBounded(response, options, value => { text += decode(value); });
+  return text + decode();
+}
+
+/** Options for {@link readResponseBytes}: the same limits as {@link readResponseText}, without text decoding. */
+export type ReadResponseBytesOptions = Omit<ReadResponseTextOptions, 'preserveBOM'>;
+
+/**
+ * Reads the exact response bytes under the same limits and error codes as {@link readResponseText}, for bodies that are
+ * hashed, signed, saved or decoded by the caller (CSV and zip downloads, HMAC-verified webhooks, media).
+ */
+export function readResponseBytes(response: Response, options: ReadResponseBytesOptions): Promise<Uint8Array>;
+export async function readResponseBytes(response: Response, options: Partial<ReadResponseBytesOptions> = {}): Promise<Uint8Array> {
+  const parts: Uint8Array[] = [];
+  const total = await readBounded(response, options, value => { parts.push(value); });
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) { bytes.set(part, offset); offset += part.byteLength; }
+  return bytes;
+}
+
+// One read loop for both readers, so limits, codes and error precedence cannot drift apart. Returns the byte count.
+async function readBounded(response: Response, { maxBytes, signal, contentLength = false, maxChunks }: Partial<ReadResponseBytesOptions>, onChunk: (value: Uint8Array) => void): Promise<number> {
   if (typeof maxBytes !== 'number' || !Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError('maxBytes must be a nonnegative safe integer.');
   if (maxChunks !== undefined && (!Number.isSafeInteger(maxChunks) || maxChunks < 1)) throw new TypeError('maxChunks must be a positive safe integer.');
   if (![false, true, 'limit', 'exact'].includes(contentLength)) throw new TypeError("contentLength must be true, false, 'limit' or 'exact'.");
@@ -50,30 +79,25 @@ export async function readResponseText(response: Response, { maxBytes, signal, p
   if (!reader) {
     signal?.throwIfAborted();
     if (declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
-    return '';
+    return 0;
   }
   const abort = () => { void reader.cancel(signal?.reason).catch(() => {}); };
   signal?.addEventListener('abort', abort, { once: true });
   try {
     signal?.throwIfAborted();
-    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: preserveBOM });
-    const decode = (value?: Uint8Array): string => {
-      try { return value ? decoder.decode(value, { stream: true }) : decoder.decode(); }
-      catch { throw lengthError('RESPONSE_DECODE_INVALID', 'Response body is not valid UTF-8.'); }
-    };
-    let bytes = 0, chunks = 0, text = '';
+    let bytes = 0, chunks = 0;
     while (true) {
       const { value, done } = await reader.read();
       signal?.throwIfAborted();
       if (done) {
         if (declared !== undefined && bytes !== declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is shorter than its Content-Length.');
-        return text + decode();
+        return bytes;
       }
       bytes += value.byteLength;
       if (bytes > maxBytes) throw tooLarge();
       if (maxChunks !== undefined && ++chunks > maxChunks) throw Object.assign(new RangeError('Response arrived in too many chunks.'), { code: 'RESPONSE_TOO_MANY_CHUNKS' });
       if (declared !== undefined && bytes > declared) throw lengthError('RESPONSE_INCOMPLETE', 'Response body is longer than its Content-Length.');
-      text += decode(value);
+      onChunk(value);
     }
   } finally {
     signal?.removeEventListener('abort', abort);

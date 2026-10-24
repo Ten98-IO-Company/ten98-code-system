@@ -2,7 +2,7 @@ export declare const workspaceRoles: readonly ['owner', 'admin', 'editor', 'view
 export type WorkspaceRole = typeof workspaceRoles[number];
 export declare function mayGrantWorkspaceRole(actor: unknown, role: unknown): boolean;
 export declare function mayManageWorkspaceMember(actor: unknown, previousRole: unknown, nextRole?: unknown): boolean;
-/** Options for {@link readResponseText}. */
+/** Options for {@link readResponseText}; {@link readResponseBytes} takes the same limits. */
 export interface ReadResponseTextOptions {
     maxBytes: number;
     signal?: AbortSignal;
@@ -21,6 +21,13 @@ export interface ReadResponseTextOptions {
  * rethrown as they are, so a caller can tell an unreadable body from an interrupted one.
  */
 export declare function readResponseText(response: Response, options: ReadResponseTextOptions): Promise<string>;
+/** Options for {@link readResponseBytes}: the same limits as {@link readResponseText}, without text decoding. */
+export type ReadResponseBytesOptions = Omit<ReadResponseTextOptions, 'preserveBOM'>;
+/**
+ * Reads the exact response bytes under the same limits and error codes as {@link readResponseText}, for bodies that are
+ * hashed, signed, saved or decoded by the caller (CSV and zip downloads, HMAC-verified webhooks, media).
+ */
+export declare function readResponseBytes(response: Response, options: ReadResponseBytesOptions): Promise<Uint8Array>;
 export declare function openRouterFetch(path: string, { apiKey, title, body, signal, metadata }?: {
     apiKey?: string;
     title?: string;
