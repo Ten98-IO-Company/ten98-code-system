@@ -16,4 +16,6 @@ Track defects and migration work in this repository's GitHub Issues and linked P
 
 Make decisions at the lowest level that has the authority and the facts. Owners decide in-scope, reversible work themselves. The manager coordinates across sessions. The decision council answers high-level questions in issues labelled `decision`. The user decides anything irreversible or outward.
 
+## Cross-app consistency
+
 Same feature, same experience: the same features across both apps should look the same and work the same. Shared pieces land here first; before approving a change, check how both Campaign and Discover use it (https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Development#same-feature-same-experience).
