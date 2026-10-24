@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { checkManifest, checkVendoredFloors } from '../check.mjs';
 
-const runtime = 'file:vendor/ten98-runtime-0.4.1.tgz';
+const runtime = 'file:vendor/ten98-runtime-0.4.2.tgz';
 const app = ui => ({
-  name: 'ten98-campaign', type: 'module', engines: { node: '>=24.0.0 <25' },
+  name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
   dependencies: { '@ten98/ui': ui, '@ten98/runtime': runtime, 'openid-client': '6.8.8', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },

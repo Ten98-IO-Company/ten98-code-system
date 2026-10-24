@@ -57,7 +57,7 @@ test('canonical checker CLI enforces database policy before accepting a reviewed
     for (const name of ['check.mjs', 'database-policy.mjs']) writeFileSync(join(checkerFolder, name), readFileSync(new URL('../' + name, import.meta.url)));
     const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
     contract.profiles['fixture-stateful'] = { dependencies: {}, devDependencies: {}, sharedDependencies: [], sharedDevDependencies: [], peerDependencies: {}, checkScripts: ['test'], database: { engine: 'postgresql' } };
-    const manifest = { name: 'fixture-stateful', type: 'module', engines: { node: '>=24.0.0 <25' },
+    const manifest = { name: 'fixture-stateful', type: 'module', engines: { node: '>=24.22.1 <25' },
       scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test' } };
     writeFileSync(join(directory, 'package.json'), JSON.stringify(manifest));
     const run = () => {
@@ -78,29 +78,30 @@ test('canonical checker CLI enforces database policy before accepting a reviewed
 });
 
 test('running Node must satisfy the canonical range, not just manifest declarations', () => {
-  for (const version of ['24.0.0', '24.19.0', '24.999.999']) assert.deepEqual(checkRuntimeVersion(version), []);
-  for (const version of ['22.14.0', '23.99.99', '25.0.0', '26.1.0']) assert.match(checkRuntimeVersion(version).join('\n'), /outside canonical range/);
+  for (const version of ['24.22.1', '24.23.0', '24.999.999']) assert.deepEqual(checkRuntimeVersion(version), []);
+  // 24.22.1 carries the 2026-10-20 Node security fixes (Brotli decoder RCE, TLS and DNS hostname bypasses).
+  for (const version of ['24.0.0', '24.19.0', '24.22.0', '24.21.9', '22.14.0', '23.99.99', '25.0.0', '26.1.0']) assert.match(checkRuntimeVersion(version).join('\n'), /outside canonical range/);
   for (const version of ['', '24', '24.0.0-rc.1', 'v24.0.0', null]) assert.match(checkRuntimeVersion(version).join('\n'), /Cannot validate/);
 });
 
 // Independent fixture: do not derive the expected application from architecture.json.
 const campaign = () => ({
-  name: 'ten98-campaign', type: 'module', engines: { node: '>=24.0.0 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.4.1.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.4.2.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
 
 test('architecture accepts independent manifests with reviewed tools and mandatory gates', () => {
   assert.deepEqual(checkManifest(campaign()), []);
-  const runtime = { name: '@ten98/runtime', type: 'module', engines: { node: '>=24.0.0 <25' }, devDependencies: { '@types/node': '24.10.1', typescript: '7.0.2' }, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && tsc --project tsconfig.json', typecheck: 'npm run check:architecture && tsc --project tsconfig.json --noEmit' } };
+  const runtime = { name: '@ten98/runtime', type: 'module', engines: { node: '>=24.22.1 <25' }, devDependencies: { '@types/node': '24.10.1', typescript: '7.0.2' }, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && tsc --project tsconfig.json', typecheck: 'npm run check:architecture && tsc --project tsconfig.json --noEmit' } };
   assert.deepEqual(checkManifest(runtime), []);
 });
 
 test('native static site uses shared build tools without application runtime dependencies', () => {
   const site = () => ({
-    name: 'ten98-io', type: 'module', engines: { node: '>=24.0.0 <25' },
-    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.4.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    name: 'ten98-io', type: 'module', engines: { node: '>=24.22.1 <25' },
+    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.4.2.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', build: 'npm run check:architecture && tsc --project tsconfig.tooling.json && node scripts/build.mts', check: 'npm run check:architecture && npm run build && node scripts/check.mjs', test: 'npm run check:architecture && node scripts/enquiry-test.mjs' },
   });
   assert.deepEqual(checkManifest(site()), []);
@@ -160,8 +161,8 @@ test('architecture rejects unreviewed toolchains and dependency resolution subst
 test('approved profile-specific development tools keep their reviewed declaration', () => {
   const { '@types/node': _campaignNode, '@types/pg': _campaignPg, ...sharedDevDependencies } = campaign().devDependencies;
   const manifest = {
-    name: '@ten98/ui', type: 'module', engines: { node: '>=24.0.0 <25' },
-    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.4.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    name: '@ten98/ui', type: 'module', engines: { node: '>=24.22.1 <25' },
+    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.4.2.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };
@@ -219,7 +220,7 @@ test('architecture detects actual drift without consulting the contract for expe
 test('CLI checks the compiler-backed runtime and returns failure for any drift', () => {
   const temporary = mkdtempSync(join(tmpdir(), 'ten98-architecture-'));
   try {
-    const manifest = { name: '@ten98/runtime', type: 'module', engines: { node: '>=24.0.0 <25' }, dependencies: {}, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test' } }, file = join(temporary, 'package.json');
+    const manifest = { name: '@ten98/runtime', type: 'module', engines: { node: '>=24.22.1 <25' }, dependencies: {}, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test' } }, file = join(temporary, 'package.json');
     writeFileSync(file, JSON.stringify(manifest));
     const script = fileURLToPath(new URL('../check.mjs', import.meta.url));
     const actual = fileURLToPath(new URL('..', import.meta.url));

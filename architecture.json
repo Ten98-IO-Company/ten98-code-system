@@ -1,5 +1,5 @@
 {
-  "node": ">=24.0.0 <25",
+  "node": ">=24.22.1 <25",
   "sharedVersions": {
     "react": "19.2.8",
     "react-dom": "19.2.8",
@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.4.1.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.4.2.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
