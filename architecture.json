@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.14.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.15.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -645,6 +645,10 @@
           "capability-token.d.mts": "Generated declarations from src/capability-token.mts.",
           "json-body.mjs": "Generated runtime executable from src/json-body.mts, re-exported by index.mjs.",
           "json-body.d.mts": "Generated declarations from src/json-body.mts.",
+          "cloudflare-email.mjs": "Generated runtime executable from src/cloudflare-email.mts, re-exported by index.mjs.",
+          "cloudflare-email.d.mts": "Generated declarations from src/cloudflare-email.mts.",
+          "email-message.mjs": "Generated runtime executable from src/email-message.mts, internal module imported by other runtime modules, not re-exported by index.mjs.",
+          "email-message.d.mts": "Generated declarations from src/email-message.mts.",
           "public-hostname.mjs": "Generated runtime executable from src/public-hostname.mts, re-exported by index.mjs.",
           "public-hostname.d.mts": "Generated declarations from src/public-hostname.mts.",
           "provider-fetch.mjs": "Generated runtime executable from src/provider-fetch.mts, re-exported by index.mjs.",

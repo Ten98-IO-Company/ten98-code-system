@@ -3,6 +3,7 @@
 // Callers retain credentials, sender identity, suppression/consent policy, retries and send accounting.
 import { createHash, createHmac } from 'node:crypto';
 import { readResponseText } from './browser.mjs';
+import { checkEmailMessage, type EmailMessage } from './email-message.mjs';
 
 /** SES v2 API origins for the commercial partition, from https://docs.aws.amazon.com/general/latest/gr/ses.html. */
 const SES_ORIGINS: Readonly<Record<string, string>> = Object.freeze({
@@ -40,16 +41,9 @@ export const SES_REGIONS: readonly string[] = Object.freeze(Object.keys(SES_ORIG
 
 const SEND_PATH = '/v2/email/outbound-emails';
 const THROTTLING = new Set(['ThrottlingException', 'TooManyRequestsException', 'Throttling']);
-// Header names the request itself controls; a caller header must never add recipients or rewrite the envelope.
-const RESERVED_HEADERS = new Set(['bcc', 'cc', 'content-disposition', 'content-id', 'content-transfer-encoding', 'content-type', 'date', 'from', 'message-id', 'mime-version', 'reply-to', 'return-path', 'sender', 'subject', 'to']);
-const ADDRESS = /^[!#-'*+\-/-9=?A-Z^-~]+(?:\.[!#-'*+\-/-9=?A-Z^-~]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
 
 export interface AwsCredentials { readonly accessKeyId: string; readonly secretAccessKey: string; readonly sessionToken?: string }
-export interface SesMessage {
-  readonly from: string; readonly to: string; readonly subject: string;
-  readonly text?: string; readonly html?: string; readonly replyTo?: string;
-  readonly headers?: Readonly<Record<string, string>>;
-}
+export interface SesMessage extends EmailMessage {}
 /** Thrown by `sendSesEmail`. `uncertain` means SES may have sent the email; `retryable` means it definitely did not and may be retried later. */
 export interface SesSendError extends Error { code: string; uncertain: boolean; retryable: boolean; status?: number }
 
@@ -101,37 +95,6 @@ export function sesOrigin(region: unknown): string {
   return SES_ORIGINS[region]!;
 }
 
-function address(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value.length > 254 || !ADDRESS.test(value) || value.split('@')[0]!.length > 64) invalid(field);
-  return value;
-}
-
-/** A bare address or `Display Name <address>`; the unquoted display name excludes the list and address delimiters `,;:@<>"\`. */
-function sender(value: unknown): string {
-  if (typeof value !== 'string') invalid('from address');
-  const named = /^([ !#-+\--9=?A-Z^-~]{1,128}) <([^<>]+)>$/.exec(value);
-  if (!named) return address(value, 'from address');
-  if (!named[1]!.trim()) invalid('from address');
-  address(named[2], 'from address');
-  return value;
-}
-
-function messageHeaders(headers: unknown): { Name: string; Value: string }[] | undefined {
-  if (headers === undefined) return undefined;
-  if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) invalid('headers');
-  const entries = Object.entries(headers);
-  // Limits from https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_MessageHeader.html and API_Message.html.
-  if (entries.length > 15) invalid('headers');
-  const seen = new Set<string>();
-  return entries.map(([name, value]) => {
-    const lower = name.toLowerCase();
-    if (!/^[!-9;-~]{1,126}$/.test(name) || RESERVED_HEADERS.has(lower) || lower.startsWith('x-ses-') || seen.has(lower)) invalid('header name');
-    if (typeof value !== 'string' || !/^[ -~]{1,995}$/.test(value) || name.length + value.length > 996) invalid('header value');
-    seen.add(lower);
-    return { Name: name, Value: value };
-  });
-}
-
 function credentialsOf(value: unknown): AwsCredentials {
   const { accessKeyId, secretAccessKey, sessionToken } = (value ?? {}) as Partial<Record<keyof AwsCredentials, unknown>>;
   if (typeof accessKeyId !== 'string' || !/^[A-Z0-9]{16,128}$/.test(accessKeyId)) invalid('credentials');
@@ -141,24 +104,21 @@ function credentialsOf(value: unknown): AwsCredentials {
 }
 
 function requestBody(message: SesMessage, configurationSetName: unknown, idempotencyKey: unknown): string {
-  if (message === null || typeof message !== 'object') invalid('message');
-  const { from, to, subject, text, html, replyTo, headers } = message;
-  if (typeof subject !== 'string' || subject.length > 998 || /[\u0000-\u001f\u007f]/u.test(subject)) invalid('subject');
-  if (text !== undefined && typeof text !== 'string' || html !== undefined && typeof html !== 'string' || !text && !html) invalid('body');
+  const { from, to, subject, text, html, replyTo, headers } = checkEmailMessage(message, 'SES', { reservedHeaderPrefix: 'x-ses-' });
   if (configurationSetName !== undefined && (typeof configurationSetName !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(configurationSetName))) invalid('configuration set name');
   // MessageTag values allow only letters, digits, underscore and dash: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_MessageTag.html
   if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(idempotencyKey))) invalid('idempotency key');
   const content = (data: string) => ({ Data: data, Charset: 'UTF-8' });
-  const simpleHeaders = messageHeaders(headers);
+  const simpleHeaders = headers.map(({ name, value }) => ({ Name: name, Value: value }));
   // Request shape: https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html
   return JSON.stringify({
-    FromEmailAddress: sender(from),
-    Destination: { ToAddresses: [address(to, 'to address')] },
-    ...(replyTo === undefined ? {} : { ReplyToAddresses: [address(replyTo, 'reply-to address')] }),
+    FromEmailAddress: from.raw,
+    Destination: { ToAddresses: [to] },
+    ...(replyTo === undefined ? {} : { ReplyToAddresses: [replyTo] }),
     Content: { Simple: {
       Subject: content(subject),
       Body: { ...(text ? { Text: content(text) } : {}), ...(html ? { Html: content(html) } : {}) },
-      ...(simpleHeaders?.length ? { Headers: simpleHeaders } : {}),
+      ...(simpleHeaders.length ? { Headers: simpleHeaders } : {}),
     } },
     ...(configurationSetName === undefined ? {} : { ConfigurationSetName: configurationSetName }),
     ...(idempotencyKey === undefined ? {} : { EmailTags: [{ Name: 'idempotency-key', Value: idempotencyKey }] }),

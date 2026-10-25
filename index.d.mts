@@ -26,5 +26,6 @@ export * from './sns-notification.mjs';
 export * from './email-feedback.mjs';
 export * from './capability-token.mjs';
 export * from './json-body.mjs';
+export * from './cloudflare-email.mjs';
 export * from './public-hostname.mjs';
 export * from './provider-fetch.mjs';
