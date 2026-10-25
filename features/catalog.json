@@ -106,7 +106,10 @@
         "createSnsCertificateFetcher",
         "snsRefusalStatus",
         "confirmSnsSubscription",
-        "migrateOnStart"
+        "migrateOnStart",
+        "csvCell",
+        "csvRow",
+        "toCsv"
       ],
       "tests": [
         "tests/runtime.test.mts",
@@ -126,10 +129,11 @@
         "tests/public-hostname.test.mts",
         "tests/cloudflare-email.test.mts",
         "tests/sns-fetcher.test.mts",
-        "tests/migrate-deadline.test.mts"
+        "tests/migrate-deadline.test.mts",
+        "tests/csv.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.17.0"
+      "version": "v0.18.0"
     },
     "presentation": {
       "package": "@ten98/ui",
