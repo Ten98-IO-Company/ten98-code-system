@@ -1,3 +1,4 @@
+import { type EmailMessage } from './email-message.mjs';
 /** Commercial AWS regions with an SES v2 API endpoint. */
 export declare const SES_REGIONS: readonly string[];
 export interface AwsCredentials {
@@ -5,14 +6,7 @@ export interface AwsCredentials {
     readonly secretAccessKey: string;
     readonly sessionToken?: string;
 }
-export interface SesMessage {
-    readonly from: string;
-    readonly to: string;
-    readonly subject: string;
-    readonly text?: string;
-    readonly html?: string;
-    readonly replyTo?: string;
-    readonly headers?: Readonly<Record<string, string>>;
+export interface SesMessage extends EmailMessage {
 }
 /** Thrown by `sendSesEmail`. `uncertain` means SES may have sent the email; `retryable` means it definitely did not and may be retried later. */
 export interface SesSendError extends Error {

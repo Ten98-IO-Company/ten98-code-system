@@ -101,7 +101,8 @@
         "readCapability",
         "readJsonBody",
         "providerFetchJson",
-        "normalizePublicHostname"
+        "normalizePublicHostname",
+        "sendCloudflareEmail"
       ],
       "tests": [
         "tests/runtime.test.mjs",
@@ -118,10 +119,11 @@
         "tests/ledger-guards.test.mts",
         "tests/browser-entry.test.mts",
         "tests/provider-fetch.test.mts",
-        "tests/public-hostname.test.mts"
+        "tests/public-hostname.test.mts",
+        "tests/cloudflare-email.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.14.0"
+      "version": "v0.15.0"
     },
     "presentation": {
       "package": "@ten98/ui",
