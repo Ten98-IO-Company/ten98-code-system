@@ -14,6 +14,20 @@ type AppliedMigration = Readonly<{
     version: string;
     checksum: string;
 }>;
+/** A pooled connection: `release(error)` discards it, which also ends its session locks and any open transaction. */
+export interface MigrationPoolClient extends MigrationClient {
+    release(error?: Error | boolean): void;
+}
+export interface MigrationPool {
+    connect(): Promise<MigrationPoolClient>;
+}
+/** Startup failures carry operator-safe text only: never SQL, parameters, connection strings or credentials. */
+export type MigrationStartupError = Error & {
+    code: 'MIGRATION_TIMEOUT' | 'MIGRATION_FAILED';
+    sqlState?: string;
+};
+/** MIGRATE_ON_START: unset, empty, `true` or `1` migrates at startup; `false` or `0` waits for an operator migration. */
+export declare function migrateOnStart(value: string | undefined): boolean;
 /**
  * Ordered, checksummed SQL migrations recorded in a `schema_version(version, checksum)` table.
  * `files` lists the migration filenames in application order; the first four characters of each are its version.
@@ -31,5 +45,18 @@ export declare function createMigrationLedger({ directory, files, lockKey }: {
         afterApply?(client: MigrationClient, applied: readonly string[]): Promise<void>;
         lockTimeoutMs?: number;
     }) => Promise<readonly string[]>;
+    migrateWithDeadline: (pool: MigrationPool, { timeoutMs, retryIntervalMs, progressIntervalMs, log, afterApply }?: {
+        timeoutMs?: number;
+        retryIntervalMs?: number;
+        progressIntervalMs?: number;
+        log?(message: string): void;
+        afterApply?(client: MigrationClient, applied: readonly string[]): Promise<void>;
+    }) => Promise<readonly string[]>;
+    waitForCurrent: (client: MigrationClient, { timeoutMs, intervalMs, progressIntervalMs, log }?: {
+        timeoutMs?: number;
+        intervalMs?: number;
+        progressIntervalMs?: number;
+        log?(message: string): void;
+    }) => Promise<void>;
 };
 export {};

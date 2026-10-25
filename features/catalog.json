@@ -105,7 +105,8 @@
         "sendCloudflareEmail",
         "createSnsCertificateFetcher",
         "snsRefusalStatus",
-        "confirmSnsSubscription"
+        "confirmSnsSubscription",
+        "migrateOnStart"
       ],
       "tests": [
         "tests/runtime.test.mts",
@@ -124,10 +125,11 @@
         "tests/provider-fetch.test.mts",
         "tests/public-hostname.test.mts",
         "tests/cloudflare-email.test.mts",
-        "tests/sns-fetcher.test.mts"
+        "tests/sns-fetcher.test.mts",
+        "tests/migrate-deadline.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.16.0"
+      "version": "v0.17.0"
     },
     "presentation": {
       "package": "@ten98/ui",
