@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import pg from 'pg';
-import { createWorkspaceTeam } from '../index.mjs';
+import { createWorkspaceTeam, isTeamError, TeamError } from '../index.mjs';
 import type { TeamClient } from '../index.mjs';
 
 // Integration tests on real PostgreSQL, opt-in: set TEN98_TEST_DATABASE_URL to a disposable server (a superuser URL; each
@@ -24,7 +24,7 @@ test.before(async () => {
   const url = new URL(admin);
   url.pathname = `/${database}`;
   pool = new pg.Pool({ connectionString: url.href, max: 4 });
-  await pool.query(readFileSync(new URL('./fixtures/workspace-team.sql', import.meta.url), 'utf8'));
+  await pool.query(readFileSync(new URL('../workspace-team.sql', import.meta.url), 'utf8'));
 });
 test.after(async () => {
   if (!admin || !pool) return;
@@ -51,7 +51,7 @@ async function user(email: string, { twoFactor = false, closed = false } = {}) {
   await pool!.query('INSERT INTO "user"(id,name,email,"twoFactorEnabled",closed_at) VALUES($1,$2,$3,$4,$5)', [userId, email.split('@')[0], email, twoFactor, closed ? new Date() : null]);
   return userId;
 }
-async function workspaceWith(members: Record<string, 'admin' | 'editor' | 'viewer'> = {}) {
+async function workspaceWith(members: Record<string, 'owner' | 'admin' | 'editor' | 'viewer'> = {}) {
   const owner = await user(`owner-${randomUUID()}@example.com`);
   const { workspace } = await tx(client => team.createWorkspace(client, owner, { name: '  Acme  ' }));
   const ids: Record<string, string> = {};
@@ -149,10 +149,13 @@ test('roles keep an owner, transfers are atomic, and members can leave', { skip 
 });
 
 test('removing a member removes invitations they sent and received', { skip }, async () => {
-  const { owner, workspaceId, ids } = await workspaceWith({ admin: 'admin' });
-  const sent = await tx(client => team.inviteMember(client, workspaceId, ids.admin!, { email: 's@example.com', role: 'viewer' }));
-  const received = await tx(async client => team.inviteMember(client, workspaceId, owner, { email: await emailOf(ids.admin!), role: 'editor' }));
-  await tx(client => team.removeMember(client, workspaceId, owner, ids.admin!));
+  const { owner, workspaceId } = await workspaceWith();
+  // The invitation to this person exists from before they became a member some other way.
+  const member = await user(`member-${randomUUID()}@example.com`);
+  const received = await tx(async client => team.inviteMember(client, workspaceId, owner, { email: await emailOf(member), role: 'editor' }));
+  await pool!.query("INSERT INTO membership(workspace_id,user_id,role) VALUES($1,$2,'admin')", [workspaceId, member]);
+  const sent = await tx(client => team.inviteMember(client, workspaceId, member, { email: 's@example.com', role: 'viewer' }));
+  await tx(client => team.removeMember(client, workspaceId, owner, member));
   for (const { token } of [sent, received]) await assert.rejects(tx(client => team.inspectInvitation(client, { token })), code('INVITATION_UNAVAILABLE'));
 });
 
@@ -195,7 +198,10 @@ test('operator grants come from the host, are audited, and closed accounts never
   await tx(async client => team.setInstanceOperator(client, (await emailOf(operator)).toUpperCase(), true));
   assert.equal(await team.isInstanceOperator(pool! as unknown as TeamClient, operator), true);
   assert.equal(await tx(async client => team.requireNamedInstanceOperator(client, await emailOf(operator))), operator);
-  await tx(async client => team.setInstanceOperator(client, await emailOf(closed), true));
+  await assert.rejects(tx(async client => team.setInstanceOperator(client, await emailOf(closed), true)), code('NOT_FOUND', 404));
+  await pool!.query("INSERT INTO instance_operator(user_id,source) VALUES($1,'host')", [closed]);
+  await assert.rejects(tx(client => team.requireInstanceOperator(client, closed)), code('OPERATOR_REQUIRED', 403));
+  assert.equal(await team.isInstanceOperator(pool! as unknown as TeamClient, closed), false);
   await assert.rejects(tx(async client => team.requireNamedInstanceOperator(client, await emailOf(closed))), code('OPERATOR_REQUIRED'));
   await tx(async client => team.setInstanceOperator(client, await emailOf(operator), false));
   assert.equal(await team.isInstanceOperator(pool! as unknown as TeamClient, operator), false);
@@ -211,6 +217,138 @@ test('ids, tokens and emails are validated before any query', async () => {
   await assert.rejects(team.inspectInvitation(client, { token: 'short' }), code('INVALID_INPUT'));
   await assert.rejects(team.inviteMember(client, randomUUID(), randomUUID(), { email: 'not an email', role: 'viewer' }), code('INVALID_INPUT'));
   await assert.rejects(team.acceptInvitation(client, { token: 'A'.repeat(43), password: 'short' }), code('INVALID_INPUT'));
+  // Control characters (NUL included) never reach the database.
+  for (const bad of [`a${String.fromCharCode(0)}b`, `line1${String.fromCharCode(10)}line2`, `x${String.fromCharCode(27)}[31m`, `del${String.fromCharCode(127)}`]) {
+    await assert.rejects(team.createWorkspace(client, randomUUID(), { name: bad }), code('INVALID_INPUT'));
+    await assert.rejects(team.acceptInvitation(client, { token: 'A'.repeat(43), name: bad, password: 'twelve chars!' }), code('INVALID_INPUT'));
+  }
+  await assert.rejects(team.acceptInvitation(client, { token: 'A'.repeat(43) }, null as unknown as { id: string; email: string }), code('INVALID_INPUT'));
+  await assert.rejects(team.rotateInvitation(client, randomUUID(), randomUUID(), randomUUID(), 'x' as unknown as undefined), code('INVALID_INPUT'));
+  await assert.rejects(team.setInstanceOperator(client, 'a@example.com', 'false'), code('INVALID_INPUT'));
+  await assert.rejects(team.acceptVerifiedOidcInvitation(client, 'A'.repeat(43), { email: 'a@example.com', name: 'A' }, 5 as unknown as string), code('INVALID_INPUT'));
   assert.deepEqual(calls, []);
   assert.throws(() => createWorkspaceTeam({ hashPassword: undefined as unknown as (password: string) => Promise<string> }), TypeError);
+  for (const emailLockKey of [2 ** 31, -(2 ** 31) - 1, 1.5]) assert.throws(() => createWorkspaceTeam({ hashPassword: async () => 'h', emailLockKey }), TypeError);
+  const refused = await team.renameWorkspace(client, 'x', 'y', {}).catch(error => error);
+  assert.ok(refused instanceof TeamError && isTeamError(refused) && !isTeamError(new Error('x')));
+});
+
+const errorOf = async (work: Promise<unknown>) => { try { await work; return 'ok'; } catch (error) { return `${(error as TeamError).code}:${(error as Error).message}`; } };
+
+test('a caller without authority gets one answer whether or not the target exists', { skip }, async () => {
+  const { owner, workspaceId, ids } = await workspaceWith({ editor: 'editor' });
+  const outsider = await user(`out-${randomUUID()}@example.com`), stranger = await user(`str-${randomUUID()}@example.com`);
+  const answers = await Promise.all([ids.editor!, randomUUID(), stranger].map(target => errorOf(tx(client => team.removeMember(client, workspaceId, outsider, target)))));
+  assert.equal(new Set(answers).size, 1, answers.join(' | '));
+  assert.equal(answers[0], await errorOf(tx(client => team.removeMember(client, randomUUID(), outsider, ids.editor!))));
+  const fromMember = await Promise.all([owner, randomUUID(), stranger].map(target => errorOf(tx(client => team.removeMember(client, workspaceId, ids.editor!, target)))));
+  assert.equal(new Set(fromMember).size, 1, fromMember.join(' | '));
+  // Leaving a workspace one does not belong to gets the same workspace answer.
+  assert.equal(await errorOf(tx(client => team.removeMember(client, workspaceId, outsider, outsider))), answers[0]);
+});
+
+test('every role guard holds: administrators cannot act on owners or owner-sent invitations', { skip }, async () => {
+  const { owner, workspaceId, ids } = await workspaceWith({ coowner: 'owner', admin: 'admin', admin2: 'admin', viewer: 'viewer' });
+  await assert.rejects(tx(client => team.removeMember(client, workspaceId, ids.admin!, ids.coowner!)), code('FORBIDDEN', 403));
+  await assert.rejects(tx(client => team.removeMember(client, workspaceId, ids.admin!, ids.admin2!)), code('FORBIDDEN', 403));
+  await assert.rejects(tx(async client => team.transferOwnership(client, workspaceId, ids.admin!, { targetUserId: ids.viewer, confirmationEmail: await emailOf(ids.viewer!) })), code('FORBIDDEN', 403));
+  const ownerSent = await tx(client => team.inviteMember(client, workspaceId, owner, { email: 'adm2@example.com', role: 'admin' }));
+  await assert.rejects(tx(client => team.revokeInvitation(client, workspaceId, ids.admin!, ownerSent.invitation.id)), code('FORBIDDEN', 403));
+  await assert.rejects(tx(client => team.rotateInvitation(client, workspaceId, ids.admin!, ownerSent.invitation.id)), code('FORBIDDEN', 403));
+  await assert.rejects(tx(client => team.inviteMember(client, workspaceId, ids.admin!, { email: 'adm2@example.com', role: 'viewer' })), code('FORBIDDEN', 403));
+  await tx(client => team.inspectInvitation(client, { token: ownerSent.token }));
+  // An invitation never changes an existing member's role: an owner who accepts a viewer link stays owner.
+  const invited = await user(`later-owner-${randomUUID()}@example.com`);
+  const link = await tx(async client => team.inviteMember(client, workspaceId, owner, { email: await emailOf(invited), role: 'viewer' }));
+  await pool!.query("INSERT INTO membership(workspace_id,user_id,role) VALUES($1,$2,'owner')", [workspaceId, invited]);
+  const accepted = await tx(async client => team.acceptInvitation(client, { token: link.token }, { id: invited, email: await emailOf(invited) }));
+  assert.deepEqual([accepted.userId, accepted.role, accepted.joined, accepted.created], [invited, 'owner', false, false]);
+  // An inviter who loses authority outside the controller: the invitation is hidden, unavailable and not pending.
+  const sent = await tx(client => team.inviteMember(client, workspaceId, ids.admin2!, { email: 'via-admin2@example.com', role: 'editor' }));
+  await pool!.query("UPDATE membership SET role='viewer' WHERE workspace_id=$1 AND user_id=$2", [workspaceId, ids.admin2]);
+  assert.equal((await tx(client => team.getTeam(client, workspaceId, owner))).invitations.some(row => row.id === sent.invitation.id), false);
+  await assert.rejects(tx(client => team.inspectInvitation(client, { token: sent.token })), code('INVITATION_UNAVAILABLE', 410));
+  await assert.rejects(tx(client => team.rotateInvitation(client, workspaceId, owner, sent.invitation.id)), code('INVITATION_NOT_PENDING', 409));
+});
+
+test('inviting a member is refused, acceptance reports the account and role, and older stored emails still work', { skip }, async () => {
+  const { owner, workspaceId, ids } = await workspaceWith({ viewer: 'viewer' });
+  await assert.rejects(tx(async client => team.inviteMember(client, workspaceId, owner, { email: (await emailOf(ids.viewer!)).toUpperCase(), role: 'editor' })), code('MEMBER_EXISTS', 409));
+  const fresh = await tx(client => team.inviteMember(client, workspaceId, owner, { email: 'fresh@example.com', role: 'editor' }));
+  const created = await tx(client => team.acceptInvitation(client, { token: fresh.token, name: 'Fresh', password: 'twelve chars!' }));
+  assert.deepEqual([created.role, created.joined, created.created, typeof created.userId], ['editor', true, true, 'string']);
+  // A stored email outside the current address rule (65-character local part) can still be invited and accept.
+  const legacyEmail = `${'l'.repeat(65)}@example.com`;
+  const legacy = await user(legacyEmail);
+  await assert.rejects(tx(client => team.inviteMember(client, workspaceId, owner, { email: `${'n'.repeat(65)}@example.com`, role: 'viewer' })), code('INVALID_INPUT'));
+  const link = await tx(client => team.inviteMember(client, workspaceId, owner, { email: legacyEmail, role: 'viewer' }));
+  assert.equal((await tx(client => team.acceptInvitation(client, { token: link.token }, { id: legacy, email: ` ${legacyEmail.toUpperCase()} ` }))).joined, true);
+});
+
+test('lockEmail serialises account creation for one email with the documented lock', { skip }, async () => {
+  const holder = await pool!.connect(), waiter = await pool!.connect();
+  try {
+    await holder.query('BEGIN');
+    await team.lockEmail(holder as unknown as TeamClient, ' Same@Example.com ');
+    await waiter.query('BEGIN');
+    await waiter.query("SET LOCAL lock_timeout = '200ms'");
+    await assert.rejects(waiter.query('SELECT pg_advisory_xact_lock($1,hashtext($2))', [109_859, 'same@example.com']), (error: unknown) => (error as { code?: string }).code === '55P03');
+  } finally {
+    await holder.query('ROLLBACK'); await waiter.query('ROLLBACK').catch(() => undefined);
+    holder.release(); waiter.release();
+  }
+});
+
+test('acceptance hashes the password before taking the workspace lock', { skip }, async () => {
+  const slow = createWorkspaceTeam({ hashPassword: async password => { await new Promise(resolve => setTimeout(resolve, 400)); return `hash:${password}`; } });
+  const { owner, workspaceId } = await workspaceWith();
+  const { token } = await tx(client => team.inviteMember(client, workspaceId, owner, { email: 'slow@example.com', role: 'viewer' }));
+  const accepting = tx(client => slow.acceptInvitation(client, { token, name: 'Slow', password: 'twelve chars!' }));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const started = Date.now();
+  await tx(client => team.getTeam(client, workspaceId, owner));
+  assert.ok(Date.now() - started < 300, String(Date.now() - started));
+  await accepting;
+});
+
+test('operator changes are audited only when something changed', { skip }, async () => {
+  const account = await user(`audit-${randomUUID()}@example.com`);
+  const actions = async () => (await pool!.query<{ action: string }>('SELECT action FROM instance_operator_audit WHERE user_id=$1 ORDER BY id', [account])).rows.map(row => row.action);
+  await tx(async client => team.setInstanceOperator(client, await emailOf(account), false));
+  await tx(async client => team.setInstanceOperator(client, await emailOf(account), true));
+  await tx(async client => team.setInstanceOperator(client, await emailOf(account), true));
+  assert.deepEqual(await actions(), ['grant']);
+});
+
+// Two transactions at REPEATABLE READ: the second takes its snapshot before the first commits, then waits on the workspace.
+async function race(level: string, first: (client: TeamClient) => Promise<unknown>, second: (client: TeamClient) => Promise<unknown>) {
+  const a = await pool!.connect(), b = await pool!.connect();
+  const outcomes: string[] = [];
+  try {
+    await a.query(`BEGIN ISOLATION LEVEL ${level}`); await b.query(`BEGIN ISOLATION LEVEL ${level}`);
+    await b.query('SELECT 1 FROM workspace LIMIT 1');
+    await first(a as unknown as TeamClient);
+    const waiting = second(b as unknown as TeamClient).then(() => 'ok', (error: { code?: string }) => error.code ?? 'error');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await a.query('COMMIT');
+    outcomes.push('ok', await waiting);
+    await b.query(outcomes[1] === 'ok' ? 'COMMIT' : 'ROLLBACK');
+  } finally { a.release(); b.release(); }
+  return outcomes;
+}
+
+test('two owners demoting each other or leaving together never leave a workspace without an owner', { skip }, async () => {
+  for (const level of ['READ COMMITTED', 'REPEATABLE READ', 'SERIALIZABLE']) {
+    const demote = await workspaceWith({ second: 'owner' });
+    const demoted = await race(level, client => team.changeRole(client, demote.workspaceId, demote.owner, demote.ids.second!, { role: 'viewer' }),
+      client => team.changeRole(client, demote.workspaceId, demote.ids.second!, demote.owner, { role: 'viewer' }));
+    const leave = await workspaceWith({ second: 'owner', viewer: 'viewer' });
+    const left = await race(level, client => team.removeMember(client, leave.workspaceId, leave.owner, leave.owner),
+      client => team.removeMember(client, leave.workspaceId, leave.ids.second!, leave.ids.second!));
+    for (const [{ workspaceId }, outcome] of [[demote, demoted], [leave, left]] as const) {
+      const owners = (await pool!.query("SELECT 1 FROM membership WHERE workspace_id=$1 AND role='owner'", [workspaceId])).rowCount;
+      assert.equal(owners, 1, `${level}: ${outcome.join(',')}`);
+      assert.notEqual(outcome[1], 'ok', level);
+    }
+  }
 });

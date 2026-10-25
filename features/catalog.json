@@ -110,7 +110,9 @@
         "csvCell",
         "csvRow",
         "toCsv",
-        "createWorkspaceTeam"
+        "createWorkspaceTeam",
+        "TeamError",
+        "isTeamError"
       ],
       "tests": [
         "tests/runtime.test.mts",
@@ -134,7 +136,7 @@
         "tests/csv.test.mts",
         "tests/workspace-team.test.mts"
       ],
-      "boundary": "Reusable primitives. These exports do not implement routes, workspace persistence or provider accounting; the separate auth entry below holds the identity policy.",
+      "boundary": "Reusable mechanisms. Apps keep their routes, transactions and provider accounting; createWorkspaceTeam runs inside the app's transaction over the shipped workspace-team.sql schema. The separate auth entry holds the identity policy.",
       "version": "v0.20.0"
     },
     "auth": {
@@ -351,7 +353,7 @@
           ]
         }
       ],
-      "boundary": "Import shared grant predicates; keep tenant joins, current-authority rechecks and last-owner locks inside the database transaction. Campaign permits owner invitations; Discover uses ownership transfer.",
+      "boundary": "Use createWorkspaceTeam (and the grant predicates) inside the app's transaction over the shipped workspace-team.sql schema; the app keeps routes, rate limits and the error mapping. Invitations never grant owner and accepted or revoked invitations are deleted, so Campaign drops owner invitations and its invitation history list when it adopts (#97).",
       "portable": [
         "createWorkspaceTeam"
       ]

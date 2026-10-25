@@ -42,6 +42,7 @@
     "json-body.d.mts",
     "workspace-team.mjs",
     "workspace-team.d.mts",
+    "workspace-team.sql",
     "auth.mjs",
     "auth.d.mts",
     "csv.mjs",
