@@ -100,7 +100,8 @@
         "signCapability",
         "readCapability",
         "readJsonBody",
-        "providerFetchJson"
+        "providerFetchJson",
+        "normalizePublicHostname"
       ],
       "tests": [
         "tests/runtime.test.mjs",
@@ -116,10 +117,11 @@
         "tests/loopback-origin.test.mts",
         "tests/ledger-guards.test.mts",
         "tests/browser-entry.test.mts",
-        "tests/provider-fetch.test.mts"
+        "tests/provider-fetch.test.mts",
+        "tests/public-hostname.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.13.0"
+      "version": "v0.14.0"
     },
     "presentation": {
       "package": "@ten98/ui",
