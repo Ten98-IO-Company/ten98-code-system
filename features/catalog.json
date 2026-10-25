@@ -109,7 +109,8 @@
         "migrateOnStart",
         "csvCell",
         "csvRow",
-        "toCsv"
+        "toCsv",
+        "createWorkspaceTeam"
       ],
       "tests": [
         "tests/runtime.test.mts",
@@ -130,10 +131,11 @@
         "tests/cloudflare-email.test.mts",
         "tests/sns-fetcher.test.mts",
         "tests/migrate-deadline.test.mts",
-        "tests/csv.test.mts"
+        "tests/csv.test.mts",
+        "tests/workspace-team.test.mts"
       ],
       "boundary": "Reusable primitives. These exports do not implement routes, workspace persistence or provider accounting; the separate auth entry below holds the identity policy.",
-      "version": "v0.19.0"
+      "version": "v0.20.0"
     },
     "auth": {
       "package": "@ten98/runtime",
@@ -349,7 +351,10 @@
           ]
         }
       ],
-      "boundary": "Import shared grant predicates; keep tenant joins, current-authority rechecks and last-owner locks inside the database transaction. Campaign permits owner invitations; Discover uses ownership transfer."
+      "boundary": "Import shared grant predicates; keep tenant joins, current-authority rechecks and last-owner locks inside the database transaction. Campaign permits owner invitations; Discover uses ownership transfer.",
+      "portable": [
+        "createWorkspaceTeam"
+      ]
     },
     {
       "id": "provider-settings-credential-lifecycle",

@@ -2,6 +2,10 @@
 // Header names the request itself controls; a caller header must never add recipients or rewrite the envelope.
 const RESERVED_HEADERS = new Set(['bcc', 'cc', 'content-disposition', 'content-id', 'content-transfer-encoding', 'content-type', 'date', 'from', 'message-id', 'mime-version', 'reply-to', 'return-path', 'sender', 'subject', 'to']);
 const ADDRESS = /^[!#-'*+\-/-9=?A-Z^-~]+(?:\.[!#-'*+\-/-9=?A-Z^-~]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
+/** A single mailbox address under the senders' rule: at most 254 characters, local part at most 64. */
+export function isEmailAddress(value) {
+    return typeof value === 'string' && value.length <= 254 && ADDRESS.test(value) && value.split('@')[0].length <= 64;
+}
 export function invalidEmailInput(provider, field) {
     throw Object.assign(new TypeError(`Invalid ${provider} ${field}.`), { code: 'INVALID_INPUT' });
 }
@@ -12,7 +16,7 @@ export function invalidEmailInput(provider, field) {
 export function checkEmailMessage(message, provider, { reservedHeaderPrefix } = {}) {
     const invalid = (field) => invalidEmailInput(provider, field);
     const address = (value, field) => {
-        if (typeof value !== 'string' || value.length > 254 || !ADDRESS.test(value) || value.split('@')[0].length > 64)
+        if (!isEmailAddress(value))
             invalid(field);
         return value;
     };
