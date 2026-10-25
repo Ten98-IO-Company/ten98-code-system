@@ -108,3 +108,6 @@ async function readBounded(response: Response, { maxBytes, signal, contentLength
     reader.releaseLock();
   }
 }
+
+// Spreadsheet-safe CSV has no Node dependency, so browser code gets it from this entry too.
+export * from './csv.mjs';
