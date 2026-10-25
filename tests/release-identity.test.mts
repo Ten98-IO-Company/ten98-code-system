@@ -1,24 +1,26 @@
 import test from 'node:test';
+import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { collectReleaseIdentity } from '../check.mjs';
+import type { ReleaseOptions } from '../check.mjs';
 
-function fixture(t, version = '1.2.3') {
+function fixture(t: TestContext, version = '1.2.3') {
   const directory = mkdtempSync(join(tmpdir(), 'ten98-release-'));
   t.after(() => {
     assert.equal(resolve(directory).startsWith(join(tmpdir(), 'ten98-release-')), true);
     rmSync(directory, { recursive: true, force: true });
   });
-  const run = (command, args) => {
+  const run = (command: string, args: string[]) => {
     const result = spawnSync(command, args, { cwd: directory, encoding: 'utf8', timeout: 15_000, windowsHide: true });
     assert.equal(result.status, 0, result.error?.message ?? result.stderr);
     return result.stdout.trim();
   };
-  const git = (...args) => run('git', ['-c', 'user.name=Release Test', '-c', 'user.email=release@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', ...args]);
-  const write = (name, data) => writeFileSync(join(directory, name), JSON.stringify(data));
+  const git = (...args: string[]) => run('git', ['-c', 'user.name=Release Test', '-c', 'user.email=release@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', ...args]);
+  const write = (name: string, data: unknown) => writeFileSync(join(directory, name), JSON.stringify(data));
   const manifest = { name: '@ten98/fixture', version };
   const lock = { name: manifest.name, version, lockfileVersion: 3, packages: { '': { ...manifest } } };
   git('init', '--quiet');
@@ -26,8 +28,8 @@ function fixture(t, version = '1.2.3') {
   const commit = () => { git('add', '.'); git('commit', '--quiet', '-m', 'Fixture'); return git('rev-parse', 'HEAD'); };
   const options = { tag: `v${version}`, commit: commit() };
   git('tag', '-a', options.tag, '-m', 'Qualified fixture');
-  const check = extra => collectReleaseIdentity(directory, { ...options, ...extra });
-  const pack = (identity = manifest) => {
+  const check = (extra?: ReleaseOptions) => collectReleaseIdentity(directory, { ...options, ...extra });
+  const pack = (identity: Record<string, string> = manifest) => {
     mkdirSync(join(directory, 'package'), { recursive: true });
     write('package/package.json', identity);
     const archive = join(directory, `ten98-fixture-${version}.tgz`);
@@ -43,9 +45,9 @@ test('collects real tag, committed package/lock and actual archive bytes', t => 
   const archive = f.pack(), evidence = f.check({ tagObject, archive });
   assert.equal(evidence.version, '1.2.3');
   assert.equal(evidence.commit, f.options.commit);
-  assert.equal(evidence.archive.bytes, readFileSync(archive).length);
-  assert.equal(evidence.archive.priorBytesVerified, false);
-  assert.equal(f.check({ archive, archiveSha256: evidence.archive.sha256 }).archive.priorBytesVerified, true);
+  assert.equal(evidence.archive!.bytes, readFileSync(archive).length);
+  assert.equal(evidence.archive!.priorBytesVerified, false);
+  assert.equal(f.check({ archive, archiveSha256: evidence.archive!.sha256 }).archive!.priorBytesVerified, true);
   assert.match(f.check().tagHistory, /unverified/u);
   f.write('push.json', { ref: 'refs/tags/v1.2.3', created: true, deleted: false, forced: false, before: '0'.repeat(40), after: f.options.commit });
   assert.equal(f.check({ event: join(f.directory, 'push.json') }).tagHistory, 'new-tag push event');
@@ -102,7 +104,7 @@ test('accepts exactly one lockfile: an npm lock with matching root identity, or 
 });
 
 test('rejects archive filename, actual packed identity and retained-byte mismatches', t => {
-  const f = fixture(t), archive = f.pack(), digest = f.check({ archive }).archive.sha256;
+  const f = fixture(t), archive = f.pack(), digest = f.check({ archive }).archive!.sha256;
   const wrongName = join(f.directory, 'wrong.tgz'); copyFileSync(archive, wrongName);
   assert.throws(() => f.check({ archive: wrongName }), /filename/u);
   f.pack({ ...f.manifest, version: '1.2.4' });

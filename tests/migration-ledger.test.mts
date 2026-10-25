@@ -5,26 +5,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
-import { createMigrationLedger } from '../index.mjs';
+import { createMigrationLedger, type Migration, type MigrationClient } from '../index.mjs';
 
-const sha = text => createHash('sha256').update(text).digest('hex');
+const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 const SELECT_APPLIED = 'SELECT version, checksum FROM schema_version ORDER BY version';
 
-function fixture(contents = { '0001_a.sql': 'CREATE TABLE a();\n', '0002_b.sql': 'CREATE TABLE b();\n', '0003_c.sql': 'CREATE TABLE c();\n' }) {
+function fixture(contents: Record<string, string> = { '0001_a.sql': 'CREATE TABLE a();\n', '0002_b.sql': 'CREATE TABLE b();\n', '0003_c.sql': 'CREATE TABLE c();\n' }) {
   const directory = mkdtempSync(join(tmpdir(), 'ten98-ledger-'));
   for (const [name, text] of Object.entries(contents)) writeFileSync(join(directory, name), text);
   const ledger = createMigrationLedger({ directory, files: Object.keys(contents), lockKey: [109857, 1] });
   return { directory, ledger, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
 }
 
-function fakeClient({ applied = [], failOn } = {}) {
-  const calls = [];
+function fakeClient({ applied = [], failOn }: { applied?: readonly { version: string; checksum: string }[]; failOn?: (sql: string) => boolean } = {}) {
+  const calls: ([string] | [string, unknown[]])[] = [];
   return {
     calls,
-    async query(sql, params) {
+    async query<R>(sql: string, params?: unknown[]) {
       calls.push(params === undefined ? [sql] : [sql, params]);
       if (failOn?.(sql)) throw new Error('statement failed');
-      return { rows: sql === SELECT_APPLIED ? applied : [] };
+      return { rows: (sql === SELECT_APPLIED ? applied : []) as R[] };
     },
   };
 }
@@ -66,7 +66,7 @@ test('pending returns the unapplied suffix and rejects any applied row that is n
   const { ledger, cleanup } = fixture();
   try {
     const [a, b, c] = await ledger.sources();
-    const row = migration => ({ version: migration.version, checksum: migration.checksum });
+    const row = (migration: Migration) => ({ version: migration.version, checksum: migration.checksum });
     assert.deepEqual((await ledger.pending([])).map(item => item.version), ['0001', '0002', '0003']);
     assert.deepEqual((await ledger.pending([row(a), row(b)])).map(item => item.version), ['0003']);
     assert.deepEqual(await ledger.pending([row(a), row(b), row(c)]), []);
@@ -83,14 +83,14 @@ test('migrate runs lock, ledger table, read, apply, record, hook and commit in o
   try {
     const [a, b, c] = await ledger.sources();
     const client = fakeClient({ applied: [{ version: a.version, checksum: a.checksum }] });
-    let hook;
+    let hook: { received: MigrationClient; versions: readonly string[] } | undefined;
     const applied = await ledger.migrate(client, { async afterApply(received, versions) {
       hook = { received, versions };
       await received.query('SELECT hook');
     } });
     assert.deepEqual(applied, ['0002', '0003']);
-    assert.equal(hook.received, client);
-    assert.deepEqual(hook.versions, ['0002', '0003']);
+    assert.equal(hook!.received, client);
+    assert.deepEqual(hook!.versions, ['0002', '0003']);
     assert.deepEqual(client.calls, [
       ['BEGIN'],
       ['SELECT pg_advisory_xact_lock($1, $2)', [109857, 1]],
@@ -114,7 +114,7 @@ test('a failing migration statement rolls back and reports nothing applied', asy
     let hooked = false;
     await assert.rejects(ledger.migrate(client, { afterApply: async () => { hooked = true; } }), /statement failed/);
     assert.equal(hooked, false);
-    assert.equal(client.calls.at(-1)[0], 'ROLLBACK');
+    assert.equal(client.calls.at(-1)![0], 'ROLLBACK');
     assert.equal(client.calls.some(([sql]) => sql === 'COMMIT'), false);
   } finally { cleanup(); }
 });
@@ -124,7 +124,7 @@ test('a failing afterApply hook rolls back every migration and the original erro
   try {
     const client = fakeClient();
     await assert.rejects(ledger.migrate(client, { afterApply: async () => { throw new Error('hook failed'); } }), /hook failed/);
-    assert.equal(client.calls.at(-1)[0], 'ROLLBACK');
+    assert.equal(client.calls.at(-1)![0], 'ROLLBACK');
     assert.equal(client.calls.some(([sql]) => sql === 'COMMIT'), false);
   } finally { cleanup(); }
 });
@@ -134,7 +134,7 @@ test('a schema mismatch inside migrate rolls back and a failing rollback does no
   try {
     const client = fakeClient({ applied: [{ version: '0001', checksum: 'changed' }], failOn: sql => sql === 'ROLLBACK' });
     await assert.rejects(ledger.migrate(client), { code: 'SCHEMA_MISMATCH' });
-    assert.equal(client.calls.at(-1)[0], 'ROLLBACK');
+    assert.equal(client.calls.at(-1)![0], 'ROLLBACK');
     assert.equal(client.calls.some(([sql]) => sql === 'COMMIT'), false);
   } finally { cleanup(); }
 });

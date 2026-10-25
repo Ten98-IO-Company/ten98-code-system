@@ -6,9 +6,23 @@ import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { checkManifest, checkRuntimeVersion, inspectSourcePolicy } from '../check.mjs';
+import type { PackageManifest } from '../check.mjs';
 import { inspectDatabasePolicy } from '../database-policy.mjs';
 
-const databaseFixture = () => ({
+type StringMap = Record<string, string>;
+interface DatabaseDeclaration { engine: string; exception?: string; transition?: string }
+interface DatabaseFixture {
+  policy: { default: string; integration: string; stateless: string;
+    exceptions: Record<string, { engine: string; profiles: string[]; purpose: string; requirement: string; review: string }>;
+    transitions: Record<string, { profile: string; engine: string; target: string; reason: string; review: string }> };
+  profiles: Record<string, { database?: DatabaseDeclaration }>;
+}
+// Fixture manifests keep the maps that the tests mutate present.
+type ManifestFixture = PackageManifest & { engines: { node?: string }; devDependencies: StringMap; scripts: Record<string, string | undefined> };
+type AppManifestFixture = ManifestFixture & { dependencies: StringMap };
+type ManifestChange = [(m: AppManifestFixture) => void, RegExp];
+
+const databaseFixture = (): DatabaseFixture => ({
   policy: { default: 'postgresql', integration: 'drizzle', stateless: 'none',
     exceptions: { native: { engine: 'd1', profiles: ['site'], purpose: 'native-platform-binding', requirement: 'Native D1 binding', review: 'issue7' } },
     transitions: { existing: { profile: 'existing', engine: 'sqlite', target: 'postgresql', reason: 'Preserve installed data pending verified parity', review: 'issue7' } } },
@@ -35,14 +49,14 @@ test('database choices need explicit declarations and centrally reviewed excepti
     f => { f.profiles.app.database = { engine: 'sqlite', exception: 'not-recorded' }; },
     f => { f.profiles.app.database = { engine: 'd1', exception: 'native' }; },
     f => { f.policy.exceptions.native.purpose = 'vector-storage'; },
-    f => { f.policy.exceptions.native.purpose = ['approved-requirement']; },
+    f => { f.policy.exceptions.native.purpose = ['approved-requirement'] as unknown as string; },
     f => { f.policy.exceptions.native.requirement = ''; },
     f => { f.policy.exceptions.native.review = ''; },
     f => { f.policy.transitions.existing.target = 'sqlite'; },
     f => { f.policy.transitions.existing.reason = ''; },
     f => { f.profiles.library.database = { engine: 'none', exception: 'native' }; },
-    f => { f.profiles.app.database = []; },
-  ]) {
+    f => { f.profiles.app.database = [] as unknown as DatabaseDeclaration; },
+  ] satisfies ((f: DatabaseFixture) => void)[]) {
     const fixture = databaseFixture(); mutate(fixture);
     assert.ok(inspectDatabasePolicy(fixture.policy, fixture.profiles).length > 0);
   }
@@ -85,9 +99,9 @@ test('running Node must satisfy the canonical range, not just manifest declarati
 });
 
 // Independent fixture: do not derive the expected application from architecture.json.
-const campaign = () => ({
+const campaign = (): AppManifestFixture => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.15.0.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.15.1.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
@@ -99,9 +113,9 @@ test('architecture accepts independent manifests with reviewed tools and mandato
 });
 
 test('native static site uses shared build tools without application runtime dependencies', () => {
-  const site = () => ({
+  const site = (): ManifestFixture => ({
     name: 'ten98-io', type: 'module', engines: { node: '>=24.22.1 <25' },
-    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.15.0.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.15.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', build: 'npm run check:architecture && tsc --project tsconfig.tooling.json && node scripts/build.mts', check: 'npm run check:architecture && npm run build && node scripts/check.mjs', test: 'npm run check:architecture && node scripts/enquiry-test.mjs' },
   });
   assert.deepEqual(checkManifest(site()), []);
@@ -114,7 +128,7 @@ test('native static site uses shared build tools without application runtime dep
     [m => { m.devDependencies['@ten98/ui'] = 'file:vendor/ten98-ui-0.3.19.tgz'; }, /devDependencies.@ten98\/ui/],
     [m => { m.devDependencies.wrangler = '4.144.0'; }, /devDependencies.wrangler/],
     [m => { m.devDependencies.react = '19.3.1'; m.devDependencies['react-dom'] = '19.3.1'; }, /devDependencies.react/],
-  ]) {
+  ] satisfies [(m: ManifestFixture) => void, RegExp][]) {
     const manifest = site(); change(manifest);
     assert.match(checkManifest(manifest).join('\n'), expected);
   }
@@ -149,7 +163,7 @@ test('architecture rejects unreviewed toolchains and dependency resolution subst
     [m => { m.pnpm = { packageExtensions: { react: { dependencies: { express: '5.0.0' } } } }; }, /pnpm.packageExtensions/],
     [m => { m.bundledDependencies = ['express']; }, /bundledDependencies/],
     [m => { m.bundleDependencies = true; }, /bundleDependencies/],
-  ]) {
+  ] satisfies ManifestChange[]) {
     const manifest = campaign(); change(manifest);
     assert.match(checkManifest(manifest).join('\n'), expected);
   }
@@ -160,9 +174,9 @@ test('architecture rejects unreviewed toolchains and dependency resolution subst
 
 test('approved profile-specific development tools keep their reviewed declaration', () => {
   const { '@types/node': _campaignNode, '@types/pg': _campaignPg, ...sharedDevDependencies } = campaign().devDependencies;
-  const manifest = {
+  const manifest: ManifestFixture = {
     name: '@ten98/ui', type: 'module', engines: { node: '>=24.22.1 <25' },
-    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.15.0.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.15.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };
@@ -211,7 +225,7 @@ test('architecture detects actual drift without consulting the contract for expe
     [m => { m.scripts.test = 'node --test'; }, /scripts.test must run/],
     [m => { delete m.scripts['check:architecture']; }, /scripts.check:architecture/],
     [m => { m.scripts['check:architecture'] = 'node check.mjs .'; }, /scripts.check:architecture/],
-  ]) {
+  ] satisfies ManifestChange[]) {
     const manifest = campaign(); change(manifest);
     assert.match(checkManifest(manifest).join('\n'), expected);
   }
@@ -220,7 +234,7 @@ test('architecture detects actual drift without consulting the contract for expe
 test('CLI checks the compiler-backed runtime and returns failure for any drift', () => {
   const temporary = mkdtempSync(join(tmpdir(), 'ten98-architecture-'));
   try {
-    const manifest = { name: '@ten98/runtime', type: 'module', engines: { node: '>=24.22.1 <25' }, dependencies: {}, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test' } }, file = join(temporary, 'package.json');
+    const manifest: PackageManifest & { dependencies: StringMap } = { name: '@ten98/runtime', type: 'module', engines: { node: '>=24.22.1 <25' }, dependencies: {}, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test' } }, file = join(temporary, 'package.json');
     writeFileSync(file, JSON.stringify(manifest));
     const script = fileURLToPath(new URL('../check.mjs', import.meta.url));
     const actual = fileURLToPath(new URL('..', import.meta.url));

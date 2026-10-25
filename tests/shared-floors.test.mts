@@ -5,14 +5,14 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { checkManifest, checkVendoredFloors } from '../check.mjs';
 
-const runtime = 'file:vendor/ten98-runtime-0.15.0.tgz';
-const app = ui => ({
+const runtime = 'file:vendor/ten98-runtime-0.15.1.tgz';
+const app = (ui: string) => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
   dependencies: { '@ten98/ui': ui, '@ten98/runtime': runtime, 'openid-client': '6.8.8', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
-const uiErrors = ui => checkManifest(app(ui)).filter(error => error.includes('@ten98/ui'));
+const uiErrors = (ui: string | undefined) => checkManifest(app(ui as string)).filter(error => error.includes('@ten98/ui'));
 
 test('an app may pin any released UI archive at or above the floor', () => {
   for (const version of ['0.5.0', '0.5.4', '0.6.0', '1.0.0']) assert.deepEqual(uiErrors(`file:vendor/ten98-ui-${version}.tgz`), [], version);

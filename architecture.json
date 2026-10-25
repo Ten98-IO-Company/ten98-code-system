@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.15.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.15.1.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -595,28 +595,14 @@
         "build",
         "typecheck"
       ],
-      "sourceBoundary": "Runtime API is authored in src/index.mts and strictly compiler checked; root index.mjs and index.d.mts are generated public entrypoints. The canonical checker is authored in src/check.mts with generated root check.mjs and check.d.mts; native tests remain an explicit authored JavaScript migration gap owned by the code-system integrator in issue14.",
+      "sourceBoundary": "Runtime API is authored in src/index.mts and strictly compiler checked; root index.mjs and index.d.mts are generated public entrypoints. The canonical checker is authored in src/check.mts with generated root check.mjs and check.d.mts; tests are authored in TypeScript.",
       "sourceLanguage": {
         "default": "typescript",
         "roots": [
           "src",
           "tests"
         ],
-        "legacyJavaScript": [
-          "tests/architecture.test.mjs",
-          "tests/client-address.test.mjs",
-          "tests/email-feedback.test.mjs",
-          "tests/migration-ledger.test.mjs",
-          "tests/presentation.test.mjs",
-          "tests/release-identity.test.mjs",
-          "tests/runtime-security.test.mjs",
-          "tests/runtime.test.mjs",
-          "tests/ses-email.test.mjs",
-          "tests/shared-floors.test.mjs",
-          "tests/sns-notification.test.mjs",
-          "tests/source-language.test.mjs",
-          "tests/typed-authoring.test.mjs"
-        ],
+        "legacyJavaScript": [],
         "generated": {},
         "artifactDirectories": [
           ".git",

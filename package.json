@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "packageManager": "pnpm@11.19.0",
   "description": "Shared HTTP, OpenRouter and OIDC primitives for ten98 applications",
   "type": "module",
@@ -72,7 +72,7 @@
     "check:architecture": "node check.mjs .",
     "typecheck": "pnpm run check:architecture && tsc --project tsconfig.json --noEmit",
     "build": "pnpm run check:architecture && tsc --project tsconfig.json",
-    "test": "pnpm run check:architecture && tsc --project tsconfig.json && tsc --project tests/tsconfig.api.json && tsc --project tests/tsconfig.tests.json && node --test tests/*.test.mjs tests/*.test.mts",
+    "test": "pnpm run check:architecture && tsc --project tsconfig.json && tsc --project tests/tsconfig.api.json && tsc --project tests/tsconfig.tests.json && node --test tests/*.test.mts",
     "prepack": "pnpm run build"
   },
   "engines": {

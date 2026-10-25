@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { classifyEmailFeedback } from '../email-feedback.mjs';
+import { classifyEmailFeedback, type EmailFeedbackOptions } from '../email-feedback.mjs';
 
 // Shapes follow https://docs.aws.amazon.com/ses/latest/dg/notification-contents.html; every listed type and subtype has a fixture.
-const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/ses-feedback/${name}.json`, import.meta.url), 'utf8'));
+const fixture = (name: string) => JSON.parse(readFileSync(new URL(`./fixtures/ses-feedback/${name}.json`, import.meta.url), 'utf8'));
 const options = { transient: { threshold: 3, windowMs: 7 * 24 * 3_600_000 } };
-const actions = (event, opts = options) => classifyEmailFeedback(event, opts).map(({ recipient, action, reason }) => [recipient, action, reason]);
+const actions = (event: unknown, opts: EmailFeedbackOptions = options) => classifyEmailFeedback(event, opts).map(({ recipient, action, reason }) => [recipient, action, reason]);
 
 const expected = {
   'bounce-undetermined': ['undetermined@example.net', 'flag-undetermined', 'undetermined-bounce'],
@@ -66,7 +66,7 @@ test('outcomes carry the subtype and feedback type', () => {
 test('transient bounces suppress once the threshold is reached inside the window, inclusive at its boundary', () => {
   const event = fixture('bounce-transient-mailbox-full');
   const at = Date.parse(event.bounce.timestamp), { windowMs } = options.transient;
-  const run = history => classifyEmailFeedback(event, { ...options, history: recipient => (assert.equal(recipient, 'full@example.net'), history) })[0];
+  const run = (history: number[]) => classifyEmailFeedback(event, { ...options, history: recipient => (assert.equal(recipient, 'full@example.net'), history) })[0];
   assert.equal(run([at - 1000]).action, 'count-transient');
   assert.deepEqual([run([at - windowMs, at - 1]).action, run([at - windowMs, at - 1]).reason], ['suppress', 'repeated-transient']);
   assert.equal(run([at - windowMs - 1, at - 1]).action, 'count-transient');
@@ -84,7 +84,7 @@ test('undetermined bounces accumulate but a single one never suppresses', () => 
 });
 
 test('Cloudflare suppression reasons map to actions, and unknown reasons are left to the caller', () => {
-  const row = (reason, expiresAt = null) => ({ provider: 'cloudflare', email: 'cf@example.net', reason, expiresAt });
+  const row = (reason: string, expiresAt: string | null = null) => ({ provider: 'cloudflare', email: 'cf@example.net', reason, expiresAt });
   assert.deepEqual(actions(row('hard_bounce')), [['cf@example.net', 'suppress', 'permanent-bounce']]);
   assert.deepEqual(actions(row('complaint')), [['cf@example.net', 'suppress', 'complaint']]);
   assert.deepEqual(actions(row('manual')), [['cf@example.net', 'suppress', 'manual']]);
