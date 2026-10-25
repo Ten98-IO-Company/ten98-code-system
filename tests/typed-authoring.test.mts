@@ -8,7 +8,7 @@ import test from 'node:test';
 import * as runtime from '../index.mjs';
 
 test('generated public entrypoint retains every frozen runtime export', () => {
-  assert.deepEqual(Object.keys(runtime).sort(), ['createMigrationLedger', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'normalizeClientAddress', 'oidcEndpoint', 'openRouterFetch', 'parseTrustedProxies', 'readResponseText', 'resolveClientAddress', 'workspaceRoles', 'readResponseBytes', 'readCapability', 'signCapability', 'readJsonBody', 'providerFetchJson', 'normalizePublicHostname', 'appOrigin', 'clientLimitKey', 'SES_REGIONS', 'classifyEmailFeedback', 'deriveAwsV4SigningKey', 'sendSesEmail', 'sesOrigin', 'signAwsV4Request', 'verifySnsMessage', 'sendCloudflareEmail', 'createSnsCertificateFetcher', 'snsRefusalStatus', 'confirmSnsSubscription'].sort());
+  assert.deepEqual(Object.keys(runtime).sort(), ['createMigrationLedger', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'normalizeClientAddress', 'oidcEndpoint', 'openRouterFetch', 'parseTrustedProxies', 'readResponseText', 'resolveClientAddress', 'workspaceRoles', 'readResponseBytes', 'readCapability', 'signCapability', 'readJsonBody', 'providerFetchJson', 'normalizePublicHostname', 'appOrigin', 'clientLimitKey', 'SES_REGIONS', 'classifyEmailFeedback', 'deriveAwsV4SigningKey', 'sendSesEmail', 'sesOrigin', 'signAwsV4Request', 'verifySnsMessage', 'sendCloudflareEmail', 'createSnsCertificateFetcher', 'snsRefusalStatus', 'confirmSnsSubscription', 'migrateOnStart'].sort());
 });
 
 test('actual compiler rejects an implementation type error and preserves last good output', () => {
