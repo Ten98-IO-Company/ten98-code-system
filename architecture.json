@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.18.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.19.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -580,16 +580,19 @@
       }
     },
     "@ten98/runtime": {
-      "boundary": "Node standard library and web platform primitives only; no framework, database, session controller or provider accounting.",
+      "boundary": "Node standard library and web platform primitives; no framework, database or provider accounting. The optional ./auth entry is a better-auth preset (an exact, optional peer) with no controller of its own: apps keep routes, transactions and storage.",
       "dependencies": {},
       "devDependencies": {
-        "@types/node": "24.10.1"
+        "@types/node": "24.10.1",
+        "better-auth": "1.7.7"
       },
       "sharedDependencies": [],
       "sharedDevDependencies": [
         "typescript"
       ],
-      "peerDependencies": {},
+      "peerDependencies": {
+        "better-auth": "1.7.7"
+      },
       "checkScripts": [
         "test",
         "build",
@@ -631,6 +634,8 @@
           "capability-token.d.mts": "Generated declarations from src/capability-token.mts.",
           "json-body.mjs": "Generated runtime executable from src/json-body.mts, re-exported by index.mjs.",
           "json-body.d.mts": "Generated declarations from src/json-body.mts.",
+          "auth.mjs": "Generated better-auth identity preset from src/auth.mts, exported as ./auth only; needs the optional better-auth peer.",
+          "auth.d.mts": "Generated declarations from src/auth.mts.",
           "csv.mjs": "Generated runtime executable from src/csv.mts, re-exported by browser.mjs and index.mjs.",
           "csv.d.mts": "Generated declarations from src/csv.mts.",
           "cloudflare-email.mjs": "Generated runtime executable from src/cloudflare-email.mts, re-exported by index.mjs.",

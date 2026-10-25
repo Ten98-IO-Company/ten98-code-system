@@ -27,7 +27,7 @@ test('actual compiler rejects an implementation type error and preserves last go
     writeFileSync(implementation, source);
     writeFileSync(join(temporary, 'src/database-policy.mts'), readFileSync(new URL('../src/database-policy.mts', import.meta.url)));
     writeFileSync(join(temporary, 'src/migration-ledger.mts'), readFileSync(new URL('../src/migration-ledger.mts', import.meta.url)));
-    for (const module of ['browser', 'client-address', 'ses-email', 'sns-notification', 'email-feedback', 'capability-token', 'json-body', 'provider-fetch', 'public-hostname', 'email-message', 'cloudflare-email', 'csv']) writeFileSync(join(temporary, `src/${module}.mts`), readFileSync(new URL(`../src/${module}.mts`, import.meta.url)));
+    for (const module of ['browser', 'client-address', 'ses-email', 'sns-notification', 'email-feedback', 'capability-token', 'json-body', 'provider-fetch', 'public-hostname', 'email-message', 'cloudflare-email', 'csv', 'auth']) writeFileSync(join(temporary, `src/${module}.mts`), readFileSync(new URL(`../src/${module}.mts`, import.meta.url)));
     let result = compile(); assert.equal(result.status, 0, result.stdout + result.stderr);
     const outputs = ['index.mjs', 'index.d.mts'].map(name => join(temporary, name));
     const before = outputs.map(hash);
