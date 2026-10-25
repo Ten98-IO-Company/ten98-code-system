@@ -37,3 +37,34 @@ export interface SnsVerifyOptions {
  * Throws SNS_CONFIG for an unknown region, an empty topic list or a non-positive maxAgeMs.
  */
 export declare function verifySnsMessage(rawBody: string, options: SnsVerifyOptions): Promise<SnsVerification>;
+type SnsFetch = (url: string, init: RequestInit) => Promise<Response>;
+/**
+ * A `fetchCertificate` for `verifySnsMessage`: one bounded GET per certificate URL, cached for the process. A URL that
+ * failed is not fetched again for `failureBackoffMs`, and `admit` (an app's budget) is asked before every network fetch,
+ * so unverified traffic cannot drive repeated requests to AWS. Only certificate URLs on an SNS origin are fetched.
+ * Each map is cleared when it reaches its limit, which keeps memory bounded without an eviction policy.
+ */
+export declare function createSnsCertificateFetcher({ fetch: send, timeoutMs, maxBytes, maxEntries, failureBackoffMs, admit, now }?: {
+    fetch?: SnsFetch;
+    timeoutMs?: number;
+    maxBytes?: number;
+    maxEntries?: number;
+    failureBackoffMs?: number;
+    admit?(): boolean | Promise<boolean>;
+    now?(): number;
+}): (url: string) => Promise<string>;
+/**
+ * The HTTP status for a refused message: 503 when the signing certificate could not be fetched, which may be a genuine
+ * delivery during an outage or a spent budget, so SNS retries it; 403 for every other refusal, which SNS does not retry.
+ */
+export declare function snsRefusalStatus(reason: SnsRejection): 403 | 503;
+/**
+ * Confirms a subscription by fetching the `subscribeUrl` that `verifySnsMessage` returned for a verified
+ * SubscriptionConfirmation. Throws when the URL is not an SNS ConfirmSubscription URL or SNS does not answer 2xx;
+ * answer 503 then, so SNS sends the confirmation again.
+ */
+export declare function confirmSnsSubscription(subscribeUrl: string, { fetch: send, timeoutMs }?: {
+    fetch?: SnsFetch;
+    timeoutMs?: number;
+}): Promise<void>;
+export {};

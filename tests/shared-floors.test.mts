@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { checkManifest, checkVendoredFloors } from '../check.mjs';
 
-const runtime = 'file:vendor/ten98-runtime-0.15.1.tgz';
+const runtime = 'file:vendor/ten98-runtime-0.16.0.tgz';
 const app = (ui: string) => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
   dependencies: { '@ten98/ui': ui, '@ten98/runtime': runtime, 'openid-client': '6.8.8', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
