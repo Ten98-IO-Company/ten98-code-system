@@ -9,7 +9,7 @@ test('OpenRouter refuses unsafe API key header values before transport and never
   for (const apiKey of [`${secret}\nNEXT_SETTING=value`, `${secret}\r\nX-Injected: 1`, `${secret}\u0000`]) {
     let sent = 0;
     // Request construction applies the same header validation as fetch without touching the network.
-    const send = async (url, init) => { sent++; return new Response(new Request(url, init).url); };
+    const send: typeof fetch = async (url, init) => { sent++; return new Response(new Request(url, init).url); };
     const error = await (async () => { await openRouterFetch('/key', { apiKey }, send); })().then(() => undefined, failure => failure);
     assert.ok(error instanceof TypeError, 'unsafe header values are rejected');
     assert.equal(String(error.message).includes(secret), false, `error message leaks the credential: ${JSON.stringify(error.message)}`);

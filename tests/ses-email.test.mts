@@ -1,20 +1,23 @@
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
 import test from 'node:test';
-import { SES_REGIONS, deriveAwsV4SigningKey, sendSesEmail, sesOrigin, signAwsV4Request } from '../ses-email.mjs';
+import { SES_REGIONS, deriveAwsV4SigningKey, sendSesEmail, sesOrigin, signAwsV4Request, type SesSendError } from '../ses-email.mjs';
 
-const sha = text => createHash('sha256').update(text).digest('hex');
+const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 const DATE = new Date('2026-10-23T08:09:10.123Z');
 const CREDENTIALS = Object.freeze({ accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY' });
 const MESSAGE = Object.freeze({ from: 'Ten98 <noreply@mail.ten98.io>', to: 'reader@example.com', subject: 'Welcome', text: 'Hello', html: '<p>Hello</p>' });
 
-function stubFetch(respond = () => new Response(JSON.stringify({ MessageId: '0100-abc-000000' }), { status: 200 })) {
-  const calls = [];
-  const fetch = async (url, init) => { calls.push({ url, init }); return respond(init); };
+// sendSesEmail always passes a plain header record and its own deadline signal.
+type SentInit = RequestInit & { headers: Record<string, string>; signal: AbortSignal };
+
+function stubFetch(respond: (init: SentInit) => Response | Promise<Response> = () => new Response(JSON.stringify({ MessageId: '0100-abc-000000' }), { status: 200 })) {
+  const calls: { url: RequestInfo | URL; init: SentInit }[] = [];
+  const fetch: typeof globalThis.fetch = async (url, init) => { calls.push({ url, init: init as SentInit }); return respond(init as SentInit); };
   return { calls, fetch };
 }
-const send = (overrides = {}) => sendSesEmail({ region: 'eu-west-1', credentials: CREDENTIALS, message: MESSAGE, now: () => DATE, ...overrides });
-const fails = (promise, expected) => assert.rejects(promise, error => {
+const send = (overrides: Partial<Parameters<typeof sendSesEmail>[0]> = {}) => sendSesEmail({ region: 'eu-west-1', credentials: CREDENTIALS, message: MESSAGE, now: () => DATE, ...overrides });
+const fails = (promise: Promise<unknown>, expected: Partial<SesSendError>) => assert.rejects(promise, (error: Record<string, unknown>) => {
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(error[key], value, key);
   return true;
 });
@@ -31,7 +34,7 @@ test('signing key derivation matches the AWS documentation example', () => {
 // Vectors from the AWS SigV4 test suite as published in awslabs/aws-c-auth tests/aws-signing-test-suite/v4
 // (context: AKIDEXAMPLE, us-east-1, service "service", 2015-08-30T12:36:00Z).
 const SUITE = { credentials: { accessKeyId: 'AKIDEXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY' }, region: 'us-east-1', service: 'service', host: 'example.amazonaws.com', method: 'POST', path: '/', date: new Date('2015-08-30T12:36:00Z') };
-const authorization = (signedHeaders, signature) => `AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+const authorization = (signedHeaders: string, signature: string) => `AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
 test('signing reproduces the AWS SigV4 suite post-vanilla, post-x-www-form-urlencoded and post-sts-header-before vectors', () => {
   assert.deepEqual(signAwsV4Request(SUITE), {
@@ -111,7 +114,7 @@ test('regions come only from the allowlist of constant origins', async () => {
 
 test('header injection and malformed input are refused before any request', async () => {
   const { calls, fetch } = stubFetch();
-  const cases = [
+  const cases: Record<string, unknown>[] = [
     { subject: 'Hi\r\nBcc: victim@example.com' },
     { subject: 'Hi\nthere' },
     { to: 'reader@example.com\r\nBcc: victim@example.com' },
@@ -140,17 +143,17 @@ test('header injection and malformed input are refused before any request', asyn
   assert.equal(calls.length, 1);
 });
 
-const rejection = (status, type, { inHeader = true } = {}) => () => new Response(
+const rejection = (status: number, type: string, { inHeader = true } = {}) => () => new Response(
   JSON.stringify(inHeader ? { message: 'Email address is not verified: reader@example.com' } : { __type: `com.amazonaws.sesv2#${type}`, message: 'detail' }),
   { status, headers: inHeader ? { 'x-amzn-ErrorType': `${type}:http://internal.amazon.com/coral/com.amazonaws.sesv2/` } : {} });
 
 test('definite SES rejections carry the SES error type and a safe message', async () => {
-  const types = [[400, 'MessageRejected'], [400, 'MailFromDomainNotVerifiedException'], [400, 'AccountSuspendedException'],
+  const types: [number, string][] = [[400, 'MessageRejected'], [400, 'MailFromDomainNotVerifiedException'], [400, 'AccountSuspendedException'],
     [400, 'SendingPausedException'], [400, 'BadRequestException'], [404, 'NotFoundException'], [403, 'AccessDeniedException']];
   for (const [status, type] of types) {
     for (const inHeader of [true, false]) {
       const { fetch } = stubFetch(rejection(status, type, { inHeader }));
-      await assert.rejects(send({ fetch }), error => {
+      await assert.rejects(send({ fetch }), (error: SesSendError) => {
         assert.deepEqual([error.code, error.uncertain, error.retryable, error.status], [type, false, false, status]);
         assert.doesNotMatch(error.message, /reader@example\.com|detail|wJalr|AKIA/);
         return true;
@@ -166,12 +169,12 @@ test('definite SES rejections carry the SES error type and a safe message', asyn
 test('throttling is retryable and not uncertain', async () => {
   for (const respond of [rejection(429, 'TooManyRequestsException'), rejection(400, 'ThrottlingException'), () => new Response('', { status: 429 })]) {
     const { fetch } = stubFetch(respond);
-    await assert.rejects(send({ fetch }), error => error.retryable === true && error.uncertain === false && /Throttl|TooMany/.test(error.code));
+    await assert.rejects(send({ fetch }), (error: SesSendError) => error.retryable === true && error.uncertain === false && /Throttl|TooMany/.test(error.code));
   }
 });
 
 test('server failures and unreadable acceptances are uncertain', async () => {
-  for (const [status, type] of [[500, 'InternalFailure'], [503, 'ServiceUnavailable']]) {
+  for (const [status, type] of [[500, 'InternalFailure'], [503, 'ServiceUnavailable']] as const) {
     const { fetch } = stubFetch(rejection(status, type));
     await fails(send({ fetch }), { code: type, uncertain: true, retryable: false, status });
   }
@@ -185,7 +188,7 @@ test('network failures, aborts and timeouts after sending are uncertain', async 
   const network = stubFetch(() => { throw new TypeError('fetch failed'); });
   await fails(send({ fetch: network.fetch }), { code: 'NETWORK_ERROR', uncertain: true, retryable: false });
 
-  const hang = init => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true }));
+  const hang = (init: SentInit) => new Promise<Response>((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true }));
   const controller = new AbortController();
   const aborted = stubFetch(hang);
   const pending = send({ fetch: aborted.fetch, signal: controller.signal });

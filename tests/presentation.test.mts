@@ -16,7 +16,7 @@ const parseAst = ['..', '../../ten98-campaign', '../../../../../ten98-campaign',
 }).find(Boolean);
 const needsParser = { skip: parseAst ? false : 'rolldown/parseAst is not installed in any known checkout' };
 
-function consumer(files, baseline, run) {
+function consumer(files: string[], baseline: Record<string, Record<string, number>> | undefined, run: (root: string) => void) {
   const root = mkdtempSync(join(tmpdir(), 'ten98-presentation-'));
   try {
     mkdirSync(join(root, 'src'));
@@ -26,7 +26,7 @@ function consumer(files, baseline, run) {
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-const check = root => checkPresentation(root, profile, { parseAst });
+const check = (root: string) => checkPresentation(root, profile, { parseAst });
 
 test('only @ten98/ui imports and Ui.* members pass with strict zero', needsParser, () => consumer(['pass.tsx'], undefined, root => {
   assert.deepEqual(check(root), []);
@@ -57,7 +57,7 @@ test('a missing baseline file is strict', needsParser, () => consumer(['element.
 }));
 
 test('update mode lowers counts, removes cleared entries and refuses to raise them', needsParser, () => {
-  const stored = root => JSON.parse(readFileSync(join(root, baselineName), 'utf8'));
+  const stored = (root: string) => JSON.parse(readFileSync(join(root, baselineName), 'utf8'));
   consumer(['element.tsx'], { 'src/element.tsx': { element: 3 }, 'src/gone.tsx': { styling: 2 } }, root => {
     assert.deepEqual(updatePresentationBaseline(root, profile, { parseAst }), []);
     assert.deepEqual(stored(root), { 'src/element.tsx': { element: 1 } });

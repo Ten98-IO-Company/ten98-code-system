@@ -62,7 +62,7 @@ test('malformed, non-literal and oversized forwarding chains stay unknown', () =
 
 test('invalid proxy configuration fails closed without echoing the value', () => {
   for (const raw of ['secret-sentinel', '10.0.0.1,,10.0.0.2', '10.0.0.0/33', '2001:db8::/129', '10.0.0.1/-1', '10.0.0.0/01', '::ffff:10.0.0.1/24', 'fe80::1%eth0', '10.0.0.0/24/1', 'x'.repeat(4097), 7]) {
-    assert.throws(() => parseTrustedProxies(raw), error => error.code === 'CLIENT_ADDRESS_CONFIG' && !String(error.message).includes('secret-sentinel'));
+    assert.throws(() => parseTrustedProxies(raw), (error: Error & { code?: string }) => error.code === 'CLIENT_ADDRESS_CONFIG' && !String(error.message).includes('secret-sentinel'));
   }
   assert.throws(() => parseTrustedProxies(Array(33).fill('10.0.0.1').join(',')), { code: 'CLIENT_ADDRESS_CONFIG' });
   assert.doesNotThrow(() => parseTrustedProxies(undefined));

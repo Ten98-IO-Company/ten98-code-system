@@ -105,12 +105,12 @@
         "sendCloudflareEmail"
       ],
       "tests": [
-        "tests/runtime.test.mjs",
-        "tests/migration-ledger.test.mjs",
-        "tests/client-address.test.mjs",
-        "tests/ses-email.test.mjs",
-        "tests/sns-notification.test.mjs",
-        "tests/email-feedback.test.mjs",
+        "tests/runtime.test.mts",
+        "tests/migration-ledger.test.mts",
+        "tests/client-address.test.mts",
+        "tests/ses-email.test.mts",
+        "tests/sns-notification.test.mts",
+        "tests/email-feedback.test.mts",
         "tests/read-bytes.test.mts",
         "tests/client-limit-key.test.mts",
         "tests/capability-token.test.mts",
@@ -123,7 +123,7 @@
         "tests/cloudflare-email.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.15.0"
+      "version": "v0.15.1"
     },
     "presentation": {
       "package": "@ten98/ui",
