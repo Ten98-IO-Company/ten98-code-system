@@ -16,6 +16,11 @@ export interface CheckedEmail {
   headers: readonly { name: string; value: string }[];
 }
 
+/** A single mailbox address under the senders' rule: at most 254 characters, local part at most 64. */
+export function isEmailAddress(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 254 && ADDRESS.test(value) && value.split('@')[0]!.length <= 64;
+}
+
 export function invalidEmailInput(provider: string, field: string): never {
   throw Object.assign(new TypeError(`Invalid ${provider} ${field}.`), { code: 'INVALID_INPUT' });
 }
@@ -27,7 +32,7 @@ export function invalidEmailInput(provider: string, field: string): never {
 export function checkEmailMessage(message: unknown, provider: string, { reservedHeaderPrefix }: { reservedHeaderPrefix?: string } = {}): CheckedEmail {
   const invalid = (field: string) => invalidEmailInput(provider, field);
   const address = (value: unknown, field: string): string => {
-    if (typeof value !== 'string' || value.length > 254 || !ADDRESS.test(value) || value.split('@')[0]!.length > 64) invalid(field);
+    if (!isEmailAddress(value)) invalid(field);
     return value as string;
   };
   if (message === null || typeof message !== 'object') invalid('message');

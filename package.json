@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "packageManager": "pnpm@11.19.0",
   "description": "Shared HTTP, provider, email, migration, OIDC and identity primitives for ten98 applications",
   "type": "module",
@@ -40,6 +40,9 @@
     "capability-token.d.mts",
     "json-body.mjs",
     "json-body.d.mts",
+    "workspace-team.mjs",
+    "workspace-team.d.mts",
+    "workspace-team.sql",
     "auth.mjs",
     "auth.d.mts",
     "csv.mjs",
@@ -66,6 +69,7 @@
     "src/email-feedback.mts",
     "src/capability-token.mts",
     "src/json-body.mts",
+    "src/workspace-team.mts",
     "src/auth.mts",
     "src/csv.mts",
     "src/cloudflare-email.mts",
@@ -94,7 +98,9 @@
   },
   "devDependencies": {
     "@types/node": "24.10.1",
+    "@types/pg": "8.15.6",
     "better-auth": "1.7.7",
+    "pg": "8.23.0",
     "typescript": "7.0.2"
   },
   "peerDependencies": {

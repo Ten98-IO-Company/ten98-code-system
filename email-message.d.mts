@@ -24,6 +24,8 @@ export interface CheckedEmail {
         value: string;
     }[];
 }
+/** A single mailbox address under the senders' rule: at most 254 characters, local part at most 64. */
+export declare function isEmailAddress(value: unknown): value is string;
 export declare function invalidEmailInput(provider: string, field: string): never;
 /**
  * Validates one message for `provider` (named in errors). Header limits follow SES, the stricter provider:
