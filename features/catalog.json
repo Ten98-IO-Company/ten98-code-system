@@ -99,7 +99,8 @@
         "classifyEmailFeedback",
         "signCapability",
         "readCapability",
-        "readJsonBody"
+        "readJsonBody",
+        "providerFetchJson"
       ],
       "tests": [
         "tests/runtime.test.mjs",
@@ -114,10 +115,11 @@
         "tests/json-body.test.mts",
         "tests/loopback-origin.test.mts",
         "tests/ledger-guards.test.mts",
-        "tests/browser-entry.test.mts"
+        "tests/browser-entry.test.mts",
+        "tests/provider-fetch.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.12.0"
+      "version": "v0.13.0"
     },
     "presentation": {
       "package": "@ten98/ui",
