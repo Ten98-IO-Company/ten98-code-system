@@ -1,8 +1,8 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "packageManager": "pnpm@11.19.0",
-  "description": "Shared HTTP, OpenRouter and OIDC primitives for ten98 applications",
+  "description": "Shared HTTP, provider, email, migration, OIDC and identity primitives for ten98 applications",
   "type": "module",
   "license": "MIT",
   "main": "./index.mjs",
@@ -15,6 +15,10 @@
     "./browser": {
       "types": "./browser.d.mts",
       "import": "./browser.mjs"
+    },
+    "./auth": {
+      "types": "./auth.d.mts",
+      "import": "./auth.mjs"
     }
   },
   "files": [
@@ -36,6 +40,8 @@
     "capability-token.d.mts",
     "json-body.mjs",
     "json-body.d.mts",
+    "auth.mjs",
+    "auth.d.mts",
     "csv.mjs",
     "csv.d.mts",
     "cloudflare-email.mjs",
@@ -60,6 +66,7 @@
     "src/email-feedback.mts",
     "src/capability-token.mts",
     "src/json-body.mts",
+    "src/auth.mts",
     "src/csv.mts",
     "src/cloudflare-email.mts",
     "src/email-message.mts",
@@ -87,6 +94,15 @@
   },
   "devDependencies": {
     "@types/node": "24.10.1",
+    "better-auth": "1.7.7",
     "typescript": "7.0.2"
+  },
+  "peerDependencies": {
+    "better-auth": "1.7.7"
+  },
+  "peerDependenciesMeta": {
+    "better-auth": {
+      "optional": true
+    }
   }
 }

@@ -132,8 +132,35 @@
         "tests/migrate-deadline.test.mts",
         "tests/csv.test.mts"
       ],
-      "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.18.0"
+      "boundary": "Reusable primitives. These exports do not implement routes, workspace persistence or provider accounting; the separate auth entry below holds the identity policy.",
+      "version": "v0.19.0"
+    },
+    "auth": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/auth",
+      "entrypoints": [
+        "auth.mjs",
+        "auth.d.mts"
+      ],
+      "peerDependencies": {
+        "better-auth": "1.7.7"
+      },
+      "exports": [
+        "createTen98Auth",
+        "ten98AuthPolicy",
+        "verifyLegacyScryptHash"
+      ],
+      "tests": [
+        "tests/auth.test.mts"
+      ],
+      "source": "Discover src/server/auth.ts (dev, 2026-10-25)",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/97",
+      "boundary": "A better-auth preset with the Ten98 identity policy. Apps keep routes, transactions, the first-boot claim, the OIDC protocol, the TOTP replay ledger, rate limiters and workspace authorization.",
+      "version": "v0.19.0",
+      "adoptionNotes": [
+        "Discover: pass cookiePrefix: 'better-auth' (keeps current sessions and the two_factor cookie name its tests read) and allowPasswordless: true (its router proves a fresh OIDC sign-in first).",
+        "Campaign: pass legacyPasswords: true; sessions reset once at cutover."
+      ]
     },
     "presentation": {
       "package": "@ten98/ui",
@@ -247,7 +274,11 @@
           ]
         }
       ],
-      "gap": "Campaign does not provide Discover's web password recovery or MFA lifecycle. Host recovery is a retained fallback, not feature parity."
+      "gap": "Campaign does not provide Discover's web password recovery or MFA lifecycle. Host recovery is a retained fallback, not feature parity.",
+      "portableAuth": [
+        "createTen98Auth",
+        "ten98AuthPolicy"
+      ]
     },
     {
       "id": "oidc-signin-linking",

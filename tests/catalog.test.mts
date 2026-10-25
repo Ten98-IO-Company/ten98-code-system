@@ -8,8 +8,8 @@ import * as runtime from '../index.mjs';
 interface Implementation { source: string; entrypoints?: string[]; tests?: string[] }
 interface Catalog {
   sources: Record<string, { repository: string; tag: string }>;
-  portableImports: { runtime: { exports: string[]; tests: string[] } };
-  features: { id: string; implementations: Implementation[]; portable?: string[] }[];
+  portableImports: { runtime: { exports: string[]; tests: string[] }; auth: { exports: string[]; tests: string[] } };
+  features: { id: string; implementations: Implementation[]; portable?: string[]; portableAuth?: string[] }[];
 }
 const catalog: Catalog = JSON.parse(readFileSync(new URL('../features/catalog.json', import.meta.url), 'utf8'));
 
@@ -18,6 +18,13 @@ test('every runtime export and test file the catalogue names exists in this pack
   const named = [...catalog.portableImports.runtime.exports, ...catalog.features.flatMap(feature => feature.portable ?? [])];
   assert.deepEqual(named.filter(name => !exported.has(name)), []);
   assert.deepEqual(catalog.portableImports.runtime.tests.filter(path => !existsSync(new URL(`../${path}`, import.meta.url))), []);
+});
+
+test('every auth-entry export and test file the catalogue names exists', async () => {
+  const exported = new Set(Object.keys(await import('../auth.mjs')));
+  const named = [...catalog.portableImports.auth.exports, ...catalog.features.flatMap(feature => feature.portableAuth ?? [])];
+  assert.deepEqual(named.filter(name => !exported.has(name)), []);
+  assert.deepEqual(catalog.portableImports.auth.tests.filter(path => !existsSync(new URL(`../${path}`, import.meta.url))), []);
 });
 
 test('every implementation names a declared source', () => {
