@@ -156,7 +156,11 @@
       "source": "Discover src/server/auth.ts (dev, 2026-10-25)",
       "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/97",
       "boundary": "A better-auth preset with the Ten98 identity policy. Apps keep routes, transactions, the first-boot claim, the OIDC protocol, the TOTP replay ledger, rate limiters and workspace authorization.",
-      "version": "v0.19.0"
+      "version": "v0.19.0",
+      "adoptionNotes": [
+        "Discover: pass cookiePrefix: 'better-auth' (keeps current sessions and the two_factor cookie name its tests read) and allowPasswordless: true (its router proves a fresh OIDC sign-in first).",
+        "Campaign: pass legacyPasswords: true; sessions reset once at cutover."
+      ]
     },
     "presentation": {
       "package": "@ten98/ui",

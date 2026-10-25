@@ -12,7 +12,8 @@ export declare const ten98AuthPolicy: Readonly<{
     }>;
     /**
      * TOTP (RFC 6238, SHA-1). `replaySeconds` is the window in which an accepted code is refused again; the app keeps that
-     * ledger. Recovery codes are `backupCodes` codes in `backupCodeFormat` (21 characters as typed, with the hyphen).
+     * ledger. Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
+     * `backupCodeInputLength` characters as typed, with the hyphen.
      * The lockout counts failures during sign-in challenges only; session-bound step-up checks are limited per user by the
      * app (`rateLimits.accountSecurityWritesPerUser`).
      */
@@ -21,7 +22,8 @@ export declare const ten98AuthPolicy: Readonly<{
         periodSeconds: 30;
         replaySeconds: 90;
         backupCodes: 10;
-        backupCodeFormat: RegExp;
+        backupCodePattern: "^[A-Za-z0-9]{5}-[A-Za-z0-9]{15}$";
+        backupCodeInputLength: 21;
         maxFailedAttempts: 10;
         lockoutSeconds: 900;
     }>;
@@ -114,7 +116,7 @@ export interface Ten98Auth {
             password: string;
             rememberMe?: boolean;
         }>;
-        /** Replaces the caller's own session with a fresh one (after the app verified a factor); needs that session's cookie. */
+        /** Replaces the caller's own session with a fresh one and revokes the old one (after the app verified a factor); needs that session's cookie. */
         rotateVerifiedSession: ServerCall<{
             verifiedUserId: string;
         }>;

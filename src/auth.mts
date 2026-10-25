@@ -17,11 +17,12 @@ export const ten98AuthPolicy = Object.freeze({
   session: Object.freeze({ expiresInSeconds: 604_800, updateAgeSeconds: 86_400 }),
   /**
    * TOTP (RFC 6238, SHA-1). `replaySeconds` is the window in which an accepted code is refused again; the app keeps that
-   * ledger. Recovery codes are `backupCodes` codes in `backupCodeFormat` (21 characters as typed, with the hyphen).
+   * ledger. Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
+   * `backupCodeInputLength` characters as typed, with the hyphen.
    * The lockout counts failures during sign-in challenges only; session-bound step-up checks are limited per user by the
    * app (`rateLimits.accountSecurityWritesPerUser`).
    */
-  twoFactor: Object.freeze({ digits: 6, periodSeconds: 30, replaySeconds: 90, backupCodes: 10, backupCodeFormat: /^[A-Za-z0-9]{5}-[A-Za-z0-9]{15}$/, maxFailedAttempts: 10, lockoutSeconds: 900 }),
+  twoFactor: Object.freeze({ digits: 6, periodSeconds: 30, replaySeconds: 90, backupCodes: 10, backupCodePattern: '^[A-Za-z0-9]{5}-[A-Za-z0-9]{15}$', backupCodeInputLength: 21, maxFailedAttempts: 10, lockoutSeconds: 900 }),
   reset: Object.freeze({ expiresInSeconds: 3600, revokesSessions: true }),
   /**
    * Counts per `windowSeconds` for each app's route limiter. better-auth's own limiter stays off because it cannot see
@@ -87,7 +88,7 @@ export interface Ten98Auth {
   api: {
     getSession(input: { headers: HeadersInit; query?: { disableRefresh?: boolean } }): Promise<Ten98AuthSession | null>;
     signInEmail: ServerCall<{ email: string; password: string; rememberMe?: boolean }>;
-    /** Replaces the caller's own session with a fresh one (after the app verified a factor); needs that session's cookie. */
+    /** Replaces the caller's own session with a fresh one and revokes the old one (after the app verified a factor); needs that session's cookie. */
     rotateVerifiedSession: ServerCall<{ verifiedUserId: string }>;
     /** Signs in a user the app's OIDC flow verified; an account with two-factor enabled gets the TOTP challenge instead. */
     completeOidcSession: ServerCall<{ oidcUserId: string }>;
@@ -96,8 +97,7 @@ export interface Ten98Auth {
 }
 
 type VerificationStore = {
-  adapter: { findMany(query: { model: string; where: { field: string; value: string }[] }): Promise<{ identifier: string }[]> };
-  internalAdapter: { deleteVerificationByIdentifier(identifier: string): Promise<unknown> };
+  adapter: { deleteMany(query: { model: string; where: { field: string; value: string; operator?: 'eq' | 'starts_with' }[] }): Promise<number> };
 };
 
 /**
@@ -145,7 +145,9 @@ export function createTen98Auth({ database, appUrl, secret, appName, sendResetPa
         // Only the account's own current session can be rotated; this never signs anyone in.
         const current = await getSessionFromCtx(context);
         if (!current || current.user.id !== user.id) throw APIError.fromStatus('UNAUTHORIZED');
-        return issue(context, user);
+        const response = await issue(context, user);
+        await context.context.internalAdapter.deleteSession(current.session.token);
+        return response;
       }),
       completeOidcSession: createAuthEndpoint.serverOnly({ method: 'POST' }, async context => issue(context, await verifiedUser(context, 'oidcUserId'))),
     },
@@ -190,14 +192,11 @@ export function createTen98Auth({ database, appUrl, secret, appName, sendResetPa
       ...(sendResetPassword ? { sendResetPassword: async ({ user, token }: { user: { id: string; email: string }; token: string }) => { await sendResetPassword({ userId: user.id, email: user.email, token }); } } : {}),
       // A reset also ends trusted devices and pending two-factor challenges, so the new password alone never skips the factor.
       onPasswordReset: async ({ user }: { user: { id: string } }) => {
-        const { adapter, internalAdapter } = await (store ??= (auth as unknown as { $context: Promise<VerificationStore> }).$context);
-        const rows = await adapter.findMany({ model: 'verification', where: [{ field: 'value', value: user.id }] });
-        for (const { identifier } of rows) {
-          if (identifier.startsWith('trust-device-')) await internalAdapter.deleteVerificationByIdentifier(identifier);
-          else if (identifier.startsWith('2fa-') && !identifier.startsWith('2fa-attempts-')) {
-            await internalAdapter.deleteVerificationByIdentifier(identifier);
-            await internalAdapter.deleteVerificationByIdentifier(`2fa-attempts-${identifier}`);
-          }
+        // deleteMany has no row cap (findMany defaults to 100). Challenge rows hold the user id; their attempt counters
+        // ('2fa-attempts-…', value '0') expire with the challenge they belonged to.
+        const { adapter } = await (store ??= (auth as unknown as { $context: Promise<VerificationStore> }).$context);
+        for (const prefix of ['trust-device-', '2fa-']) {
+          await adapter.deleteMany({ model: 'verification', where: [{ field: 'value', value: user.id }, { field: 'identifier', operator: 'starts_with', value: prefix }] });
         }
       },
       ...(legacyPassword ? { password: legacyPassword } : {}),

@@ -69,10 +69,11 @@ async function withTwoFactor(env: ReturnType<typeof setup>) {
 }
 
 test('the policy is the published Ten98 identity policy', () => {
-  assert.deepEqual({ ...ten98AuthPolicy, twoFactor: { ...ten98AuthPolicy.twoFactor, backupCodeFormat: ten98AuthPolicy.twoFactor.backupCodeFormat.source } }, {
+  // A JSON round trip proves the policy can be sent to browser forms unchanged.
+  assert.deepEqual(JSON.parse(JSON.stringify(ten98AuthPolicy)), {
     password: { minLength: 12, maxLength: 128 },
     session: { expiresInSeconds: 604800, updateAgeSeconds: 86400 },
-    twoFactor: { digits: 6, periodSeconds: 30, replaySeconds: 90, backupCodes: 10, backupCodeFormat: BACKUP_CODE.source, maxFailedAttempts: 10, lockoutSeconds: 900 },
+    twoFactor: { digits: 6, periodSeconds: 30, replaySeconds: 90, backupCodes: 10, backupCodePattern: BACKUP_CODE.source, backupCodeInputLength: 21, maxFailedAttempts: 10, lockoutSeconds: 900 },
     reset: { expiresInSeconds: 3600, revokesSessions: true },
     rateLimits: { windowSeconds: 60, signInPerClient: 60, signInPerEmail: 5, twoFactorPerClient: 60, twoFactorPerChallenge: 10, resetRequestPerClient: 20, resetRequestPerEmail: 3, resetPerClient: 60, resetPerToken: 5, accountSecurityReadsPerUser: 120, accountSecurityWritesPerUser: 30 },
   });
@@ -195,12 +196,16 @@ test('two-factor uses 6-digit, 30-second TOTP and 10 recovery codes in the publi
 test('ten wrong codes in sign-in challenges lock the factor, even for the right code', async () => {
   const env = setup();
   const { uri } = await withTwoFactor(env);
+  // Bounded: a stricter or broken lockout ends the loop and fails below instead of hanging.
   let failures = 0, challenge = '';
-  while (failures < 10) {
+  for (let attempt = 0; attempt < 40 && failures < 10; attempt++) {
     if (!challenge) challenge = cookieOf(await env.signIn());
     const response = await env.post('/two-factor/verify-totp', { code: '000000' }, challenge);
-    if (response.status === 401) failures++; else challenge = '';
+    if (response.status === 401) failures++;
+    else if (response.status === 429) break;
+    else challenge = '';
   }
+  assert.equal(failures, 10);
   const locked = await env.post('/two-factor/verify-totp', { code: totp(uri) }, cookieOf(await env.signIn()));
   assert.notEqual(locked.status, 200);
 });
@@ -219,6 +224,8 @@ test('OIDC sign-in sends a two-factor account through the challenge, and rotatio
   const rotated = await env.auth.api.rotateVerifiedSession({ body: { verifiedUserId: id }, headers: { cookie }, asResponse: true });
   assert.equal(rotated.status, 200);
   assert.equal((await env.auth.api.getSession({ headers: { cookie: cookieOf(rotated) } }))?.user.id, id);
+  // The session that was rotated no longer works.
+  assert.equal(await env.auth.api.getSession({ headers: { cookie } }), null);
   // Over HTTP both endpoints do not exist.
   assert.equal((await env.post('/complete-oidc-session', { oidcUserId: id })).status, 404);
   assert.equal((await env.post('/rotate-verified-session', { verifiedUserId: id }, cookie)).status, 404);
@@ -248,6 +255,23 @@ test('a password reset revokes sessions and ends trusted devices and pending cha
   assert.equal(await env.auth.api.getSession({ headers: { cookie } }), null);
   assert.deepEqual(await (await env.signIn('owner@example.com', 'a brand new password', trustCookie)).json(), { twoFactorRedirect: true, twoFactorMethods: ['totp'] });
   assert.notEqual((await env.post('/two-factor/verify-totp', { code: totp(uri) }, pending)).status, 200);
+});
+
+test('a password reset ends trusted devices even behind more than 100 pending challenges', async () => {
+  const env = setup();
+  const { uri } = await withTwoFactor(env);
+  const trusted = await env.post('/two-factor/verify-totp', { code: totp(uri, 1), trustDevice: true }, cookieOf(await env.signIn()));
+  const trustCookie = cookies(trusted).filter(pair => pair.split('=')[0]!.endsWith('.trust_device')).join('; ');
+  for (let i = 0; i < 101; i++) await env.signIn();
+  // Signing in with the trust cookie rotates the trusted-device row, so it sits after the 101 pending challenges.
+  assert.equal((await env.signIn('owner@example.com', PASSWORD, trustCookie)).status, 200);
+  const rotatedTrust = (await env.signIn('owner@example.com', PASSWORD, trustCookie)).headers.getSetCookie().map(value => value.split(';')[0]!).filter(pair => pair.split('=')[0]!.endsWith('.trust_device') && !pair.endsWith('=')).join('; ') || trustCookie;
+  const owned = env.db.verification!.filter(row => row.value !== '0').length;
+  assert.ok(owned > 100, String(owned));
+  assert.equal((await env.post('/request-password-reset', { email: 'owner@example.com', redirectTo: '/' })).status, 200);
+  assert.equal((await env.post('/reset-password', { token: env.resets.at(-1), newPassword: 'a brand new password' })).status, 200);
+  assert.equal(env.db.verification!.filter(row => typeof row.identifier === 'string' && /^(trust-device-|2fa-(?!attempts-))/.test(row.identifier)).length, 0);
+  assert.deepEqual(await (await env.signIn('owner@example.com', 'a brand new password', rotatedTrust)).json(), { twoFactorRedirect: true, twoFactorMethods: ['totp'] });
 });
 
 test('unexpected adapter errors become a bare 500 without their text', async () => {
