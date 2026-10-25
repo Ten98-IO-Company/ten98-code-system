@@ -28,6 +28,18 @@ const startupError = (code: MigrationStartupError['code'], message: string, sqlS
 const seconds = (ms: number) => `${Math.round(ms / 1000)} seconds`;
 const positive = (value: number, name: string) => { if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer.`); };
 
+/** `pool.connect()` bounded by `ms`, for pools without `connectionTimeoutMillis`; a connection that arrives late is discarded. */
+function connectWithin(pool: MigrationPool, ms: number): Promise<MigrationPoolClient> {
+  return new Promise((resolve, reject) => {
+    let late = false;
+    const timer = setTimeout(() => { late = true; reject(new Error('The database did not accept a connection in time.')); }, ms);
+    pool.connect().then(client => {
+      if (late) client.release(true);
+      else { clearTimeout(timer); resolve(client); }
+    }, error => { clearTimeout(timer); reject(error); });
+  });
+}
+
 /** MIGRATE_ON_START: unset, empty, `true` or `1` migrates at startup; `false` or `0` waits for an operator migration. */
 export function migrateOnStart(value: string | undefined): boolean {
   const setting = value?.trim().toLowerCase();
@@ -151,7 +163,7 @@ export function createMigrationLedger({ directory, files, lockKey }: {
       let waiting = 'the database to accept connections';
       let candidate: MigrationPoolClient | undefined;
       try {
-        candidate = await pool.connect();
+        candidate = await connectWithin(pool, Math.max(0, deadline - Date.now()));
         const { rows } = await candidate.query<{ locked: boolean }>('SELECT pg_try_advisory_lock($1, $2) AS locked', [lockKey[0], lockKey[1]]);
         if (rows[0]?.locked) { client = candidate; break; }
         candidate.release();

@@ -9,13 +9,14 @@ import type { MigrationPoolClient } from '../index.mjs';
 
 // A scripted pool, not PostgreSQL: each connection enforces a 10 ms statement_timeout unless it is set to 0, the way
 // the apps' pools default to 10 s. A statement containing "slow" takes 30 ms.
-type Script = { locks?: boolean[]; connectFailures?: number; slowMs?: number; fail?: { code: string; message: string }; applied?: { version: string; checksum: string }[] };
+type Script = { locks?: boolean[]; connectFailures?: number; connectDelayMs?: number; slowMs?: number; fail?: { code: string; message: string }; applied?: { version: string; checksum: string }[] };
 function pool(script: Script = {}) {
   const calls: string[] = [];
   const releases: (Error | boolean | undefined)[] = [];
   let connectFailures = script.connectFailures ?? 0;
   const locks = [...(script.locks ?? [true])];
   const connect = async (): Promise<MigrationPoolClient> => {
+    if (script.connectDelayMs) await delay(script.connectDelayMs);
     if (connectFailures-- > 0) throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
     let statementTimeout = 10, discarded = false;
     const ended = () => { if (discarded) throw new Error('Connection terminated.'); };
@@ -79,6 +80,19 @@ test('migrateWithDeadline waits for another instance and an unavailable database
       (error as { code?: string }).code === 'MIGRATION_TIMEOUT' && /Nothing was applied/.test((error as Error).message));
     assert.ok(Date.now() - started < 1000);
     assert.equal(held.calls.includes('BEGIN'), false);
+  } finally { cleanup(); }
+});
+
+test('migrateWithDeadline bounds a connection that hangs past the deadline and discards it when it arrives', async () => {
+  const { ledger, cleanup } = ledgerWith('CREATE TABLE a();\n');
+  try {
+    const hung = pool({ connectDelayMs: 200 });
+    const started = Date.now();
+    await assert.rejects(ledger.migrateWithDeadline(hung.pool, { timeoutMs: 40 }), (error: unknown) => (error as { code?: string }).code === 'MIGRATION_TIMEOUT' && /accept connections/.test((error as Error).message));
+    assert.ok(Date.now() - started < 150);
+    await delay(250);
+    assert.deepEqual(hung.releases, [true]);
+    assert.equal(hung.calls.length, 0);
   } finally { cleanup(); }
 });
 
