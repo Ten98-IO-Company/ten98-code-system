@@ -1,8 +1,10 @@
 // Amazon SNS HTTP(S) message verification for SES feedback and other topic subscriptions.
-// The caller fetches and caches signing certificates and records processed message ids, so this module does no I/O itself.
+// verifySnsMessage does no I/O: the caller supplies the certificate fetcher (createSnsCertificateFetcher is the bounded,
+// cached one) and records processed message ids. Effects, duplicate stores and admission budgets stay in the app.
 // Procedure: https://docs.aws.amazon.com/sns/latest/dg/sns-verify-signature-of-message.html
 // and https://docs.aws.amazon.com/sns/latest/dg/sns-verify-signature-of-message-verify-message-signature.html
 import { createVerify, X509Certificate } from 'node:crypto';
+import { readResponseText } from './browser.mjs';
 
 export type SnsMessageType = 'Notification' | 'SubscriptionConfirmation' | 'UnsubscribeConfirmation';
 export type SnsRejection =
@@ -166,4 +168,70 @@ export async function verifySnsMessage(rawBody: string, options: SnsVerifyOption
     ok: true, duplicate: false, type, messageId, topicArn: text.TopicArn, rawMessage: text.Message,
     ...(message === undefined ? {} : { message }), ...(text.Subject === undefined ? {} : { subject: text.Subject }),
   };
+}
+
+type SnsFetch = (url: string, init: RequestInit) => Promise<Response>;
+const ALL_REGIONS = Object.keys(SNS_ORIGINS);
+
+// One bounded GET on a constant SNS origin: no redirects, no credentials, a deadline and a byte cap.
+async function snsGet(url: string, send: SnsFetch, timeoutMs: number, maxBytes: number): Promise<string> {
+  const signal = AbortSignal.timeout(timeoutMs);
+  const response = await send(url, { method: 'GET', redirect: 'error', credentials: 'omit', signal });
+  if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error('The SNS request failed.'); }
+  return readResponseText(response, { maxBytes, signal, contentLength: 'limit' });
+}
+
+/**
+ * A `fetchCertificate` for `verifySnsMessage`: one bounded GET per certificate URL, cached for the process. A URL that
+ * failed is not fetched again for `failureBackoffMs`, and `admit` (an app's budget) is asked before every network fetch,
+ * so unverified traffic cannot drive repeated requests to AWS. Only certificate URLs on an SNS origin are fetched.
+ * Each map is cleared when it reaches its limit, which keeps memory bounded without an eviction policy.
+ */
+export function createSnsCertificateFetcher({ fetch: send = globalThis.fetch, timeoutMs = 5000, maxBytes = 16_384, maxEntries = 16, failureBackoffMs = 60_000, admit, now = Date.now }: {
+  fetch?: SnsFetch; timeoutMs?: number; maxBytes?: number; maxEntries?: number; failureBackoffMs?: number;
+  admit?(): boolean | Promise<boolean>; now?(): number;
+} = {}): (url: string) => Promise<string> {
+  for (const value of [timeoutMs, maxBytes, maxEntries]) if (!Number.isSafeInteger(value) || value < 1) configError();
+  if (!Number.isSafeInteger(failureBackoffMs) || failureBackoffMs < 0 || typeof send !== 'function') configError();
+  const certificates = new Map<string, string>();
+  const failedUntil = new Map<string, number>();
+  return async url => {
+    const target = snsRegion(url, ALL_REGIONS);
+    if (!target || target.url.search || !/^\/[A-Za-z0-9_-]{1,128}\.pem$/.test(target.url.pathname)) throw new Error('Not an SNS certificate URL.');
+    const key = target.url.href;
+    const cached = certificates.get(key);
+    if (cached !== undefined) return cached;
+    if ((failedUntil.get(key) ?? 0) > now()) throw new Error('The certificate failed recently.');
+    if (admit && !await admit()) throw new Error('The certificate budget is exhausted.');
+    try {
+      const pem = await snsGet(key, send, timeoutMs, maxBytes);
+      if (certificates.size >= maxEntries) certificates.clear();
+      certificates.set(key, pem);
+      return pem;
+    } catch (error) {
+      if (failedUntil.size >= 256) failedUntil.clear();
+      failedUntil.set(key, now() + failureBackoffMs);
+      throw error;
+    }
+  };
+}
+
+/**
+ * The HTTP status for a refused message: 503 when the signing certificate could not be fetched, which may be a genuine
+ * delivery during an outage or a spent budget, so SNS retries it; 403 for every other refusal, which SNS does not retry.
+ */
+export function snsRefusalStatus(reason: SnsRejection): 403 | 503 {
+  return reason === 'certificate-unavailable' ? 503 : 403;
+}
+
+/**
+ * Confirms a subscription by fetching the `subscribeUrl` that `verifySnsMessage` returned for a verified
+ * SubscriptionConfirmation. Throws when the URL is not an SNS ConfirmSubscription URL or SNS does not answer 2xx;
+ * answer 503 then, so SNS sends the confirmation again.
+ */
+export async function confirmSnsSubscription(subscribeUrl: string, { fetch: send = globalThis.fetch, timeoutMs = 5000 }: { fetch?: SnsFetch; timeoutMs?: number } = {}): Promise<void> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || typeof send !== 'function') configError();
+  const target = typeof subscribeUrl === 'string' ? snsRegion(subscribeUrl, ALL_REGIONS) : null;
+  if (!target || target.url.pathname !== '/' || target.url.searchParams.get('Action') !== 'ConfirmSubscription') throw new Error('Not an SNS subscription confirmation URL.');
+  await snsGet(target.url.href, send, timeoutMs, 16_384);
 }

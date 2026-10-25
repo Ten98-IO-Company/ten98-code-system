@@ -102,7 +102,10 @@
         "readJsonBody",
         "providerFetchJson",
         "normalizePublicHostname",
-        "sendCloudflareEmail"
+        "sendCloudflareEmail",
+        "createSnsCertificateFetcher",
+        "snsRefusalStatus",
+        "confirmSnsSubscription"
       ],
       "tests": [
         "tests/runtime.test.mts",
@@ -120,10 +123,11 @@
         "tests/browser-entry.test.mts",
         "tests/provider-fetch.test.mts",
         "tests/public-hostname.test.mts",
-        "tests/cloudflare-email.test.mts"
+        "tests/cloudflare-email.test.mts",
+        "tests/sns-fetcher.test.mts"
       ],
       "boundary": "Reusable primitives only. These exports do not implement complete authentication, provider accounting or workspace persistence.",
-      "version": "v0.15.1"
+      "version": "v0.16.0"
     },
     "presentation": {
       "package": "@ten98/ui",
