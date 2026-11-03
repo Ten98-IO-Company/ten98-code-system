@@ -115,7 +115,12 @@
         "isTeamError",
         "parseShopifyCrawlerAccess",
         "shopifyCrawlerHeadersFor",
-        "verifyShopifyCrawlerAccess"
+        "verifyShopifyCrawlerAccess",
+        "addressKey",
+        "publicNetworkAddress",
+        "pinnedNetworkPeer",
+        "resolveNetworkHost",
+        "normalizeLighthouseReport"
       ],
       "tests": [
         "tests/runtime.test.mts",
@@ -138,10 +143,12 @@
         "tests/migrate-deadline.test.mts",
         "tests/csv.test.mts",
         "tests/workspace-team.test.mts",
-        "tests/shopify-crawler-access.test.mts"
+        "tests/shopify-crawler-access.test.mts",
+        "tests/public-network.test.mts",
+        "tests/lighthouse-report.test.mts"
       ],
-      "boundary": "Reusable mechanisms. Apps keep their routes, transactions and provider accounting; createWorkspaceTeam runs inside the app's transaction over the shipped workspace-team.sql schema. The separate auth entry holds the identity policy. Shopify exports parse and verify supplied signature bytes and select fixed same-origin headers only; apps retain key lookup, encrypted storage, current authority, domain proof, request identity, queueing, rotation and crawl transport.",
-      "version": "v0.21.0"
+      "boundary": "Reusable mechanisms. Apps keep their routes, transactions and provider accounting; createWorkspaceTeam runs inside the app's transaction over the shipped workspace-team.sql schema. The separate auth entry holds the identity policy. Shopify exports parse and verify supplied signature bytes and select fixed same-origin headers only; apps retain key lookup, encrypted storage, current authority, domain proof, request identity, queueing, rotation and crawl transport. Public-network primitives classify addresses, compare socket peers and resolve both DNS families; callers retain complete-answer admission, connection pinning and authorization. Lighthouse normalization handles bounded supplied reports only; apps own execution, request identity, storage and UI.",
+      "version": "v0.22.0"
     },
     "auth": {
       "package": "@ten98/runtime",

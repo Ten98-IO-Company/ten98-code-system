@@ -15,3 +15,6 @@ declare const nodeShopifyKey: Omit<CryptoKey, 'usages'> & { usages: ('verify' | 
 declare const browserShopifyKey: CryptoKey;
 export const nodeShopifyVerification = current.verifyShopifyCrawlerAccess({}, nodeShopifyKey);
 export const browserShopifyVerification = current.verifyShopifyCrawlerAccess({}, browserShopifyKey);
+
+export const resolveNetworkHostType: (hostname: string, signal: AbortSignal) => Promise<current.NetworkAddress[]> = current.resolveNetworkHost;
+export const normalizeLighthouseReportType: (raw: unknown, expectedUrl: string) => current.NormalizedLighthouseReport | null = current.normalizeLighthouseReport;

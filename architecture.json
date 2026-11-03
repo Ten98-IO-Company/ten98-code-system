@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.21.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.22.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -655,7 +655,11 @@
           "database-policy.mjs": "Generated internal database-policy checker from checked src/database-policy.mts.",
           "database-policy.d.mts": "Generated declarations for the internal database-policy checker.",
           "shopify-crawler-access.mjs": "Generated runtime executable from src/shopify-crawler-access.mts, re-exported by index.mjs.",
-          "shopify-crawler-access.d.mts": "Generated declarations from src/shopify-crawler-access.mts."
+          "shopify-crawler-access.d.mts": "Generated declarations from src/shopify-crawler-access.mts.",
+          "public-network.mjs": "Generated runtime executable from src/public-network.mts, re-exported by index.mjs.",
+          "public-network.d.mts": "Generated declarations from src/public-network.mts.",
+          "lighthouse-report.mjs": "Generated runtime executable from src/lighthouse-report.mts, re-exported by index.mjs.",
+          "lighthouse-report.d.mts": "Generated declarations from src/lighthouse-report.mts."
         },
         "compilerProjects": [
           "tsconfig.json",

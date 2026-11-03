@@ -2,6 +2,8 @@
 
 The Shopify crawler-access wire format and signature-base implementation adapt the MIT-licensed OpenSEO implementation at [every-app/open-seo@89e5a00717cdf049b7c2b4e29646edb3a7d4995b](https://github.com/every-app/open-seo/tree/89e5a00717cdf049b7c2b4e29646edb3a7d4995b), specifically src/shared/crawler-access.ts and src/server/features/audit/services/shopifySignature.ts. Ten98 adds strict bounded parsing and exact-origin selection; application credential and request lifecycles are separate.
 
+The local Lighthouse report normalizer adapts metric mappings, severity thresholds and compact issue/detail projection from the same OpenSEO commit's `src/server/lib/lighthouseStoredPayload.ts`. Ten98 adds requested-URL binding, bounded scalar-only details, explicit missing/error/truncation evidence and local Lighthouse 13.6.0 report validation. Provider billing fields are omitted. The upstream MIT notice below applies to both adaptations. The local report contract was checked against [GoogleChrome/lighthouse@edc407d72179bbc4d4de8a40ef0311ca87dff89c](https://github.com/GoogleChrome/lighthouse/tree/edc407d72179bbc4d4de8a40ef0311ca87dff89c); this runtime package does not bundle Lighthouse or Chromium.
+
 MIT License
 
 Copyright (c) 2026 Ben Senescu
