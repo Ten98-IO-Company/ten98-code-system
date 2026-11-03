@@ -112,7 +112,10 @@
         "toCsv",
         "createWorkspaceTeam",
         "TeamError",
-        "isTeamError"
+        "isTeamError",
+        "parseShopifyCrawlerAccess",
+        "shopifyCrawlerHeadersFor",
+        "verifyShopifyCrawlerAccess"
       ],
       "tests": [
         "tests/runtime.test.mts",
@@ -134,10 +137,11 @@
         "tests/sns-fetcher.test.mts",
         "tests/migrate-deadline.test.mts",
         "tests/csv.test.mts",
-        "tests/workspace-team.test.mts"
+        "tests/workspace-team.test.mts",
+        "tests/shopify-crawler-access.test.mts"
       ],
-      "boundary": "Reusable mechanisms. Apps keep their routes, transactions and provider accounting; createWorkspaceTeam runs inside the app's transaction over the shipped workspace-team.sql schema. The separate auth entry holds the identity policy.",
-      "version": "v0.20.0"
+      "boundary": "Reusable mechanisms. Apps keep their routes, transactions and provider accounting; createWorkspaceTeam runs inside the app's transaction over the shipped workspace-team.sql schema. The separate auth entry holds the identity policy. Shopify exports parse and verify supplied signature bytes and select fixed same-origin headers only; apps retain key lookup, encrypted storage, current authority, domain proof, request identity, queueing, rotation and crawl transport.",
+      "version": "v0.21.0"
     },
     "auth": {
       "package": "@ten98/runtime",

@@ -78,3 +78,4 @@ export * from './workspace-team.mjs';
 export * from './cloudflare-email.mjs';
 export * from './public-hostname.mjs';
 export * from './provider-fetch.mjs';
+export * from './shopify-crawler-access.mjs';
