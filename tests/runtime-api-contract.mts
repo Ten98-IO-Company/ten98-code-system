@@ -9,3 +9,12 @@ export type PublicRoleUnchanged = Assert<Equal<current.WorkspaceRole, previous.W
 interface PgLikeClient { query<R extends { [column: string]: any } = any>(text: string, values?: unknown[]): Promise<{ rows: R[]; rowCount: number | null }> }
 declare const pgClient: PgLikeClient;
 export const pgClientIsMigrationClient: current.MigrationClient = pgClient;
+
+// Node's current and future usage union can be wider than the DOM CryptoKey usage union.
+declare const nodeShopifyKey: Omit<CryptoKey, 'usages'> & { usages: ('verify' | 'encapsulateBits')[] };
+declare const browserShopifyKey: CryptoKey;
+export const nodeShopifyVerification = current.verifyShopifyCrawlerAccess({}, nodeShopifyKey);
+export const browserShopifyVerification = current.verifyShopifyCrawlerAccess({}, browserShopifyKey);
+
+export const resolveNetworkHostType: (hostname: string, signal: AbortSignal) => Promise<current.NetworkAddress[]> = current.resolveNetworkHost;
+export const normalizeLighthouseReportType: (raw: unknown, expectedUrl: string) => current.NormalizedLighthouseReport | null = current.normalizeLighthouseReport;

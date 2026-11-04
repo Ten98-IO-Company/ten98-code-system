@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.20.0",
+  "version": "0.22.0",
   "packageManager": "pnpm@11.19.0",
   "description": "Shared HTTP, provider, email, migration, OIDC and identity primitives for ten98 applications",
   "type": "module",
@@ -80,7 +80,17 @@
     "database-policy.mjs",
     "database-policy.d.mts",
     "src/database-policy.mts",
-    "src/check.mts"
+    "src/check.mts",
+    "shopify-crawler-access.mjs",
+    "shopify-crawler-access.d.mts",
+    "src/shopify-crawler-access.mts",
+    "THIRD_PARTY_NOTICES.md",
+    "public-network.mjs",
+    "public-network.d.mts",
+    "src/public-network.mts",
+    "lighthouse-report.mjs",
+    "lighthouse-report.d.mts",
+    "src/lighthouse-report.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
