@@ -39,9 +39,9 @@ export async function probe(input: Probe) {
   }
   if (input.kind === 'tcp') {
     const { createConnection } = await import('node:net');
-    return await new Promise<{ ok: boolean; nonce: string }>(resolve => {
+    return await new Promise<{ ok: boolean; nonce: string; peer?: string }>(resolve => {
       const socket = createConnection({ host: input.host, port: input.port });
-      const finish = (ok: boolean) => { socket.destroy(); resolve({ ok, nonce: input.nonce }); };
+      const finish = (ok: boolean) => { const peer = socket.remoteAddress; socket.destroy(); resolve({ ok, nonce: input.nonce, peer }); };
       socket.setTimeout(500, () => finish(false)); socket.once('error', () => finish(false));
       socket.once('connect', () => socket.write(input.nonce));
       socket.once('data', data => finish(data.toString() === input.nonce));
@@ -56,4 +56,28 @@ export async function probe(input: Probe) {
     socket.once('error', () => finish(false)); socket.once('message', data => finish(data.toString() === input.nonce));
     socket.send(input.nonce, input.port, input.host);
   });
+}
+
+/** Fixed CI evidence only: no permission changes, caller paths, symlinks or unbounded reads. */
+export async function printLinuxEvidence() {
+  if (process.platform !== 'linux' || process.getuid?.() !== 0 || process.env.GITHUB_ACTIONS !== 'true'
+    || process.env.RUNNER_ENVIRONMENT !== 'github-hosted') throw Error('hosted-root-reader-required');
+  const fs = await import('node:fs'), path = await import('node:path');
+  const dir = path.resolve('work/d9-linux-proof');
+  if (!fs.existsSync(dir)) return;
+  const parent = fs.lstatSync(dir);
+  if (!parent.isDirectory() || parent.uid !== 0 || fs.realpathSync(dir) !== dir) throw Error('invalid-evidence-directory');
+  for (const name of ['result.json', 'lease.json']) {
+    let fd: number;
+    try { fd = fs.openSync(path.join(dir, name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.uid !== 0 || stat.size > 65536 || (stat.mode & 0o022) !== 0
+        || (name === 'lease.json' && (stat.mode & 0o777) !== 0o600)) throw Error('invalid-evidence-file');
+      const buffer = Buffer.alloc(65537), length = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      if (length > 65536 || length !== stat.size) throw Error('evidence-size-changed');
+      console.log(name + ': ' + JSON.stringify(JSON.parse(buffer.subarray(0, length).toString('utf8'))));
+    } finally { fs.closeSync(fd); }
+  }
 }

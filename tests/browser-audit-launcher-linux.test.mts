@@ -6,7 +6,7 @@ import { closeSync, existsSync, fstatSync, mkdirSync, readFileSync, readdirSync,
 import { createBrowserAuditNetworkAdapter, pinBrowserAuditNetwork } from '../browser-audit-launcher-network.mjs';
 import type { BrowserAuditContainerIdentity } from '../browser-audit-launcher-network.mjs';
 import type * as LinuxFixture from './fixtures/browser-audit/launcher-linux.mts';
-const { image, canary, probe } = await import(new URL('./fixtures/browser-audit/launcher-linux.mts', import.meta.url).href) as typeof LinuxFixture;
+const { image, canary, probe, printLinuxEvidence } = await import(new URL('./fixtures/browser-audit/launcher-linux.mts', import.meta.url).href) as typeof LinuxFixture;
 import type { Probe } from './fixtures/browser-audit/launcher-linux.mts';
 
 const dir = 'work/d9-linux-proof', leasePath = dir + '/lease.json';
@@ -68,6 +68,9 @@ if (process.env.TEN98_LINUX_CLEANUP === '1') {
     assert.doesNotThrow(() => new Function('return (' + canary.toString() + ')'));
     assert.doesNotThrow(() => new Function('return (' + probe.toString() + ')'));
   });
+  test('evidence reader refuses a caller outside the hosted root boundary', {
+    skip: process.platform === 'linux' && process.getuid?.() === 0 && process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_ENVIRONMENT === 'github-hosted',
+  }, async () => { await assert.rejects(printLinuxEvidence(), /hosted-root-reader-required/); });
   test('native Linux namespace policy: actual adapter, traffic, refusals and cleanup', {
   skip: !enabled && 'set TEN98_LINUX_PROOF=1 only in the disposable hosted Linux job', timeout: 120_000,
 }, async () => {
@@ -97,7 +100,7 @@ if (process.env.TEN98_LINUX_CLEANUP === '1') {
     const ids: string[] = [];
     for (const [index, role] of (['worker', 'capsule'] as const).entries()) {
       const id = await docker('create', '--name', names[index]!, '--network', networkId, '--network-alias', role,
-        '--ip', '172.30.98.' + (index + 2), '--read-only', '--user', '65532:65532', '--cap-drop', 'ALL',
+        '--ip', '172.30.98.' + (index + 2), ...(role === 'capsule' ? ['--add-host', 'worker:172.30.98.2'] : []), '--read-only', '--user', '65532:65532', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges', '--restart', 'no', '--pids-limit', '32', '--memory', '128m', '--cpus', '0.5',
         '--sysctl', 'net.ipv4.ip_unprivileged_port_start=0', '--sysctl', 'net.ipv6.conf.all.disable_ipv6=0',
         '--label', 'io.ten98.installation=' + installation, '--label', 'io.ten98.operation=' + operation,
@@ -149,14 +152,15 @@ if (process.env.TEN98_LINUX_CLEANUP === '1') {
         '(' + probe.toString() + ')(' + JSON.stringify(input) + ').then(x=>console.log(JSON.stringify(x)))'));
       (evidence.probes as unknown[]).push({ ...input, source: id === capsule ? 'capsule' : 'worker', wanted, actual });
       assert.equal(actual.nonce, input.nonce); assert.equal(actual.ok, wanted, kind + ' ' + host + ':' + port);
+      if (host === 'worker' && wanted) assert.equal(actual.peer, '172.30.98.2', 'static worker hostname identity');
       if (kind !== 'dns') {
-        const target = host === '172.30.98.2' ? worker : capsule;
+        const target = host === '172.30.98.2' || host === 'worker' ? worker : capsule;
         const logs = await docker('logs', target);
         assert.equal(logs.includes(input.nonce), wanted, 'receiver nonce evidence');
       }
     }
     const cases: [string, Probe['kind'], string, number, boolean][] = [
-      [capsule, 'tcp', '172.30.98.2', 3138, true], [worker, 'tcp', '172.30.98.3', 9223, true],
+      [capsule, 'tcp', 'worker', 3138, true], [capsule, 'tcp', '172.30.98.2', 3138, true], [worker, 'tcp', '172.30.98.3', 9223, true],
       [capsule, 'tcp', '127.0.0.1', 9222, true], [capsule, 'tcp', '172.30.98.2', 3139, false],
       [worker, 'tcp', '172.30.98.3', 9224, false], [capsule, 'tcp', '127.0.0.1', 9221, false],
       [capsule, 'tcp', '172.30.98.2', 53, false], [capsule, 'udp', '172.30.98.2', 53, false],
@@ -169,7 +173,13 @@ if (process.env.TEN98_LINUX_CLEANUP === '1') {
       const pin = await pinBrowserAuditNetwork(expected, adapter); pins.push(pin);
       await pin.apply(); await pin.verify(); return pin;
     }
-    let pin = await apply();
+    assert.notEqual(String(evidence.beforeNft).trim(), '', 'native fixture must exercise Docker DNS bootstrap');
+    const unprepared = await pinBrowserAuditNetwork(expected, adapter); pins.push(unprepared);
+    await assert.rejects(unprepared.apply()); evidence.unpreparedApplyRejected = true;
+    let pin = await pinBrowserAuditNetwork(expected, adapter); pins.push(pin);
+    evidence.dnsPreparation = await pin.prepareDockerDns();
+    assert.deepEqual(evidence.dnsPreparation, { removed: true });
+    await pin.apply(); await pin.verify();
     evidence.applied = { ipv4: await inCapsule('/usr/sbin/iptables-legacy-save', []), ipv6: await inCapsule('/usr/sbin/ip6tables-legacy-save', []) };
     for (const [id, kind, host, port, wanted] of cases) await exchange(id, kind, host, port, wanted);
     const weakened = pin.policy.ipv4.replace('COMMIT',

@@ -43,6 +43,5 @@ jobs:
       - name: Show bounded native evidence
         if: always()
         run: |
-          if test -f work/d9-linux-proof/result.json; then cat work/d9-linux-proof/result.json; fi
-          if test -f work/d9-linux-proof/lease.json; then cat work/d9-linux-proof/lease.json; fi
+          sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT timeout 3s "$(command -v node)" --input-type=module -e "import{printLinuxEvidence}from'./tests/fixtures/browser-audit/launcher-linux.mts';await printLinuxEvidence();"
           git diff --exit-code

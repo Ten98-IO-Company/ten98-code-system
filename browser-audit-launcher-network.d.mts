@@ -53,6 +53,9 @@ export declare function createBrowserAuditNetworkAdapter(inspect: BrowserAuditNe
 /** The passive gate must remain closed until apply() and the caller's final verify() both succeed. */
 export declare function pinBrowserAuditNetwork(expected: BrowserAuditNetworkIdentity, adapter: BrowserAuditNetworkAdapter): Promise<{
     policy: BrowserAuditNetworkPolicy;
+    prepareDockerDns: () => Promise<{
+        removed: boolean;
+    }>;
     apply: () => Promise<{
         policySha256: string;
         namespace: {

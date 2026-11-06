@@ -180,3 +180,79 @@ test('requires NAT in both families and rejects unknown or nonempty ancillary ta
   assert.throws(() => verifyBrowserAuditNetworkPolicy(f.policy, f.policy.ipv4 + empty('unknown', ['OUTPUT']), f.policy.ipv6, ''));
   assert.throws(() => verifyBrowserAuditNetworkPolicy(f.policy, f.policy.ipv4 + empty('nat', ['OUTPUT']), f.policy.ipv6, ''));
 });
+
+// Captured from Docker 28.0.4 in Linux run 42205393317, independent of the recognizer.
+const dockerDns = "table ip nat {\n chain DOCKER_OUTPUT {\n  ip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:36941\n  ip daddr 127.0.0.11 udp dport 53 counter packets 1 bytes 52 dnat to 127.0.0.11:54197\n }\n chain OUTPUT {\n  type nat hook output priority -100; policy accept;\n  ip daddr 127.0.0.11 counter packets 1 bytes 52 jump DOCKER_OUTPUT\n }\n chain DOCKER_POSTROUTING {\n  ip saddr 127.0.0.11 tcp sport 36941 counter packets 0 bytes 0 snat to :53\n  ip saddr 127.0.0.11 udp sport 54197 counter packets 0 bytes 0 snat to :53\n }\n chain POSTROUTING {\n  type nat hook postrouting priority 100; policy accept;\n  ip daddr 127.0.0.11 counter packets 1 bytes 52 jump DOCKER_POSTROUTING\n }\n}";
+
+function dnsFixture(initial = dockerDns) {
+  const f = fixture(), execute = f.adapter.execute; let nft = initial;
+  f.adapter.execute = async c => {
+    if (c.args[2] !== '/usr/sbin/nft') return execute(c);
+    f.commands.push(c);
+    if (JSON.stringify(c.args.slice(3)) === JSON.stringify(['delete', 'table', 'ip', 'nat'])) { nft = ''; return ''; }
+    assert.deepEqual(c.args.slice(3), ['-n', 'list', 'ruleset']); return nft;
+  };
+  return { ...f, get nft() { return nft; }, set nft(value: string) { nft = value; } };
+}
+const deletions = (commands: BrowserAuditNamespaceCommand[]) => commands.filter(c => c.args[3] === 'delete');
+test('explicit DNS preparation removes only the captured profile, then strict apply and verify succeed', async () => {
+  const f = dnsFixture(), pin = await pinBrowserAuditNetwork(f.expected, f.adapter);
+  assert.deepEqual(await pin.prepareDockerDns(), { removed: true });
+  assert.equal(deletions(f.commands).length, 1); assert.equal(deletions(f.commands)[0]!.fd, 17);
+  assert.deepEqual(deletions(f.commands)[0]!.args, ['--net=/proc/self/fd/3', '--', '/usr/sbin/nft', 'delete', 'table', 'ip', 'nat']);
+  await pin.apply(); await pin.verify();
+  f.nft = dockerDns; await assert.rejects(pin.verify());
+  assert.equal(deletions(f.commands).length, 1); assert.deepEqual(f.closed, [17]);
+});
+test('empty DNS preparation is inert and tolerates changed counters and valid dynamic ports', async () => {
+  for (const rules of ['', dockerDns.replaceAll('36941', '65535').replaceAll('54197', '1024').replaceAll('packets 1 bytes 52', 'packets 99 bytes 999')]) {
+    const f = dnsFixture(rules), pin = await pinBrowserAuditNetwork(f.expected, f.adapter);
+    assert.deepEqual(await pin.prepareDockerDns(), { removed: rules !== '' });
+    assert.equal(deletions(f.commands).length, rules === '' ? 0 : 1); pin.close();
+  }
+});
+for (const operation of ['apply', 'verify'] as const) test(operation + ' never implicitly prepares Docker DNS', async () => {
+  const f = dnsFixture(), pin = await pinBrowserAuditNetwork(f.expected, f.adapter);
+  await assert.rejects(pin[operation]()); assert.equal(deletions(f.commands).length, 0); assert.deepEqual(f.closed, [17]);
+});
+for (const first of ['prepareDockerDns', 'apply', 'verify'] as const) test('preparation is forbidden after ' + first, async () => {
+  const f = dnsFixture(''), pin = await pinBrowserAuditNetwork(f.expected, f.adapter);
+  await pin[first](); const count = f.commands.length;
+  await assert.rejects(pin.prepareDockerDns()); assert.equal(f.commands.length, count); assert.deepEqual(f.closed, [17]);
+});
+for (const [name, rules] of Object.entries({
+  extraTable: dockerDns + '\ntable inet other {}', extraChain: dockerDns.replace('chain OUTPUT', 'chain UNKNOWN {} chain OUTPUT'),
+  extraRule: dockerDns.replace('chain DOCKER_OUTPUT {', 'chain DOCKER_OUTPUT { counter accept'),
+  wrongFamily: dockerDns.replace('table ip nat', 'table ip6 nat'), wrongTable: dockerDns.replace('table ip nat', 'table ip other'),
+  wrongAddress: dockerDns.replaceAll('127.0.0.11', '169.254.169.254'),
+  mismatch: dockerDns.replace('tcp sport 36941', 'tcp sport 36942'),
+  hook: dockerDns.replace('hook output', 'hook input'), priority: dockerDns.replace('priority -100', 'priority -101'),
+  missing: dockerDns.replace('ip daddr 127.0.0.11 counter packets 1 bytes 52 jump DOCKER_OUTPUT', ''),
+  invalidPort: dockerDns.replaceAll('36941', '65536'), reservedPort: dockerDns.replaceAll('36941', '53'),
+  leadingZero: dockerDns.replaceAll('36941', '036941'), wrongProtocol: dockerDns.replace('udp dport', 'tcp dport'),
+})) test('unknown DNS profile rejects before mutation: ' + name, async () => {
+  const f = dnsFixture(rules), pin = await pinBrowserAuditNetwork(f.expected, f.adapter);
+  await assert.rejects(pin.prepareDockerDns()); assert.equal(deletions(f.commands).length, 0);
+  assert(f.commands.every(c => c.args[3] === '-n')); assert.deepEqual(f.closed, [17]);
+});
+for (const kind of ['changed-profile', 'changed-identity', 'delete-failure', 'not-empty-after-delete']) test('DNS preparation fails closed: ' + kind, async () => {
+  const f = dnsFixture(), execute = f.adapter.execute; let reads = 0;
+  f.adapter.execute = async c => {
+    if (c.args[3] === 'delete' && kind === 'delete-failure') throw Error('failed deletion');
+    const result = await execute(c);
+    if (c.args[3] === '-n' && ++reads === 1) {
+      if (kind === 'changed-profile') f.nft = dockerDns.replaceAll('36941', '36942');
+      if (kind === 'changed-identity') f.observed.capsule.restartCount++;
+    }
+    if (c.args[3] === 'delete' && kind === 'not-empty-after-delete') f.nft = 'table inet other {}';
+    return result;
+  };
+  const pin = await pinBrowserAuditNetwork(f.expected, f.adapter);
+  await assert.rejects(pin.prepareDockerDns()); assert.deepEqual(f.closed, [17]);
+  if (kind.startsWith('changed-')) assert.equal(deletions(f.commands).length, 0);
+});
+test('DNS preparation refuses a restarted capsule even when its expected identity matches', async () => {
+  const f = dnsFixture(); f.expected.capsule.restartCount = 1; f.observed.capsule.restartCount = 1;
+  const pin = await pinBrowserAuditNetwork(f.expected, f.adapter);
+  await assert.rejects(pin.prepareDockerDns()); assert.equal(f.commands.length, 0); assert.deepEqual(f.closed, [17]);
+});

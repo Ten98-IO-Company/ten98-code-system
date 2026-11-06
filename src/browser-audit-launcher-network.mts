@@ -135,13 +135,34 @@ function fingerprint(value: BrowserAuditNetworkIdentity) {
     ordered(c.labels), Object.entries(c.networks).sort(([a], [b]) => a.localeCompare(b)).map(([id, a]) => [id, a.ipv4, a.ipv6])])]);
 }
 function stamp(stat: { dev: bigint; ino: bigint }): BrowserAuditNamespaceIdentity { return { dev: String(stat.dev), ino: String(stat.ino) }; }
+// Docker 28.0.4 resolver profile (libnetwork/resolver_unix.go); counters are observational only.
+function dockerDnsProfile(value: string): string | undefined {
+  const normalized = value.replace(/\s+/g, ' ').trim().replace(/counter packets [0-9]+ bytes [0-9]+/g, 'counter');
+  const ports = [...normalized.matchAll(/dnat to 127\.0\.0\.11:([1-9][0-9]{0,4})/g)].map(match => match[1]!);
+  if (ports.length !== 2 || ports.some(port => Number(port) < 1024 || Number(port) > 65535)) return;
+  const [tcp, udp] = ports;
+  const expected = [
+    'table ip nat { chain DOCKER_OUTPUT {',
+    'ip daddr 127.0.0.11 tcp dport 53 counter dnat to 127.0.0.11:' + tcp,
+    'ip daddr 127.0.0.11 udp dport 53 counter dnat to 127.0.0.11:' + udp,
+    '} chain OUTPUT { type nat hook output priority -100; policy accept;',
+    'ip daddr 127.0.0.11 counter jump DOCKER_OUTPUT',
+    '} chain DOCKER_POSTROUTING {',
+    'ip saddr 127.0.0.11 tcp sport ' + tcp + ' counter snat to :53',
+    'ip saddr 127.0.0.11 udp sport ' + udp + ' counter snat to :53',
+    '} chain POSTROUTING { type nat hook postrouting priority 100; policy accept;',
+    'ip daddr 127.0.0.11 counter jump DOCKER_POSTROUTING } }',
+  ].join(' ');
+  return normalized === expected ? normalized : undefined;
+}
 function nativeExecute(command: BrowserAuditNamespaceCommand): Promise<string> {
   const tool = command.args[2];
   if (!['/usr/sbin/iptables-legacy-restore', '/usr/sbin/ip6tables-legacy-restore', '/usr/sbin/iptables-legacy-save', '/usr/sbin/ip6tables-legacy-save', '/usr/sbin/nft'].includes(tool ?? '')) throw failure();
   const restore = tool!.endsWith('-restore');
+  const suffixes = tool === '/usr/sbin/nft' ? [['-n', 'list', 'ruleset'], ['delete', 'table', 'ip', 'nat']] : [restore ? ['--wait', '2'] : []];
   if (command.executable !== '/usr/bin/nsenter' || command.shell !== false || command.timeoutMs !== 2000 || command.maxOutputBytes !== 65536
     || !Number.isSafeInteger(command.fd) || command.fd < 3 || typeof command.input !== 'string' || Buffer.byteLength(command.input) > 4096
-    || (!restore && command.input !== '') || JSON.stringify(command.args) !== JSON.stringify(['--net=/proc/self/fd/3', '--', tool, ...(tool === '/usr/sbin/nft' ? ['-n', 'list', 'ruleset'] : restore ? ['--wait', '2'] : [])])) throw failure();
+    || (!restore && command.input !== '') || !suffixes.some(suffix => JSON.stringify(command.args) === JSON.stringify(['--net=/proc/self/fd/3', '--', tool, ...suffix]))) throw failure();
   const target = stamp(fstatSync(command.fd, { bigint: true }));
   if (['self', '1'].some(pid => equalNamespace(target, stamp(statSync(`/proc/${pid}/ns/net`, { bigint: true }))))) throw failure();
   return new Promise((resolve, reject) => {
@@ -181,7 +202,7 @@ export async function pinBrowserAuditNetwork(expected: BrowserAuditNetworkIdenti
   const identity = structuredClone(expected); validateIdentity(identity);
   const expectedFingerprint = fingerprint(identity);
   const policy = createBrowserAuditNetworkPolicy(identity.capsule.networks[identity.networkId]!.ipv4, identity.worker.networks[identity.networkId]!.ipv4);
-  let fd: number | undefined, pinned: BrowserAuditNamespaceIdentity | undefined, closed = false, busy = false;
+  let fd: number | undefined, pinned: BrowserAuditNamespaceIdentity | undefined, closed = false, busy = false, preparationAvailable = true;
   function close() {
     if (busy) throw failure();
     if (!closed) { closed = true; if (fd !== undefined) adapter.close(fd); }
@@ -206,18 +227,38 @@ export async function pinBrowserAuditNetwork(expected: BrowserAuditNetworkIdenti
     if (!Number.isSafeInteger(fd) || fd < 3) { const invalid = fd; fd = undefined; if (Number.isSafeInteger(invalid) && invalid >= 0) adapter.close(invalid); throw failure(); }
     await check();
   } catch { close(); throw failure(); }
-  async function command(tool: 'iptables-legacy-restore' | 'ip6tables-legacy-restore' | 'iptables-legacy-save' | 'ip6tables-legacy-save' | 'nft', input = '') {
+  async function command(tool: 'iptables-legacy-restore' | 'ip6tables-legacy-restore' | 'iptables-legacy-save' | 'ip6tables-legacy-save' | 'nft', input = '', operation: 'read' | 'removeDockerDns' = 'read') {
     await check();
     const restore = tool.endsWith('-restore');
     const output = await adapter.execute(Object.freeze({ executable: '/usr/bin/nsenter',
-      args: Object.freeze(['--net=/proc/self/fd/3', '--', `/usr/sbin/${tool}`, ...(tool === 'nft' ? ['-n', 'list', 'ruleset'] : restore ? ['--wait', '2'] : [])]),
+      args: Object.freeze(['--net=/proc/self/fd/3', '--', `/usr/sbin/${tool}`, ...(tool === 'nft' ? operation === 'removeDockerDns' ? ['delete', 'table', 'ip', 'nat'] : ['-n', 'list', 'ruleset'] : restore ? ['--wait', '2'] : [])]),
       fd: fd!, input, environment: Object.freeze({ PATH: '/usr/sbin:/usr/bin:/sbin:/bin', LANG: 'C', LC_ALL: 'C' }),
       timeoutMs: 2000, maxOutputBytes: 65536, shell: false }));
     if (typeof output !== 'string' || Buffer.byteLength(output) > 65_536) throw failure();
     await check(); return output;
   }
+  /** Once, before apply/verify, on a newly owned passive capsule under exclusive launcher control.
+   * The caller must serialize Docker/network changes and supply the static worker hosts entry.
+   * This is not recovery or an atomic defense against another privileged namespace writer. */
+  async function prepareDockerDns() {
+    if (closed || busy) throw failure();
+    if (!preparationAvailable) { close(); throw failure(); }
+    preparationAvailable = false; busy = true;
+    try {
+      if (identity.capsule.restartCount !== 0) throw failure();
+      const before = await command('nft');
+      if (before.trim() === '') return { removed: false };
+      const profile = dockerDnsProfile(before);
+      if (!profile || dockerDnsProfile(await command('nft')) !== profile) throw failure();
+      await command('nft', '', 'removeDockerDns');
+      if ((await command('nft')).trim() !== '') throw failure();
+      await check();
+      return { removed: true };
+    } catch { busy = false; close(); throw failure(); }
+    finally { busy = false; }
+  }
   async function perform(restore: boolean) {
-    if (closed || busy) throw failure(); busy = true;
+    if (closed || busy) throw failure(); preparationAvailable = false; busy = true;
     try {
       if (restore) { if ((await command('nft')).trim() !== '') throw failure(); await command('iptables-legacy-restore', policy.ipv4); await command('ip6tables-legacy-restore', policy.ipv6); }
       const ipv4 = await command('iptables-legacy-save'), ipv6 = await command('ip6tables-legacy-save');
@@ -226,5 +267,5 @@ export async function pinBrowserAuditNetwork(expected: BrowserAuditNetworkIdenti
     } catch { busy = false; close(); throw failure(); }
     finally { busy = false; }
   }
-  return { policy, apply: () => perform(true), verify: () => perform(false), close };
+  return { policy, prepareDockerDns, apply: () => perform(true), verify: () => perform(false), close };
 }
