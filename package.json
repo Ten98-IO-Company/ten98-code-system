@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "packageManager": "pnpm@11.19.0",
   "description": "Shared HTTP, provider, email, migration, OIDC and identity primitives for ten98 applications",
   "type": "module",
@@ -19,6 +19,14 @@
     "./auth": {
       "types": "./auth.d.mts",
       "import": "./auth.mjs"
+    },
+    "./browser-audit": {
+      "types": "./browser-audit.d.mts",
+      "import": "./browser-audit.mjs"
+    },
+    "./browser-audit-capsule": {
+      "types": "./browser-audit-capsule.d.mts",
+      "import": "./browser-audit-capsule.mjs"
     }
   },
   "files": [
@@ -58,6 +66,8 @@
     "LICENSE",
     "README.md",
     "architecture.json",
+    "features/catalog.json",
+    "docs/FEATURE-ADOPTION.md",
     "check.mjs",
     "check.d.mts",
     "src/index.mts",
@@ -90,7 +100,19 @@
     "src/public-network.mts",
     "lighthouse-report.mjs",
     "lighthouse-report.d.mts",
-    "src/lighthouse-report.mts"
+    "src/lighthouse-report.mts",
+    "browser-audit.mjs",
+    "browser-audit.d.mts",
+    "src/browser-audit.mts",
+    "browser-audit-control.mjs",
+    "browser-audit-control.d.mts",
+    "src/browser-audit-control.mts",
+    "browser-audit-egress.mjs",
+    "browser-audit-egress.d.mts",
+    "src/browser-audit-egress.mts",
+    "browser-audit-capsule.mjs",
+    "browser-audit-capsule.d.mts",
+    "src/browser-audit-capsule.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
