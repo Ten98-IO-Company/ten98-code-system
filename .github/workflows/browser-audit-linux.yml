@@ -1,0 +1,48 @@
+name: Browser audit Linux proof
+on:
+  push:
+    paths: ['.github/workflows/browser-audit-linux.yml', 'tests/browser-audit-launcher-linux.test.mts', 'tests/fixtures/browser-audit/launcher-linux.mts', 'src/browser-audit-launcher-*.mts', 'browser-audit-launcher-*.mjs', 'package.json', 'pnpm-lock.yaml']
+  pull_request:
+    paths: ['.github/workflows/browser-audit-linux.yml', 'tests/browser-audit-launcher-linux.test.mts', 'tests/fixtures/browser-audit/launcher-linux.mts', 'src/browser-audit-launcher-*.mts', 'browser-audit-launcher-*.mjs', 'package.json', 'pnpm-lock.yaml']
+permissions:
+  contents: read
+concurrency:
+  group: browser-audit-linux-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.1'
+          package-manager-cache: false
+      - run: timeout 120s npx --yes pnpm@11.19.0 install --frozen-lockfile
+      - name: Compile implementation and fixtures
+        run: |
+          timeout 120s npx --yes pnpm@11.19.0 exec tsc --project tsconfig.json
+          timeout 120s npx --yes pnpm@11.19.0 exec tsc --project tests/tsconfig.tests.json
+      - name: Pull the approved digest before starting the timed proof
+        run: |
+          node --input-type=module -e "import{execFileSync}from'node:child_process';import{image}from'./tests/fixtures/browser-audit/launcher-linux.mts';execFileSync('/usr/bin/docker',['--host','unix:///var/run/docker.sock','pull',image],{timeout:120000,stdio:'inherit'});"
+      - name: Native proof on disposable hosted VM
+        env:
+          TEN98_LINUX_PROOF: '1'
+        run: |
+          sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,TEN98_LINUX_PROOF timeout --signal=TERM --kill-after=5s 120s "$(command -v node)" --test --test-concurrency=1 tests/browser-audit-launcher-linux.test.mts
+      - name: Confirm owned resource cleanup even after test failure
+        if: always()
+        env:
+          TEN98_LINUX_CLEANUP: '1'
+        run: |
+          sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,TEN98_LINUX_CLEANUP timeout --signal=TERM --kill-after=5s 25s "$(command -v node)" tests/browser-audit-launcher-linux.test.mts
+      - name: Show bounded native evidence
+        if: always()
+        run: |
+          if test -f work/d9-linux-proof/result.json; then cat work/d9-linux-proof/result.json; fi
+          if test -f work/d9-linux-proof/lease.json; then cat work/d9-linux-proof/lease.json; fi
+          git diff --exit-code

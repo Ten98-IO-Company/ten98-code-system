@@ -667,7 +667,11 @@
           "browser-audit-egress.mjs": "Generated server-only executable from src/browser-audit-egress.mts; capsule runs only as an explicit process entrypoint.",
           "browser-audit-egress.d.mts": "Generated declarations from src/browser-audit-egress.mts.",
           "browser-audit-capsule.mjs": "Generated server-only executable from src/browser-audit-capsule.mts; capsule runs only as an explicit process entrypoint.",
-          "browser-audit-capsule.d.mts": "Generated declarations from src/browser-audit-capsule.mts."
+          "browser-audit-capsule.d.mts": "Generated declarations from src/browser-audit-capsule.mts.",
+          "browser-audit-launcher-gate.mjs": "Generated passive start-gate executable from src/browser-audit-launcher-gate.mts.",
+          "browser-audit-launcher-gate.d.mts": "Generated declarations from src/browser-audit-launcher-gate.mts.",
+          "browser-audit-launcher-network.mjs": "Generated pinned-namespace policy executable from src/browser-audit-launcher-network.mts.",
+          "browser-audit-launcher-network.d.mts": "Generated declarations from src/browser-audit-launcher-network.mts."
         },
         "compilerProjects": [
           "tsconfig.json",
