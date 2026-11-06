@@ -33,3 +33,4 @@ export * from './provider-fetch.mjs';
 export * from './shopify-crawler-access.mjs';
 export * from './public-network.mjs';
 export * from './lighthouse-report.mjs';
+export * from './openrouter-chat.mjs';

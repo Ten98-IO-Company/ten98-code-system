@@ -18,3 +18,8 @@ export const browserShopifyVerification = current.verifyShopifyCrawlerAccess({},
 
 export const resolveNetworkHostType: (hostname: string, signal: AbortSignal) => Promise<current.NetworkAddress[]> = current.resolveNetworkHost;
 export const normalizeLighthouseReportType: (raw: unknown, expectedUrl: string) => current.NormalizedLighthouseReport | null = current.normalizeLighthouseReport;
+
+export const readChatType: (message: unknown, finishReason: unknown, options: current.OpenRouterChatOptionsV1) => current.OpenRouterAssistantResultV1 = current.readOpenRouterAssistantMessageV1;
+export const validateChatHistoryType: (history: unknown, options: current.OpenRouterChatOptionsV1) => current.OpenRouterChatMessageV1[] = current.validateOpenRouterToolHistoryV1;
+export const chatOptions: current.OpenRouterChatOptionsV1 = { allowedToolNames: ['read_evidence'], maxContextBytes: 131072, maxArgumentBytes: 8192, maxMessageBytes: 2097152 };
+export const nativeToolResult: current.OpenRouterChatMessageV1 = { role: 'tool', tool_call_id: 'call_1', content: '{}' };
