@@ -32,4 +32,14 @@ test('the browser entry loads with every Node built-in blocked', () => {
   const refused = probe(new URL('../index.mjs', import.meta.url));
   assert.notEqual(refused.status, 0);
   assert.match(refused.stderr, /blocked node:/);
+  for (const file of ['browser-audit.mjs', 'browser-audit-capsule.mjs']) {
+    const serverOnly = probe(new URL('../' + file, import.meta.url));
+    assert.notEqual(serverOnly.status, 0);
+    assert.match(serverOnly.stderr, /blocked node:/);
+  }
+});
+
+test('the server facade omits capsule startup and importing the capsule does not launch it', () => {
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', "const api=await import('@ten98/runtime/browser-audit'); const capsule=await import('@ten98/runtime/browser-audit-capsule'); if('runCapsule' in api || typeof capsule.runCapsule !== 'function') process.exit(2); console.log('loaded');"], {cwd:new URL('../',import.meta.url),encoding:'utf8',timeout:5000,windowsHide:true,env:{...process.env,TEN98_CAPSULE_CLOSE_CAPABILITY:''}});
+  assert.equal(child.status,0,child.stderr); assert.equal(child.stdout.trim(),'loaded');
 });

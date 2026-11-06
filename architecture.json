@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.22.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.23.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -659,7 +659,15 @@
           "public-network.mjs": "Generated runtime executable from src/public-network.mts, re-exported by index.mjs.",
           "public-network.d.mts": "Generated declarations from src/public-network.mts.",
           "lighthouse-report.mjs": "Generated runtime executable from src/lighthouse-report.mts, re-exported by index.mjs.",
-          "lighthouse-report.d.mts": "Generated declarations from src/lighthouse-report.mts."
+          "lighthouse-report.d.mts": "Generated declarations from src/lighthouse-report.mts.",
+          "browser-audit.mjs": "Generated server-only executable from src/browser-audit.mts; capsule runs only as an explicit process entrypoint.",
+          "browser-audit.d.mts": "Generated declarations from src/browser-audit.mts.",
+          "browser-audit-control.mjs": "Generated server-only executable from src/browser-audit-control.mts; capsule runs only as an explicit process entrypoint.",
+          "browser-audit-control.d.mts": "Generated declarations from src/browser-audit-control.mts.",
+          "browser-audit-egress.mjs": "Generated server-only executable from src/browser-audit-egress.mts; capsule runs only as an explicit process entrypoint.",
+          "browser-audit-egress.d.mts": "Generated declarations from src/browser-audit-egress.mts.",
+          "browser-audit-capsule.mjs": "Generated server-only executable from src/browser-audit-capsule.mts; capsule runs only as an explicit process entrypoint.",
+          "browser-audit-capsule.d.mts": "Generated declarations from src/browser-audit-capsule.mts."
         },
         "compilerProjects": [
           "tsconfig.json",

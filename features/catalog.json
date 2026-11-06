@@ -219,6 +219,27 @@
       ],
       "boundary": "Typed controls, branding, layouts and interaction patterns. Application controllers retain data, authorization, requests and draft identity. Includes isolated player and sandboxed-preview hosts; apps own player scripts, recording data and provider requests.",
       "source": "ui"
+    },
+    "browserAudit": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/browser-audit",
+      "entrypoints": [
+        "browser-audit.mjs",
+        "browser-audit.d.mts",
+        "browser-audit-capsule.mjs",
+        "browser-audit-capsule.d.mts"
+      ],
+      "exports": [
+        "createBrowserAuditControl",
+        "createPublicEgressProxy"
+      ],
+      "tests": [
+        "tests/browser-audit.test.mts",
+        "tests/browser-entry.test.mts"
+      ],
+      "version": "v0.23.0",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/103",
+      "boundary": "Shared single-owner CDP control, public egress and separate Linux capsule lifecycle. Apps supply current authority, exact-byte native resource loading, credentials, isolated process provisioning, jobs and storage. Trusted pinned observers only; service/shared workers fail closed. Partial reports preserve denied or uncorrelated requests."
     }
   },
   "features": [
@@ -662,6 +683,24 @@
         }
       ],
       "acceptance": "Tombstone, not erasure; step-up proof; refusal for the last owner or operator; scrub by inventory with a coverage test; financial rows kept 7 years without personal data, audit rows 7 years or until the workspace is deleted. Campaign has not implemented closure yet."
+    },
+    {
+      "id": "isolated-browser-audit",
+      "implementations": [],
+      "entrypoint": "@ten98/runtime/browser-audit",
+      "capsuleEntrypoint": "@ten98/runtime/browser-audit-capsule",
+      "sourceVersion": "0.23.0",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/103",
+      "tests": [
+        "tests/browser-audit.test.mts",
+        "tests/browser-entry.test.mts"
+      ],
+      "boundary": "Shared single-owner CDP control, public egress and separate Linux capsule lifecycle. Apps supply current authority, exact-byte native resource loading, credentials, isolated process provisioning, jobs and storage. Trusted pinned observers only; service/shared workers fail closed. Partial reports preserve denied or uncorrelated requests.",
+      "acceptance": "Candidate mechanism only. Preserve native lifecycle, popup/frame failures, mediated resources and report omissions. Packaged native and actual consumer acceptance are required before adoption.",
+      "portableBrowserAudit": [
+        "createBrowserAuditControl",
+        "createPublicEgressProxy"
+      ]
     }
   ],
   "knownIssues": [

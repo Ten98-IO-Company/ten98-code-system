@@ -13,6 +13,15 @@ interface Catalog {
 }
 const catalog: Catalog = JSON.parse(readFileSync(new URL('../features/catalog.json', import.meta.url), 'utf8'));
 
+test('the packed runtime includes its feature catalogue and adoption contract', () => {
+  const packed: { files: { path: string }[] }[] = JSON.parse(execFileSync(
+    process.platform === 'win32' ? 'npm.cmd' : 'npm', ['pack', '--dry-run', '--json', '--ignore-scripts'],
+    { cwd: fileURLToPath(new URL('../', import.meta.url)), encoding: 'utf8', timeout: 30_000, windowsHide: true, shell: process.platform === 'win32' },
+  ));
+  const files = new Set(packed[0]!.files.map(file => file.path));
+  assert.deepEqual(['features/catalog.json', 'docs/FEATURE-ADOPTION.md'].filter(path => !files.has(path)), []);
+});
+
 test('every runtime export and test file the catalogue names exists in this package', () => {
   const exported = new Set(Object.keys(runtime));
   const named = [...catalog.portableImports.runtime.exports, ...catalog.features.flatMap(feature => feature.portable ?? [])];

@@ -25,3 +25,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Browser execution mechanisms
+
+The browser controller, egress proxy and capsule lifecycle are Ten98-authored mechanisms promoted from the reviewed D9 source generation: controller SHA-256 f8fb8d2c407f05a68b961e25e43de0ab12ac2be08082a0aa012da295a67d2471; proxy 6c97b236b9203d3506052e690f201901cf84cac6469534d11659005fad72c2e2; capsule e25ad6785697e50382685ffd688094e374e55873758075c9ff723082a0ef9d3f. Canonical adaptations replace package self-imports, name the server-only entrypoints and reserve observer admission before asynchronous attachment. Ten98 maintains fixes under issue #103.
+
+Compatibility is tested with separately installed Lighthouse 13.6.0, Puppeteer Core 25.16.0 and Chromium; runtime does not redistribute their implementation or binaries. Deployments must preserve those distributions' own licence notices and pinned image provenance. Fixture DNS/peer substitutions, synthetic credentials, fault injection and report logging are excluded from runtime implementation.
