@@ -77,6 +77,8 @@
         "browser.d.mts"
       ],
       "exports": [
+        "readOpenRouterAssistantMessageV1",
+        "validateOpenRouterToolHistoryV1",
         "workspaceRoles",
         "mayGrantWorkspaceRole",
         "mayManageWorkspaceMember",
@@ -123,6 +125,7 @@
         "normalizeLighthouseReport"
       ],
       "tests": [
+        "tests/openrouter-chat.test.mts",
         "tests/runtime.test.mts",
         "tests/migration-ledger.test.mts",
         "tests/client-address.test.mts",
