@@ -111,3 +111,5 @@ async function readBounded(response: Response, { maxBytes, signal, contentLength
 
 // Spreadsheet-safe CSV has no Node dependency, so browser code gets it from this entry too.
 export * from './csv.mjs';
+// Exact bigint money arithmetic is pure too, so browser forms parse and format with the same rules as the server.
+export * from './money.mjs';

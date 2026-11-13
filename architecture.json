@@ -9,7 +9,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.25.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.26.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -730,6 +730,8 @@
           "auth.d.mts": "Generated declarations from src/auth.mts.",
           "csv.mjs": "Generated runtime executable from src/csv.mts, re-exported by browser.mjs and index.mjs.",
           "csv.d.mts": "Generated declarations from src/csv.mts.",
+          "money.mjs": "Generated runtime executable from src/money.mts, re-exported by browser.mjs and index.mjs.",
+          "money.d.mts": "Generated declarations from src/money.mts.",
           "cloudflare-email.mjs": "Generated runtime executable from src/cloudflare-email.mts, re-exported by index.mjs.",
           "cloudflare-email.d.mts": "Generated declarations from src/cloudflare-email.mts.",
           "email-message.mjs": "Generated runtime executable from src/email-message.mts, internal module imported by other runtime modules, not re-exported by index.mjs.",

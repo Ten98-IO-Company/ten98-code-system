@@ -23,3 +23,9 @@ export const readChatType: (message: unknown, finishReason: unknown, options: cu
 export const validateChatHistoryType: (history: unknown, options: current.OpenRouterChatOptionsV1) => current.OpenRouterChatMessageV1[] = current.validateOpenRouterToolHistoryV1;
 export const chatOptions: current.OpenRouterChatOptionsV1 = { allowedToolNames: ['read_evidence'], maxContextBytes: 131072, maxArgumentBytes: 8192, maxMessageBytes: 2097152 };
 export const nativeToolResult: current.OpenRouterChatMessageV1 = { role: 'tool', tool_call_id: 'call_1', content: '{}' };
+
+export const multiplyMoneyType: (amount: bigint, rate: string, rounding: current.MoneyRounding) => bigint = current.multiplyMoney;
+export const allocateMoneyType: (total: bigint, weights: readonly bigint[]) => bigint[] = current.allocateMoney;
+export const bahrainiDinar: current.MoneyExponent = 3;
+export const moneyRangeType: (value: unknown) => asserts value is bigint = current.assertMoneyInRange;
+export const moneyBounds: readonly [bigint, bigint] = [current.MONEY_MIN, current.MONEY_MAX];
