@@ -2,7 +2,7 @@
 
 Shared server-side building blocks for Ten98 apps, so every app gets the same tested behaviour instead of its own copy.
 
-`@ten98/runtime` is the common code behind [Ten98 Campaign](https://github.com/Ten98-IO-Company/ten98-campaign) and [Ten98 Discover](https://github.com/Ten98-IO-Company/ten98-discover), for Ten98 apps and their developers. It also holds the architecture contract that keeps their versions, dependencies and source rules consistent. Shared React presentation lives in the [Ten98 Design System](https://github.com/Ten98-IO-Company/ten98-design-system).
+`@ten98/runtime` is the common code behind [Ten98 Campaign](https://github.com/Ten98-IO-Company/ten98-campaign), [Ten98 Discover](https://github.com/Ten98-IO-Company/ten98-discover) and [Ten98 Books](https://github.com/Ten98-IO-Company/ten98-books), for Ten98 apps and their developers. It also holds the architecture contract that keeps their versions, dependencies and source rules consistent. Shared React presentation lives in the [Ten98 Design System](https://github.com/Ten98-IO-Company/ten98-design-system).
 
 ## Why Code System
 
