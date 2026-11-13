@@ -518,7 +518,8 @@
       "sourceLanguage": {
         "default": "typescript",
         "roots": [
-          "src"
+          "src",
+          "tests"
         ],
         "legacyJavaScript": [],
         "generated": {
@@ -551,9 +552,7 @@
         "nativeFiles": {
           "vite.config.ts": "Native Vite configuration"
         },
-        "testDirectories": [
-          "tests"
-        ],
+        "testDirectories": [],
         "compilerProjects": [
           "tsconfig.json"
         ]
