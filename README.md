@@ -20,6 +20,12 @@ Shared server-side building blocks for Ten98 apps, so every app gets the same te
 - Workspaces, members, invitations and instance operators use `createWorkspaceTeam` from `@ten98/runtime` over the common schema shipped as `workspace-team.sql`. Each method runs inside the app's transaction (READ COMMITTED, REPEATABLE READ or SERIALIZABLE; roll back on any error).
 - Shopify crawler access uses `parseShopifyCrawlerAccess`, `shopifyCrawlerHeadersFor` and `verifyShopifyCrawlerAccess` for bounded signature parsing, exact-origin expiry checks and verification with a supplied Ed25519 public key. These helpers perform no network calls or credential storage; apps retain authorization and transport safeguards.
 - Public-network checks use `addressKey`, `publicNetworkAddress`, `pinnedNetworkPeer` and `resolveNetworkHost`. Resolution returns both DNS families; the caller admits the complete answer set before connecting and verifies the actual connected peer.
+- Money uses `bigint` minor units with no floating point. The functions are `parseMoney`, `formatMoney`, `addMoney`, `subtractMoney`, `compareMoney`, `multiplyMoney`, `percentOfMoney` and `allocateMoney`, from `@ten98/runtime` or `@ten98/runtime/browser`.
+  - The currency exponent is 0, 2 or 3, so BHD, KWD and OMR use 3.
+  - Parsing refuses more fraction digits than the exponent.
+  - Rates and percentages are decimal strings, rounded `half-up` (away from zero), `half-even` or `down` (toward zero). All three modes are symmetric for negative amounts.
+  - Allocation by weights always sums to the total.
+  - Apps keep currency selection, display locale and ledger postings.
 - `normalizeLighthouseReport` validates and reduces a supplied local Lighthouse report. It preserves unavailable measurements, errors and coverage limits; it does not run a browser or authorize a website request.
 - Isolated browser execution uses the server-only `@ten98/runtime/browser-audit` entry. It provides `createBrowserAuditControl` and `createPublicEgressProxy`; the capsule runs separately with `node node_modules/@ten98/runtime/browser-audit-capsule.mjs`. See the [complete deployment and authority contract](docs/FEATURE-ADOPTION.md#isolated-browser-audit). This candidate does not establish production or consumer acceptance.
 - Run `node node_modules/@ten98/runtime/check.mjs .` as the app's `check:architecture` script, first in every `test` and `build` script. [architecture.json](architecture.json) declares the shared versions and dependencies.
