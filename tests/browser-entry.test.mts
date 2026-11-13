@@ -5,7 +5,7 @@ import test from 'node:test';
 import * as browser from '@ten98/runtime/browser';
 import * as runtime from '../index.mjs';
 
-const BROWSER_EXPORTS = ['addMoney', 'allocateMoney', 'compareMoney', 'csvCell', 'csvRow', 'formatMoney', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'multiplyMoney', 'parseMoney', 'percentOfMoney', 'readResponseBytes', 'readResponseText', 'subtractMoney', 'toCsv', 'workspaceRoles'];
+const BROWSER_EXPORTS = ['MONEY_MAX', 'MONEY_MIN', 'addMoney', 'allocateMoney', 'assertMoneyInRange', 'compareMoney', 'csvCell', 'csvRow', 'formatMoney', 'mayGrantWorkspaceRole', 'mayManageWorkspaceMember', 'multiplyMoney', 'parseMoney', 'percentOfMoney', 'readResponseBytes', 'readResponseText', 'subtractMoney', 'toCsv', 'workspaceRoles'];
 
 test('the browser entry exports roles and response readers, the same functions as the main entry', () => {
   assert.deepEqual(Object.keys(browser).sort(), BROWSER_EXPORTS);

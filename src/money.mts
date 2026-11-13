@@ -11,7 +11,12 @@ export type MoneyExponent = 0 | 2 | 3;
  */
 export type MoneyRounding = 'half-up' | 'half-even' | 'down';
 
-// Bounds parsing work on untrusted text; far beyond any ledger amount or rate.
+/** The smallest amount a PostgreSQL `bigint` (int8) column stores. */
+export const MONEY_MIN: bigint = -(2n ** 63n);
+/** The largest amount a PostgreSQL `bigint` (int8) column stores. */
+export const MONEY_MAX: bigint = 2n ** 63n - 1n;
+
+// Bounds parsing work on untrusted text; rates may need more digits than the int8 range, amounts are bounded below.
 const MAX_TEXT = 64;
 const DECIMAL = /^(-?)(\d+)(?:\.(\d+))?$/u;
 const ROUNDING: readonly string[] = ['half-up', 'half-even', 'down'] satisfies MoneyRounding[];
@@ -50,13 +55,26 @@ function divideRounded(numerator: bigint, denominator: bigint, rounding: MoneyRo
 }
 
 /**
+ * Throws RangeError unless `value` fits a PostgreSQL `bigint` column (`MONEY_MIN` to `MONEY_MAX`), and TypeError unless
+ * it is a bigint. `parseMoney` applies it to every parsed amount; arithmetic does not bound its results, so call it on a
+ * computed amount before persisting it.
+ */
+export function assertMoneyInRange(value: unknown): asserts value is bigint {
+  const amount = amountOf(value, 'Amount');
+  if (amount < MONEY_MIN || amount > MONEY_MAX) throw new RangeError('Amount is outside the PostgreSQL bigint range.');
+}
+
+/**
  * Minor units from a decimal string: `parseMoney('12.5', 3) === 12500n`. More fraction digits than the exponent are
- * refused rather than rounded, so an entered amount is never silently changed.
+ * refused rather than rounded, so an entered amount is never silently changed, and an amount outside the PostgreSQL
+ * `bigint` range is refused with a RangeError.
  */
 export function parseMoney(text: string, exponent: MoneyExponent): bigint {
   const digits = exponentOf(exponent), { units, scale } = decimalOf(text, 'Amount');
   if (scale > digits) throw new RangeError(`Amount has more than ${digits} fraction digits.`);
-  return units * 10n ** BigInt(digits - scale);
+  const amount = units * 10n ** BigInt(digits - scale);
+  assertMoneyInRange(amount);
+  return amount;
 }
 
 /** The canonical decimal string for minor units: `formatMoney(-5n, 3) === '-0.005'`. No grouping or currency sign. */
@@ -102,9 +120,10 @@ export function percentOfMoney(amount: bigint, percent: string, rounding: MoneyR
  */
 export function allocateMoney(total: bigint, weights: readonly bigint[]): bigint[] {
   const value = amountOf(total, 'Total');
-  if (!Array.isArray(weights) || !weights.length || weights.some(weight => typeof weight !== 'bigint' || weight < 0n)) {
-    throw new TypeError('Weights must be a non-empty list of non-negative bigint values.');
-  }
+  // An index loop, not some/map/reduce, which skip the holes of a sparse array such as [, 1n].
+  let valid = Array.isArray(weights) && weights.length > 0;
+  for (let index = 0; valid && index < weights.length; index++) valid = typeof weights[index] === 'bigint' && weights[index]! >= 0n;
+  if (!valid) throw new TypeError('Weights must be a non-empty list of non-negative bigint values.');
   const sum = weights.reduce((accumulated, weight) => accumulated + weight, 0n);
   if (sum === 0n) throw new RangeError('At least one weight must be positive.');
   const magnitude = value < 0n ? -value : value;

@@ -22,7 +22,7 @@ Shared server-side building blocks for Ten98 apps, so every app gets the same te
 - Public-network checks use `addressKey`, `publicNetworkAddress`, `pinnedNetworkPeer` and `resolveNetworkHost`. Resolution returns both DNS families; the caller admits the complete answer set before connecting and verifies the actual connected peer.
 - Money uses `bigint` minor units with no floating point. The functions are `parseMoney`, `formatMoney`, `addMoney`, `subtractMoney`, `compareMoney`, `multiplyMoney`, `percentOfMoney` and `allocateMoney`, from `@ten98/runtime` or `@ten98/runtime/browser`.
   - The currency exponent is 0, 2 or 3, so BHD, KWD and OMR use 3.
-  - Parsing refuses more fraction digits than the exponent.
+  - Parsing refuses more fraction digits than the exponent, and amounts outside the PostgreSQL `bigint` range (`MONEY_MIN` to `MONEY_MAX`). Call `assertMoneyInRange` on a computed amount before storing it.
   - Rates and percentages are decimal strings, rounded `half-up` (away from zero), `half-even` or `down` (toward zero). All three modes are symmetric for negative amounts.
   - Allocation by weights always sums to the total.
   - Apps keep currency selection, display locale and ledger postings.

@@ -5,9 +5,20 @@ export type MoneyExponent = 0 | 2 | 3;
  * `half-up` rounds a half away from zero, `half-even` rounds a half to the even unit, `down` truncates toward zero.
  */
 export type MoneyRounding = 'half-up' | 'half-even' | 'down';
+/** The smallest amount a PostgreSQL `bigint` (int8) column stores. */
+export declare const MONEY_MIN: bigint;
+/** The largest amount a PostgreSQL `bigint` (int8) column stores. */
+export declare const MONEY_MAX: bigint;
+/**
+ * Throws RangeError unless `value` fits a PostgreSQL `bigint` column (`MONEY_MIN` to `MONEY_MAX`), and TypeError unless
+ * it is a bigint. `parseMoney` applies it to every parsed amount; arithmetic does not bound its results, so call it on a
+ * computed amount before persisting it.
+ */
+export declare function assertMoneyInRange(value: unknown): asserts value is bigint;
 /**
  * Minor units from a decimal string: `parseMoney('12.5', 3) === 12500n`. More fraction digits than the exponent are
- * refused rather than rounded, so an entered amount is never silently changed.
+ * refused rather than rounded, so an entered amount is never silently changed, and an amount outside the PostgreSQL
+ * `bigint` range is refused with a RangeError.
  */
 export declare function parseMoney(text: string, exponent: MoneyExponent): bigint;
 /** The canonical decimal string for minor units: `formatMoney(-5n, 3) === '-0.005'`. No grouping or currency sign. */

@@ -27,3 +27,5 @@ export const nativeToolResult: current.OpenRouterChatMessageV1 = { role: 'tool',
 export const multiplyMoneyType: (amount: bigint, rate: string, rounding: current.MoneyRounding) => bigint = current.multiplyMoney;
 export const allocateMoneyType: (total: bigint, weights: readonly bigint[]) => bigint[] = current.allocateMoney;
 export const bahrainiDinar: current.MoneyExponent = 3;
+export const moneyRangeType: (value: unknown) => asserts value is bigint = current.assertMoneyInRange;
+export const moneyBounds: readonly [bigint, bigint] = [current.MONEY_MIN, current.MONEY_MAX];

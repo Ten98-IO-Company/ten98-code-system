@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { addMoney, allocateMoney, compareMoney, formatMoney, multiplyMoney, parseMoney, percentOfMoney, subtractMoney } from '../index.mjs';
+import { addMoney, allocateMoney, assertMoneyInRange, compareMoney, formatMoney, MONEY_MAX, MONEY_MIN, multiplyMoney, parseMoney, percentOfMoney, subtractMoney } from '../index.mjs';
 import type { MoneyExponent, MoneyRounding } from '../index.mjs';
 
 const EXPONENTS: MoneyExponent[] = [0, 2, 3];
@@ -44,7 +44,7 @@ test('parse and format round-trip every exponent, including three-decimal BHD, K
   assert.equal(formatMoney(1500n, 0), '1500');
   assert.equal(formatMoney(10n ** 30n + 1n, 2), '10000000000000000000000000000.01');
   for (let index = 0; index < 2000; index++) {
-    const exponent = EXPONENTS[index % 3]!, amount = signed(10n ** 22n);
+    const exponent = EXPONENTS[index % 3]!, amount = signed(10n ** 18n);
     const text = formatMoney(amount, exponent);
     assert.equal(parseMoney(text, exponent), amount, text);
     assert.equal(formatMoney(parseMoney(text, exponent), exponent), text);
@@ -61,6 +61,25 @@ test('parsing refuses unsafe text and extra precision instead of rounding', () =
   assert.throws(() => parseMoney('1.0001', 3), RangeError);
   for (const exponent of [1, 4, -1, 2.5, '2', null]) assert.throws(() => parseMoney('1', exponent as MoneyExponent), RangeError);
   assert.throws(() => formatMoney(1 as unknown as bigint, 2), TypeError);
+});
+
+test('parsed amounts must fit a PostgreSQL bigint column', () => {
+  assert.equal(MONEY_MIN, -9223372036854775808n);
+  assert.equal(MONEY_MAX, 9223372036854775807n);
+  assert.equal(parseMoney('9223372036854775807', 0), MONEY_MAX);
+  assert.equal(parseMoney('-9223372036854775808', 0), MONEY_MIN);
+  assert.equal(parseMoney('92233720368547758.07', 2), MONEY_MAX);
+  assert.equal(parseMoney('-9223372036854775.808', 3), MONEY_MIN);
+  for (const [text, exponent] of [['9223372036854775808', 0], ['-9223372036854775809', 0], ['92233720368547758.08', 2], ['9223372036854775808', 2], ['-9223372036854775.809', 3], ['9'.repeat(64), 2]] as const) {
+    assert.throws(() => parseMoney(text, exponent), RangeError, `${text} @ ${exponent}`);
+  }
+  assertMoneyInRange(MONEY_MAX);
+  assertMoneyInRange(MONEY_MIN);
+  assertMoneyInRange(0n);
+  assert.throws(() => assertMoneyInRange(MONEY_MAX + 1n), RangeError);
+  assert.throws(() => assertMoneyInRange(MONEY_MIN - 1n), RangeError);
+  assert.throws(() => assertMoneyInRange(addMoney(MONEY_MAX, 1n)), RangeError);
+  assert.throws(() => assertMoneyInRange(1), TypeError);
 });
 
 test('add, subtract and compare accept only bigint minor units', () => {
@@ -146,6 +165,10 @@ test('allocation always sums to the total, favours larger remainders, then earli
     });
   }
   assert.throws(() => allocateMoney(1n, []), TypeError);
+  // Sparse arrays: array methods skip holes, so a hole must still be refused rather than returned as a missing part.
+  assert.throws(() => allocateMoney(10n, [, 1n] as bigint[]), TypeError);
+  assert.throws(() => allocateMoney(10n, [1n, , 1n] as bigint[]), TypeError);
+  assert.throws(() => allocateMoney(10n, new Array<bigint>(2)), TypeError);
   assert.throws(() => allocateMoney(1n, [1n, -1n]), TypeError);
   assert.throws(() => allocateMoney(1n, [1 as unknown as bigint]), TypeError);
   assert.throws(() => allocateMoney(1n, [0n, 0n]), RangeError);
