@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "packageManager": "pnpm@11.19.0",
   "description": "Shared framework for ten98 applications: HTTP, provider, email, migration, OIDC, identity, database and tenancy mechanisms",
   "type": "module",
