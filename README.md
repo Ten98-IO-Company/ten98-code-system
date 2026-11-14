@@ -24,7 +24,7 @@ Shared server-side building blocks for Ten98 apps, so every app gets the same te
   - The currency exponent is 0, 2 or 3, so BHD, KWD and OMR use 3.
   - Parsing refuses more fraction digits than the exponent, and amounts outside the PostgreSQL `bigint` range (`MONEY_MIN` to `MONEY_MAX`). Call `assertMoneyInRange` on a computed amount before storing it.
   - Rates and percentages are decimal strings, rounded `half-up` (away from zero), `half-even` or `down` (toward zero). All three modes are symmetric for negative amounts.
-  - `convertMoney` converts between currencies at a decimal-string rate, and `rateOfAmounts` gives the rate two amounts imply with a fixed number of places. Each rounds once, so a database can recompute both with integer `div`.
+  - `convertMoney` converts between currencies at a decimal-string rate, and `rateOfAmounts` gives the rate two amounts imply with a fixed number of places. Each rounds once, so PostgreSQL can recompute both with `div` on `numeric` integers for positive amounts; for signed values apply `div` to absolute values and restore the sign, as in `sign(F) * div(2 * abs(F) * R * power(10::numeric, b) + power(10::numeric, p + f), 2 * power(10::numeric, p + f))`. Neither result is range-checked: call `assertMoneyInRange` before storing.
   - Allocation by weights always sums to the total.
   - Apps keep currency selection, display locale and ledger postings.
 - `normalizeLighthouseReport` validates and reduces a supplied local Lighthouse report. It preserves unavailable measurements, errors and coverage limits; it does not run a browser or authorize a website request.

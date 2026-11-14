@@ -159,6 +159,7 @@
         "tests/migrate-deadline.test.mts",
         "tests/csv.test.mts",
         "tests/money.test.mts",
+        "tests/money-postgres.test.mts",
         "tests/workspace-team.test.mts",
         "tests/shopify-crawler-access.test.mts",
         "tests/public-network.test.mts",
