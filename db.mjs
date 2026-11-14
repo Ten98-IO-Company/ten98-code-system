@@ -3,7 +3,7 @@
 // tables of workspace-team.sql for typed queries. Each app keeps its own connection URLs, migrations, schema for its own
 // tables and resource-cleanup registration. drizzle-orm and pg are exact, optional peer dependencies.
 import { sql } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/node-postgres';
+import { drizzle, NodePgSession } from 'drizzle-orm/node-postgres';
 import { bigint, boolean, check, foreignKey, index, pgTable, primaryKey, text, timestamp, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 import { workspaceRoles } from './browser.mjs';
@@ -53,6 +53,42 @@ export function sharedDatabase(options) {
                 await database.pool.end();
         },
     };
+}
+/**
+ * `db.transaction` without drizzle-orm 0.45.2's connection leak. Its node-postgres transaction sends BEGIN before its
+ * `try`, so a failed BEGIN never releases the pooled connection, and a failed ROLLBACK replaces the error that caused
+ * it. Over a pool this checks the connection out itself, as Books' tenancy did: it always releases it, discards it when
+ * BEGIN, COMMIT or ROLLBACK failed (its state is then unknown), and rethrows the callback's own error. Given a
+ * transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. `config` is
+ * Drizzle's, such as `{ accessMode: 'read only' }`; a savepoint ignores it.
+ */
+export async function transaction(db, run, config) {
+    const pooled = db, client = pooled.$client;
+    const isPool = client instanceof Object && typeof client.connect === 'function' && Object.getPrototypeOf(client).constructor.name.includes('Pool');
+    const session = pooled._?.session;
+    if (!(session instanceof NodePgSession) || !isPool)
+        return db.transaction(tx => run(tx), config);
+    const connection = await pooled.$client.connect();
+    let failure, broken = false;
+    try {
+        const { schema, options } = session;
+        return await new NodePgSession(connection, pooled.dialect, schema, options).transaction(async (tx) => {
+            try {
+                return await run(tx);
+            }
+            catch (error) {
+                failure = { error };
+                throw error;
+            }
+        }, config);
+    }
+    catch (error) {
+        broken = !failure || error !== failure.error;
+        throw failure ? failure.error : error;
+    }
+    finally {
+        connection.release(broken);
+    }
 }
 // The common team tables exactly as workspace-team.sql creates them, constraint names included, so Drizzle queries are
 // typed and a drizzle-kit diff against that schema finds nothing to change. workspace-team.sql stays the definition.

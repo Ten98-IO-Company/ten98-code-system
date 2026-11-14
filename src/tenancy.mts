@@ -7,18 +7,16 @@
 // Drizzle declares the policy (`policy`) and ENABLE ROW LEVEL SECURITY (`pgTable(...).enableRLS()`). FORCE, the roles
 // and their grants are SQL in the app's custom migration step; `forceRowLevelSecurity` writes the FORCE part.
 import { and, eq, inArray, sql } from 'drizzle-orm';
-import { NodePgSession } from 'drizzle-orm/node-postgres';
-import { pgPolicy, type PgDatabase, type PgDialect, type PgPolicy, type PgQueryResultHKT, type PgTransaction } from 'drizzle-orm/pg-core';
+import { pgPolicy, PgTransaction, type PgPolicy } from 'drizzle-orm/pg-core';
 import type pg from 'pg';
 import type { WorkspaceRole } from './browser.mjs';
-import { membership, workspace } from './db.mjs';
+import { membership, transaction, workspace, type AnyDatabase, type ScopedTransaction } from './db.mjs';
+
+export type { ScopedTransaction } from './db.mjs';
 
 export type WorkspaceMode = 'read' | 'write';
 /** The authorized workspace with its name and the caller's role in it. */
 export type WorkspaceAccess = { workspaceId: string; name: string; role: WorkspaceRole };
-// Any Drizzle PostgreSQL database; `ScopedTransaction` is the transaction its `transaction` hands out.
-type AnyDatabase = PgDatabase<PgQueryResultHKT, any, any>;
-export type ScopedTransaction<TDatabase extends AnyDatabase> = TDatabase extends PgDatabase<infer H, infer F, infer S> ? PgTransaction<H, F, S> : never;
 // A pg pool, pool client or client.
 type Queryable = { query<R extends pg.QueryResultRow>(text: string, values?: unknown[]): Promise<pg.QueryResult<R>> };
 
@@ -46,35 +44,6 @@ export interface TenancyOptions<TTable extends string> {
   tables: readonly TTable[];
 }
 
-// The parts of a node-postgres Drizzle database that `transaction` rebinds to one checked-out connection. `dialect`
-// and the session's `schema` and `options` are internal to drizzle-orm, which is pinned exactly for this reason.
-type PooledDatabase = { dialect: PgDialect; _?: { session?: unknown }; $client: pg.Pool };
-
-/**
- * Drizzle's transaction (0.45.2, node-postgres/session.js) sends BEGIN before its `try`, so a failed BEGIN never
- * releases the pooled connection, and a failed ROLLBACK replaces the error that caused it. Over a pool this checks the
- * connection out itself, as Books' tenancy did: it always releases it, discards it when BEGIN, COMMIT or ROLLBACK
- * failed (its state is then unknown), and rethrows the callback's own error. Anything else, such as a transaction for
- * a savepoint, keeps Drizzle's own `transaction`.
- */
-async function transaction<TDatabase extends AnyDatabase, T>(db: TDatabase, run: (tx: ScopedTransaction<TDatabase>) => Promise<T>): Promise<T> {
-  const pooled = db as unknown as PooledDatabase, client: unknown = pooled.$client;
-  const isPool = client instanceof Object && typeof (client as pg.Pool).connect === 'function' && Object.getPrototypeOf(client).constructor.name.includes('Pool');
-  const session = pooled._?.session;
-  if (!(session instanceof NodePgSession) || !isPool) return db.transaction(tx => run(tx as ScopedTransaction<TDatabase>));
-  const connection = await pooled.$client.connect();
-  let failure: { error: unknown } | undefined, broken = false;
-  try {
-    const { schema, options } = session as unknown as { schema: never; options: never };
-    return await new NodePgSession(connection, pooled.dialect, schema, options).transaction(async tx => {
-      try { return await run(tx as unknown as ScopedTransaction<TDatabase>); } catch (error) { failure = { error }; throw error; }
-    });
-  } catch (error) {
-    broken = !failure || error !== failure.error;
-    throw failure ? failure.error : error;
-  } finally { connection.release(broken); }
-}
-
 const writers: readonly WorkspaceRole[] = ['owner', 'admin', 'editor'];
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Lowercase names only: they go into SQL text unquoted, and PostgreSQL's stored policy then matches them verbatim.
@@ -92,12 +61,25 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
   // The scope as PostgreSQL stores it in pg_policies once `deparseNoise` is removed.
   const storedScope = `${column}=ANYstring_to_arraycurrent_setting'${setting}',true,','`;
 
+  // Parameterised `sql` statements by necessity: Drizzle has no builder for set_config or current_setting.
+  const setScope = (tx: AnyDatabase, value: string) => tx.execute(sql`SELECT set_config(${setting}, ${value}, true)`);
+  const readScope = async (tx: AnyDatabase) =>
+    ((await tx.execute(sql`SELECT current_setting(${setting}, true) AS scope`)) as unknown as { rows: { scope: string | null }[] }).rows[0]?.scope ?? '';
+
   /**
-   * Sets, for the rest of the current transaction only, the workspaces row-level security admits. A parameterised `sql`
-   * statement by necessity: Drizzle has no builder for set_config.
+   * Runs `run` with row-level security admitting `workspaceIds`. In a transaction of its own the scope lasts to its end.
+   * `nested` (a caller's transaction or a savepoint, which may already hold a scope) puts the caller's scope back when
+   * `run` settles, so the caller never goes on in the inner workspace. After an error the transaction may be aborted
+   * and refuse the restore; the caller's ROLLBACK, or the savepoint's, then undoes the inner scope instead.
    */
-  async function setScope(tx: Pick<AnyDatabase, 'execute'>, workspaceIds: readonly string[]): Promise<void> {
-    await tx.execute(sql`SELECT set_config(${setting}, ${workspaceIds.join(',')}, true)`);
+  async function inScope<T>(tx: AnyDatabase, workspaceIds: readonly string[], nested: boolean, run: () => Promise<T>): Promise<T> {
+    if (!nested) { await setScope(tx, workspaceIds.join(',')); return run(); }
+    const previous = await readScope(tx);
+    await setScope(tx, workspaceIds.join(','));
+    let result: T;
+    try { result = await run(); } catch (error) { await setScope(tx, previous).catch(() => undefined); throw error; }
+    await setScope(tx, previous);
+    return result;
   }
 
   /**
@@ -129,32 +111,36 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
     forceRowLevelSecurity(): string {
       return tables.map(table => `ALTER TABLE "${table}" FORCE ROW LEVEL SECURITY;`).join('\n--> statement-breakpoint\n');
     },
-    setScope,
     /**
      * Authorizes `userId` as a member of `workspaceId` (viewers read; editors, admins and owners write) and runs `run` in
-     * one transaction whose row-level security admits that workspace only. `outer` joins a transaction the caller already
-     * holds (workspace creation inserts the workspace first); the caller then owns commit and rollback.
+     * one transaction whose row-level security admits that workspace only. `read` makes that transaction READ ONLY once
+     * the membership is checked (its share lock cannot be taken in a read-only transaction). `outer` joins a transaction
+     * the caller already holds (workspace creation inserts the workspace first), and `db` may itself be a transaction (a
+     * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards.
      */
     async withWorkspace<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceId: string, mode: WorkspaceMode,
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess) => Promise<T>, outer?: ScopedTransaction<TDatabase>): Promise<T> {
+      const nested = outer !== undefined || db instanceof PgTransaction;
       const scoped = async (tx: ScopedTransaction<TDatabase>) => {
         const [access] = await memberships(tx, userId, [workspaceId]);
         if (!access || (mode !== 'read' && !writers.includes(access.role))) throw new WorkspaceAccessError();
-        await setScope(tx, [access.workspaceId]);
-        return run(tx, access);
+        if (mode === 'read' && !nested) await tx.setTransaction({ accessMode: 'read only' });
+        return inScope(tx, [access.workspaceId], nested, () => run(tx, access));
       };
       return outer ? scoped(outer) : transaction(db, scoped);
     },
     /**
-     * For reads: runs `run` in one transaction scoped to those of `workspaceIds` the user is a member of. Ids the user
-     * cannot reach are left out silently; `run` receives the ones admitted.
+     * For reads: runs `run` in one READ ONLY transaction scoped to those of `workspaceIds` the user is a member of. Ids
+     * the user cannot reach are left out silently; `run` receives the ones admitted. Given a transaction as `db` it runs in
+     * a savepoint, as `withWorkspace` does, and restores the caller's scope.
      */
     withWorkspaces<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceIds: readonly string[],
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess[]) => Promise<T>): Promise<T> {
+      const nested = db instanceof PgTransaction;
       return transaction(db, async tx => {
         const access = await memberships(tx, userId, workspaceIds);
-        await setScope(tx, access.map(item => item.workspaceId));
-        return run(tx, access);
+        if (!nested) await tx.setTransaction({ accessMode: 'read only' });
+        return inScope(tx, access.map(item => item.workspaceId), nested, () => run(tx, access));
       });
     },
     /**

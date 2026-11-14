@@ -3,8 +3,9 @@
 // tables of workspace-team.sql for typed queries. Each app keeps its own connection URLs, migrations, schema for its own
 // tables and resource-cleanup registration. drizzle-orm and pg are exact, optional peer dependencies.
 import { sql } from 'drizzle-orm';
-import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { bigint, boolean, check, foreignKey, index, pgTable, primaryKey, text, timestamp, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { drizzle, NodePgSession, type NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { bigint, boolean, check, foreignKey, index, pgTable, primaryKey, text, timestamp, unique, uniqueIndex, uuid,
+  type PgDatabase, type PgDialect, type PgQueryResultHKT, type PgTransaction, type PgTransactionConfig } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 import { workspaceRoles } from './browser.mjs';
 
@@ -66,6 +67,39 @@ export function sharedDatabase<TSchema extends Record<string, unknown>>(options:
       if (database) await database.pool.end();
     },
   };
+}
+
+// Any Drizzle PostgreSQL database; `ScopedTransaction` is the transaction its `transaction` hands out.
+export type AnyDatabase = PgDatabase<PgQueryResultHKT, any, any>;
+export type ScopedTransaction<TDatabase extends AnyDatabase> = TDatabase extends PgDatabase<infer H, infer F, infer S> ? PgTransaction<H, F, S> : never;
+// The parts of a node-postgres Drizzle database that `transaction` rebinds to one checked-out connection. `dialect`
+// and the session's `schema` and `options` are internal to drizzle-orm, which is pinned exactly for this reason.
+type PooledDatabase = { dialect: PgDialect; _?: { session?: unknown }; $client: pg.Pool };
+
+/**
+ * `db.transaction` without drizzle-orm 0.45.2's connection leak. Its node-postgres transaction sends BEGIN before its
+ * `try`, so a failed BEGIN never releases the pooled connection, and a failed ROLLBACK replaces the error that caused
+ * it. Over a pool this checks the connection out itself, as Books' tenancy did: it always releases it, discards it when
+ * BEGIN, COMMIT or ROLLBACK failed (its state is then unknown), and rethrows the callback's own error. Given a
+ * transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. `config` is
+ * Drizzle's, such as `{ accessMode: 'read only' }`; a savepoint ignores it.
+ */
+export async function transaction<TDatabase extends AnyDatabase, T>(db: TDatabase, run: (tx: ScopedTransaction<TDatabase>) => Promise<T>, config?: PgTransactionConfig): Promise<T> {
+  const pooled = db as unknown as PooledDatabase, client: unknown = pooled.$client;
+  const isPool = client instanceof Object && typeof (client as pg.Pool).connect === 'function' && Object.getPrototypeOf(client).constructor.name.includes('Pool');
+  const session = pooled._?.session;
+  if (!(session instanceof NodePgSession) || !isPool) return db.transaction(tx => run(tx as ScopedTransaction<TDatabase>), config);
+  const connection = await pooled.$client.connect();
+  let failure: { error: unknown } | undefined, broken = false;
+  try {
+    const { schema, options } = session as unknown as { schema: never; options: never };
+    return await new NodePgSession(connection, pooled.dialect, schema, options).transaction(async tx => {
+      try { return await run(tx as unknown as ScopedTransaction<TDatabase>); } catch (error) { failure = { error }; throw error; }
+    }, config);
+  } catch (error) {
+    broken = !failure || error !== failure.error;
+    throw failure ? failure.error : error;
+  } finally { connection.release(broken); }
 }
 
 // The common team tables exactly as workspace-team.sql creates them, constraint names included, so Drizzle queries are

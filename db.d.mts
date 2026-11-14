@@ -1,4 +1,5 @@
 import { type NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { type PgDatabase, type PgQueryResultHKT, type PgTransaction, type PgTransactionConfig } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 /**
  * PostgreSQL int8 (BIGINT, money in minor units) reads as `bigint`, never as a lossy number or a string. DATE is a
@@ -34,6 +35,17 @@ export declare function sharedDatabase<TSchema extends Record<string, unknown>>(
     get(): SharedDatabase<TSchema>;
     close(): Promise<void>;
 };
+export type AnyDatabase = PgDatabase<PgQueryResultHKT, any, any>;
+export type ScopedTransaction<TDatabase extends AnyDatabase> = TDatabase extends PgDatabase<infer H, infer F, infer S> ? PgTransaction<H, F, S> : never;
+/**
+ * `db.transaction` without drizzle-orm 0.45.2's connection leak. Its node-postgres transaction sends BEGIN before its
+ * `try`, so a failed BEGIN never releases the pooled connection, and a failed ROLLBACK replaces the error that caused
+ * it. Over a pool this checks the connection out itself, as Books' tenancy did: it always releases it, discards it when
+ * BEGIN, COMMIT or ROLLBACK failed (its state is then unknown), and rethrows the callback's own error. Given a
+ * transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. `config` is
+ * Drizzle's, such as `{ accessMode: 'read only' }`; a savepoint ignores it.
+ */
+export declare function transaction<TDatabase extends AnyDatabase, T>(db: TDatabase, run: (tx: ScopedTransaction<TDatabase>) => Promise<T>, config?: PgTransactionConfig): Promise<T>;
 export declare const user: import("drizzle-orm/pg-core").PgTableWithColumns<{
     name: "user";
     schema: undefined;

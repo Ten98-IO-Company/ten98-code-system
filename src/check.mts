@@ -580,30 +580,54 @@ function rawStatementCounts(directory: string, policy: DataPolicy): Record<strin
   return counts;
 }
 
+// One allowlist entry: how many raw statements the file may hold and why they cannot be typed Drizzle queries.
+type Allowance = { count: number; reason: string };
+
+function readAllowlist(directory: string, policy: DataPolicy): { allowed: Record<string, Allowance>; exists: boolean; errors: string[] } {
+  const file = resolve(directory, policy.baseline);
+  if (!existsSync(file)) return { allowed: {}, exists: false, errors: [] };
+  const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { allowed: {}, exists: true, errors: [`${policy.baseline} must map each file to { "count", "reason" }.`] };
+  const allowed: Record<string, Allowance> = {}, errors: string[] = [];
+  for (const [path, entry] of Object.entries(parsed as Record<string, unknown>)) {
+    const { count, reason } = (entry ?? {}) as Partial<Allowance>;
+    if (!Number.isSafeInteger(count) || count! < 1) errors.push(`${policy.baseline}: ${path} needs a positive whole "count".`);
+    if (typeof reason !== 'string' || !reason.trim()) errors.push(`${policy.baseline}: ${path} needs a "reason" saying why its raw statements cannot be typed Drizzle queries.`);
+    allowed[path] = { count: Number.isSafeInteger(count) ? count! : 0, reason: typeof reason === 'string' ? reason : '' };
+  }
+  return { allowed, exists: true, errors };
+}
+
+function rawStatementRises(counts: Record<string, number>, allowed: Record<string, Allowance>, baseline: string): string[] {
+  return Object.entries(counts).filter(([path, found]) => found > (allowed[path]?.count ?? 0))
+    .map(([path, found]) => `${path}: raw statement count ${found} exceeds the allowlist (${allowed[path]?.count ?? 0} in ${baseline}); use a typed Drizzle query.`);
+}
+
 // Application queries are typed Drizzle queries. Raw statements stay only where the app's committed allowlist names
-// the file, and never more of them than it records.
+// the file with a reason, and never more of them than it records.
 export function checkDataAccess(directory: string, packageName: string): string[] {
   const policy = resolveProfile(packageName)?.profile.data;
   if (!policy) return [];
   directory = resolve(directory);
-  const file = resolve(directory, policy.baseline);
-  const allowed: Record<string, number | undefined> = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-  return Object.entries(rawStatementCounts(directory, policy)).filter(([path, found]) => found > (allowed[path] ?? 0))
-    .map(([path, found]) => `${path}: raw statement count ${found} exceeds the allowlist (${allowed[path] ?? 0} in ${policy.baseline}); use a typed Drizzle query.`);
+  const { allowed, errors } = readAllowlist(directory, policy);
+  return [...errors, ...rawStatementRises(rawStatementCounts(directory, policy), allowed, policy.baseline)];
 }
 
-// Lowers or removes allowlist entries; a rise is refused. A missing allowlist is recorded once from current counts,
-// and that first file is reviewed in the app's diff.
+// Lowers or removes allowlist entries and keeps their reasons; a rise is refused. A missing allowlist is recorded once
+// from current counts. New entries are written with an empty reason, which the check refuses until someone writes it,
+// so the first allowlist is justified file by file in the app's diff.
 export function updateRawStatementBaseline(directory: string, packageName: string): string[] {
   const policy = resolveProfile(packageName)?.profile.data;
   if (!policy) return [];
-  if (existsSync(resolve(directory, policy.baseline))) {
-    const errors = checkDataAccess(directory, packageName);
-    if (errors.length) return errors;
+  directory = resolve(directory);
+  const { allowed, exists } = readAllowlist(directory, policy), counts = rawStatementCounts(directory, policy);
+  if (exists) {
+    const rises = rawStatementRises(counts, allowed, policy.baseline);
+    if (rises.length) return rises;
   }
-  const counts = rawStatementCounts(resolve(directory), policy);
-  writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1)), null, 2)}\n`);
-  return [];
+  const entries = Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1).map(([path, count]) => [path, { count, reason: allowed[path]?.reason ?? '' }] as const);
+  writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(entries), null, 2)}\n`);
+  return readAllowlist(directory, policy).errors;
 }
 
 /**

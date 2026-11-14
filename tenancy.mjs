@@ -7,9 +7,8 @@
 // Drizzle declares the policy (`policy`) and ENABLE ROW LEVEL SECURITY (`pgTable(...).enableRLS()`). FORCE, the roles
 // and their grants are SQL in the app's custom migration step; `forceRowLevelSecurity` writes the FORCE part.
 import { and, eq, inArray, sql } from 'drizzle-orm';
-import { NodePgSession } from 'drizzle-orm/node-postgres';
-import { pgPolicy } from 'drizzle-orm/pg-core';
-import { membership, workspace } from './db.mjs';
+import { pgPolicy, PgTransaction } from 'drizzle-orm/pg-core';
+import { membership, transaction, workspace } from './db.mjs';
 /** One answer for a missing workspace and for a workspace the user may not reach (or not write), so ids reveal nothing. */
 export const workspaceNotFound = 'Workspace not found or unavailable.';
 export class WorkspaceAccessError extends Error {
@@ -21,41 +20,6 @@ export class DatabaseRoleError extends Error {
     constructor(problems) {
         super(`The application database role is unsafe for workspace data: ${problems.join('; ')}. Connect web and worker with the non-owner application role.`);
         this.name = 'DatabaseRoleError';
-    }
-}
-/**
- * Drizzle's transaction (0.45.2, node-postgres/session.js) sends BEGIN before its `try`, so a failed BEGIN never
- * releases the pooled connection, and a failed ROLLBACK replaces the error that caused it. Over a pool this checks the
- * connection out itself, as Books' tenancy did: it always releases it, discards it when BEGIN, COMMIT or ROLLBACK
- * failed (its state is then unknown), and rethrows the callback's own error. Anything else, such as a transaction for
- * a savepoint, keeps Drizzle's own `transaction`.
- */
-async function transaction(db, run) {
-    const pooled = db, client = pooled.$client;
-    const isPool = client instanceof Object && typeof client.connect === 'function' && Object.getPrototypeOf(client).constructor.name.includes('Pool');
-    const session = pooled._?.session;
-    if (!(session instanceof NodePgSession) || !isPool)
-        return db.transaction(tx => run(tx));
-    const connection = await pooled.$client.connect();
-    let failure, broken = false;
-    try {
-        const { schema, options } = session;
-        return await new NodePgSession(connection, pooled.dialect, schema, options).transaction(async (tx) => {
-            try {
-                return await run(tx);
-            }
-            catch (error) {
-                failure = { error };
-                throw error;
-            }
-        });
-    }
-    catch (error) {
-        broken = !failure || error !== failure.error;
-        throw failure ? failure.error : error;
-    }
-    finally {
-        connection.release(broken);
     }
 }
 const writers = ['owner', 'admin', 'editor'];
@@ -76,12 +40,32 @@ export function createTenancy({ setting, column, tables }) {
     const scope = sql.raw(`${column} = ANY (string_to_array(current_setting('${setting}', true), ','))`);
     // The scope as PostgreSQL stores it in pg_policies once `deparseNoise` is removed.
     const storedScope = `${column}=ANYstring_to_arraycurrent_setting'${setting}',true,','`;
+    // Parameterised `sql` statements by necessity: Drizzle has no builder for set_config or current_setting.
+    const setScope = (tx, value) => tx.execute(sql `SELECT set_config(${setting}, ${value}, true)`);
+    const readScope = async (tx) => (await tx.execute(sql `SELECT current_setting(${setting}, true) AS scope`)).rows[0]?.scope ?? '';
     /**
-     * Sets, for the rest of the current transaction only, the workspaces row-level security admits. A parameterised `sql`
-     * statement by necessity: Drizzle has no builder for set_config.
+     * Runs `run` with row-level security admitting `workspaceIds`. In a transaction of its own the scope lasts to its end.
+     * `nested` (a caller's transaction or a savepoint, which may already hold a scope) puts the caller's scope back when
+     * `run` settles, so the caller never goes on in the inner workspace. After an error the transaction may be aborted
+     * and refuse the restore; the caller's ROLLBACK, or the savepoint's, then undoes the inner scope instead.
      */
-    async function setScope(tx, workspaceIds) {
-        await tx.execute(sql `SELECT set_config(${setting}, ${workspaceIds.join(',')}, true)`);
+    async function inScope(tx, workspaceIds, nested, run) {
+        if (!nested) {
+            await setScope(tx, workspaceIds.join(','));
+            return run();
+        }
+        const previous = await readScope(tx);
+        await setScope(tx, workspaceIds.join(','));
+        let result;
+        try {
+            result = await run();
+        }
+        catch (error) {
+            await setScope(tx, previous).catch(() => undefined);
+            throw error;
+        }
+        await setScope(tx, previous);
+        return result;
     }
     /**
      * The caller's memberships among `workspaceIds`, taken inside the transaction. Each membership row is share-locked
@@ -112,31 +96,37 @@ export function createTenancy({ setting, column, tables }) {
         forceRowLevelSecurity() {
             return tables.map(table => `ALTER TABLE "${table}" FORCE ROW LEVEL SECURITY;`).join('\n--> statement-breakpoint\n');
         },
-        setScope,
         /**
          * Authorizes `userId` as a member of `workspaceId` (viewers read; editors, admins and owners write) and runs `run` in
-         * one transaction whose row-level security admits that workspace only. `outer` joins a transaction the caller already
-         * holds (workspace creation inserts the workspace first); the caller then owns commit and rollback.
+         * one transaction whose row-level security admits that workspace only. `read` makes that transaction READ ONLY once
+         * the membership is checked (its share lock cannot be taken in a read-only transaction). `outer` joins a transaction
+         * the caller already holds (workspace creation inserts the workspace first), and `db` may itself be a transaction (a
+         * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards.
          */
         async withWorkspace(db, userId, workspaceId, mode, run, outer) {
+            const nested = outer !== undefined || db instanceof PgTransaction;
             const scoped = async (tx) => {
                 const [access] = await memberships(tx, userId, [workspaceId]);
                 if (!access || (mode !== 'read' && !writers.includes(access.role)))
                     throw new WorkspaceAccessError();
-                await setScope(tx, [access.workspaceId]);
-                return run(tx, access);
+                if (mode === 'read' && !nested)
+                    await tx.setTransaction({ accessMode: 'read only' });
+                return inScope(tx, [access.workspaceId], nested, () => run(tx, access));
             };
             return outer ? scoped(outer) : transaction(db, scoped);
         },
         /**
-         * For reads: runs `run` in one transaction scoped to those of `workspaceIds` the user is a member of. Ids the user
-         * cannot reach are left out silently; `run` receives the ones admitted.
+         * For reads: runs `run` in one READ ONLY transaction scoped to those of `workspaceIds` the user is a member of. Ids
+         * the user cannot reach are left out silently; `run` receives the ones admitted. Given a transaction as `db` it runs in
+         * a savepoint, as `withWorkspace` does, and restores the caller's scope.
          */
         withWorkspaces(db, userId, workspaceIds, run) {
+            const nested = db instanceof PgTransaction;
             return transaction(db, async (tx) => {
                 const access = await memberships(tx, userId, workspaceIds);
-                await setScope(tx, access.map(item => item.workspaceId));
-                return run(tx, access);
+                if (!nested)
+                    await tx.setTransaction({ accessMode: 'read only' });
+                return inScope(tx, access.map(item => item.workspaceId), nested, () => run(tx, access));
             });
         },
         /**

@@ -1,6 +1,8 @@
-import { type PgDatabase, type PgPolicy, type PgQueryResultHKT, type PgTransaction } from 'drizzle-orm/pg-core';
+import { type PgPolicy } from 'drizzle-orm/pg-core';
 import type pg from 'pg';
 import type { WorkspaceRole } from './browser.mjs';
+import { type AnyDatabase, type ScopedTransaction } from './db.mjs';
+export type { ScopedTransaction } from './db.mjs';
 export type WorkspaceMode = 'read' | 'write';
 /** The authorized workspace with its name and the caller's role in it. */
 export type WorkspaceAccess = {
@@ -8,8 +10,6 @@ export type WorkspaceAccess = {
     name: string;
     role: WorkspaceRole;
 };
-type AnyDatabase = PgDatabase<PgQueryResultHKT, any, any>;
-export type ScopedTransaction<TDatabase extends AnyDatabase> = TDatabase extends PgDatabase<infer H, infer F, infer S> ? PgTransaction<H, F, S> : never;
 type Queryable = {
     query<R extends pg.QueryResultRow>(text: string, values?: unknown[]): Promise<pg.QueryResult<R>>;
 };
@@ -42,16 +42,18 @@ export declare function createTenancy<TTable extends string>({ setting, column, 
      * the migration file, never executed here; the table names are the identifiers checked by `createTenancy`.
      */
     forceRowLevelSecurity(): string;
-    setScope: (tx: Pick<AnyDatabase, 'execute'>, workspaceIds: readonly string[]) => Promise<void>;
     /**
      * Authorizes `userId` as a member of `workspaceId` (viewers read; editors, admins and owners write) and runs `run` in
-     * one transaction whose row-level security admits that workspace only. `outer` joins a transaction the caller already
-     * holds (workspace creation inserts the workspace first); the caller then owns commit and rollback.
+     * one transaction whose row-level security admits that workspace only. `read` makes that transaction READ ONLY once
+     * the membership is checked (its share lock cannot be taken in a read-only transaction). `outer` joins a transaction
+     * the caller already holds (workspace creation inserts the workspace first), and `db` may itself be a transaction (a
+     * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards.
      */
     withWorkspace<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceId: string, mode: WorkspaceMode, run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess) => Promise<T>, outer?: ScopedTransaction<TDatabase>): Promise<T>;
     /**
-     * For reads: runs `run` in one transaction scoped to those of `workspaceIds` the user is a member of. Ids the user
-     * cannot reach are left out silently; `run` receives the ones admitted.
+     * For reads: runs `run` in one READ ONLY transaction scoped to those of `workspaceIds` the user is a member of. Ids
+     * the user cannot reach are left out silently; `run` receives the ones admitted. Given a transaction as `db` it runs in
+     * a savepoint, as `withWorkspace` does, and restores the caller's scope.
      */
     withWorkspaces<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceIds: readonly string[], run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess[]) => Promise<T>): Promise<T>;
     /**
@@ -63,4 +65,3 @@ export declare function createTenancy<TTable extends string>({ setting, column, 
     assertDatabaseRoles(pool: Queryable, checked?: readonly string[]): Promise<void>;
 };
 export type Tenancy<TTable extends string = string> = ReturnType<typeof createTenancy<TTable>>;
-export {};

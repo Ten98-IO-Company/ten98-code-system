@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { eq, type SQL } from 'drizzle-orm';
+import { eq, sql, type SQL } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { getTableConfig, PgDialect, pgTable, serial, text } from 'drizzle-orm/pg-core';
 import pg from 'pg';
-import { createPool, teamSchema } from '../db.mjs';
+import { createPool, teamSchema, transaction } from '../db.mjs';
 import { createTenancy, DatabaseRoleError, WorkspaceAccessError, workspaceNotFound } from '../tenancy.mjs';
 
 const tenancy = createTenancy({ setting: 'app.workspace_ids', column: 'workspace_id', tables: ['note'] });
@@ -87,6 +87,26 @@ test('a failed ROLLBACK neither hides the callback\'s error nor returns the conn
   await assert.rejects(tenancy.withWorkspace(drizzle(kept as never), 'u', fakeWorkspace, 'write', async () => { throw original; }), error => error === original);
   assert.equal(await tenancy.withWorkspace(drizzle(kept as never), 'u', fakeWorkspace, 'write', async (_tx, access) => access.role), 'owner');
   assert.deepEqual([kept.sent, kept.released], [['begin', 'select', 'select', 'rollback', 'begin', 'select', 'select', 'commit'], [false, false]]);
+});
+
+test('read access switches to READ ONLY after the membership check, and the API has no unchecked scope setter', async () => {
+  const pool = new ScriptedPool({});
+  await tenancy.withWorkspace(drizzle(pool as never), 'u', fakeWorkspace, 'read', async () => undefined);
+  await tenancy.withWorkspaces(drizzle(pool as never), 'u', [fakeWorkspace], async () => undefined);
+  // begin, membership (with its share lock), SET TRANSACTION READ ONLY, set_config, commit.
+  assert.deepEqual(pool.sent, ['begin', 'select', 'set', 'select', 'commit', 'begin', 'select', 'set', 'select', 'commit']);
+  assert.equal('setScope' in tenancy, false);
+});
+
+test('the exported transaction releases a connection whose BEGIN failed and keeps the callback\'s error', async () => {
+  const lost = new Error('connection reset during BEGIN'), failing = new ScriptedPool({ begin: lost });
+  await assert.rejects(transaction(drizzle(failing as never), async () => 'unreached'), error => error === lost || (error as { cause?: unknown }).cause === lost);
+  assert.deepEqual(failing.released, [true]);
+  const original = new Error('the callback failed'), broken = new ScriptedPool({ rollback: new Error('rollback failed') });
+  await assert.rejects(transaction(drizzle(broken as never), async () => { throw original; }), error => error === original);
+  const working = new ScriptedPool({});
+  assert.equal(await transaction(drizzle(working as never), async () => 'done'), 'done');
+  assert.deepEqual([broken.released, working.sent, working.released], [[true], ['begin', 'commit'], [false]]);
 });
 
 // Integration tests on real PostgreSQL, opt-in: set TEN98_TEST_DATABASE_URL to a disposable server (a superuser URL; each
@@ -270,6 +290,38 @@ test('withWorkspaces reads across the reachable workspaces and leaves the others
   assert.deepEqual(bodies, ['one', 'two edited']);
   assert.deepEqual(await tenancy.withWorkspaces(db, fixture.b, ids, async (tx, access) => [access.length, (await tx.select().from(note)).length]), [1, 1]);
   assert.deepEqual(await tenancy.withWorkspaces(db, randomUUID(), ids, async (tx, access) => [access.length, (await tx.select().from(note)).length]), [0, 0], 'an empty scope admits nothing');
+});
+
+test('read access runs READ ONLY; a caller\'s own transaction keeps its access mode', { skip }, async () => {
+  const db = appDb(), readOnly = (error: unknown) => sqlState(error) === '25006';
+  await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', tx => tx.update(note).set({ body: 'x' })), readOnly);
+  await assert.rejects(tenancy.withWorkspaces(db, fixture.a, [fixture.w1], tx => tx.insert(note).values({ workspaceId: fixture.w1, body: 'x' })), readOnly);
+  const mode = async (tx: { execute: typeof db.execute }) => (await tx.execute<{ mode: string }>(sql`SELECT current_setting('transaction_read_only') AS mode`)).rows[0]!.mode;
+  await db.transaction(async outer => {
+    assert.equal(await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', tx => mode(tx), outer), 'off');
+    assert.equal(await tenancy.withWorkspace(outer, fixture.a, fixture.w1, 'read', tx => mode(tx)), 'off', 'a savepoint');
+    assert.equal(await mode(outer), 'off');
+  });
+  assert.equal(await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'write', tx => mode(tx)), 'off');
+});
+
+test('a nested scoped call gives the caller its own scope back, after success and after an error', { skip }, async () => {
+  const db = appDb(), inner = new Error('the inner callback failed');
+  const visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note).orderBy(note.id)).map(row => row.id);
+  await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'write', async tx => {
+    assert.deepEqual(await visible(tx), [fixture.w1]);
+    // In a savepoint (a transaction passed as db) and in the caller's transaction (outer).
+    assert.deepEqual(await tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible), [fixture.w2]);
+    assert.deepEqual(await visible(tx), [fixture.w1]);
+    assert.deepEqual(await tenancy.withWorkspace(db, fixture.a, fixture.w2, 'write', visible, tx), [fixture.w2]);
+    assert.deepEqual(await visible(tx), [fixture.w1]);
+    assert.deepEqual(await tenancy.withWorkspaces(tx, fixture.a, [fixture.w1, fixture.w2], visible), [fixture.w1, fixture.w2]);
+    assert.deepEqual(await visible(tx), [fixture.w1]);
+    await assert.rejects(tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', async () => { throw inner; }), error => error === inner);
+    assert.deepEqual(await visible(tx), [fixture.w1]);
+    await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w2, 'write', async () => { throw inner; }, tx), error => error === inner);
+    assert.deepEqual(await visible(tx), [fixture.w1]);
+  });
 });
 
 // Last: this changes D's membership.

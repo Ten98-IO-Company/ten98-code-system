@@ -149,16 +149,40 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
       assert.equal(refused.status, 1, statement);
       assert.match(refused.stderr, /src\/server\/report\.ts: raw statement count 1 exceeds the allowlist \(0 in raw-statements\.json\)/, statement);
     }
-    writeFileSync(join(app, 'raw-statements.json'), JSON.stringify({ 'src/server/report.ts': 1 }));
+    const allowlist = join(app, 'raw-statements.json'), recorded = () => JSON.parse(readFileSync(allowlist, 'utf8'));
+    // Each entry needs a count and a reason; a bare count or an empty reason is refused.
+    for (const [entry, expected] of [
+      [1, /report\.ts needs a positive whole "count"[\s\S]*report\.ts needs a "reason"/],
+      [{ count: 1 }, /report\.ts needs a "reason" saying why/],
+      [{ count: 1, reason: '  ' }, /report\.ts needs a "reason" saying why/],
+      [{ count: 0, reason: 'x' }, /report\.ts needs a positive whole "count"/],
+    ] as const) {
+      writeFileSync(allowlist, JSON.stringify({ 'src/server/report.ts': entry }));
+      assert.match(run().stderr, expected, JSON.stringify(entry));
+    }
+    writeFileSync(allowlist, JSON.stringify([]));
+    assert.match(run().stderr, /raw-statements\.json must map each file/);
+    writeFileSync(allowlist, JSON.stringify({ 'src/server/report.ts': { count: 1, reason: 'Reads pg_stat_activity.' } }));
     assert.equal(run().status, 0, run().stderr);
     // A second statement in the same file exceeds the recorded count.
     writeFileSync(source, "await pool.query('SELECT 1');\nawait pool.query('SELECT 2');\n");
     assert.match(run().stderr, /raw statement count 2 exceeds the allowlist \(1 in raw-statements\.json\)/);
-    // The updater refuses a rise and only lowers.
+    // The updater refuses a rise, lowers while keeping the reason, and removes an entry that reaches zero.
     assert.equal(run('--update-raw-statement-baseline').status, 1);
+    writeFileSync(join(app, 'src/server/other.ts'), "await pool.query('SELECT 1');\n");
+    writeFileSync(allowlist, JSON.stringify({ 'src/server/report.ts': { count: 2, reason: 'Reads pg_stat_activity.' }, 'src/server/other.ts': { count: 3, reason: 'Kept.' } }));
+    assert.equal(run('--update-raw-statement-baseline').status, 0);
+    assert.deepEqual(recorded(), { 'src/server/other.ts': { count: 1, reason: 'Kept.' }, 'src/server/report.ts': { count: 2, reason: 'Reads pg_stat_activity.' } });
     writeFileSync(source, 'export {};\n');
     assert.equal(run('--update-raw-statement-baseline').status, 0);
-    assert.deepEqual(JSON.parse(readFileSync(join(app, 'raw-statements.json'), 'utf8')), {});
+    assert.deepEqual(recorded(), { 'src/server/other.ts': { count: 1, reason: 'Kept.' } });
+    // A first allowlist is recorded with empty reasons, which fail until someone writes them.
+    rmSync(allowlist);
+    const first = run('--update-raw-statement-baseline');
+    assert.equal(first.status, 1);
+    assert.match(first.stderr, /other\.ts needs a "reason"/);
+    assert.deepEqual(recorded(), { 'src/server/other.ts': { count: 1, reason: '' } });
+    assert.equal(run().status, 1);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
