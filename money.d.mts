@@ -34,6 +34,29 @@ export declare function multiplyMoney(amount: bigint, rate: string, rounding: Mo
 /** `amount × percent / 100`, for a decimal-string percentage such as VAT `'5'` or `'15'`. */
 export declare function percentOfMoney(amount: bigint, percent: string, rounding: MoneyRounding): bigint;
 /**
+ * `amount × rate` from one currency's minor units to another's, with one rounding: `convertMoney(700n, 2, '3.67', 2,
+ * 'half-up') === 2569n` (USD 7.00 at 3.67 is AED 25.69). The rate is target units per source unit, a plain decimal
+ * above zero with at most 10 fraction digits; anything else is a TypeError or RangeError. The result equals
+ * `round(amount × units × 10^(toExponent − fromExponent) / 10^places)` computed on exact integers, the same form as
+ * PostgreSQL `numeric` integer arithmetic with `div`. It is not range-checked: call `assertMoneyInRange` before
+ * storing it.
+ */
+export declare function convertMoney(amount: bigint, fromExponent: MoneyExponent, rate: string, toExponent: MoneyExponent, rounding: MoneyRounding): bigint;
+/**
+ * The rate (target units per source unit) that two amounts imply, as a decimal string with exactly `places` digits
+ * (an integer from 0 to 10), rounded once: `rateOfAmounts(2571n, 2, 700n, 2, 4, 'half-up') === '3.6729'`. It is the
+ * exact `target × 10^(sourceExponent + places) / (source × 10^targetExponent)` rounded by one integer division, so
+ * it never rounds twice. For half-up on positive amounts it equals the PostgreSQL integer form
+ * `(2 × T × 10^(sourceExponent + places) + S × 10^targetExponent) div (2 × S × 10^targetExponent)`. A zero `source`
+ * is a RangeError.
+ *
+ * Converting `source` back at this rate drifts from `target` by at most
+ * `|source| × 10^(targetExponent − sourceExponent − places) / 2` before rounding, plus half a unit after it.
+ * A result of zero (`'0.0000'`) and a rate too large for the caller's column are returned, not refused: the caller
+ * decides whether to accept them.
+ */
+export declare function rateOfAmounts(target: bigint, targetExponent: MoneyExponent, source: bigint, sourceExponent: MoneyExponent, places: number, rounding: MoneyRounding): string;
+/**
  * Splits `total` across non-negative bigint weights (at least one positive) by the largest-remainder method. The parts
  * always sum to `total`, a zero weight always receives 0n, leftover units go to the largest remainders with ties to
  * the earlier index, and a negative total splits as the exact negation of its positive split.

@@ -123,6 +123,8 @@
         "MONEY_MIN",
         "MONEY_MAX",
         "assertMoneyInRange",
+        "convertMoney",
+        "rateOfAmounts",
         "createWorkspaceTeam",
         "TeamError",
         "isTeamError",
