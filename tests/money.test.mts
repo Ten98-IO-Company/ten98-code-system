@@ -215,6 +215,8 @@ test('convertMoney gives the specified cases, across exponents, with one roundin
   assert.equal(convertMoney(1n, 0, '1', 3, 'half-up'), 1000n);
   assert.equal(convertMoney(1999n, 3, '1', 0, 'half-up'), 2n);
   assert.equal(convertMoney(-25n, 2, '3.70', 2, 'half-up'), -93n);
+  // A negative exact half rounds away from zero; PostgreSQL's plain div form would give ...475 here.
+  assert.equal(convertMoney(-9439157537n, 0, '2848253956.97801', 2, 'half-up'), -2688511780529905683476n);
   assert.equal(convertMoney(0n, 2, '3.67', 3, 'half-up'), 0n);
 });
 
@@ -222,6 +224,8 @@ test('rateOfAmounts gives the specified cases and rounds a half by the mode', ()
   assert.equal(rateOfAmounts(37033n, 2, 10000n, 2, 4, 'half-up'), '3.7033');
   assert.equal(rateOfAmounts(2571n, 2, 700n, 2, 4, 'half-up'), '3.6729');
   assert.equal(rateOfAmounts(2571n, 2, 700n, 2, 4, 'down'), '3.6728');
+  // 12.49 rounds once to 0.12; rounding first to 0.125 and then to two places would give 0.13.
+  assert.equal(rateOfAmounts(1249n, 0, 10000n, 0, 2, 'half-up'), '0.12');
   // 1 / 8 = 0.125 and 3 / 8 = 0.375 exactly: halves at two places.
   assert.equal(rateOfAmounts(1n, 2, 8n, 2, 2, 'half-up'), '0.13');
   assert.equal(rateOfAmounts(1n, 2, 8n, 2, 2, 'half-even'), '0.12');
