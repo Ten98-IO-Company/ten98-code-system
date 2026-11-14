@@ -26,6 +26,14 @@ Verification must include the feature's listed tests and actual UI/API/persisten
 
 Before claiming adoption complete, preserve existing accounts/data and error contracts, pass the consumer's architecture/type/test/build gates, obtain independent review, and record the exact source tag and commit, commands, results, skips and remaining gaps in GitHub. The catalogue's issue statuses are a snapshot: consult issues [#4](https://github.com/Ten98-IO-Company/ten98-code-system/issues/4) through [#8](https://github.com/Ten98-IO-Company/ten98-code-system/issues/8) before choosing a reference. Current static dependency checks do not prove complete feature adoption.
 
+## Row-level security with Drizzle
+
+Every app forces row-level security and connects as a non-owner role without BYPASSRLS. Declare what Drizzle can carry in the schema and put the rest in a custom migration step (`drizzle-kit generate --custom`); the migration ledger applies both kinds of file the same way. Trial on drizzle-orm 0.45.2 and drizzle-kit 0.31.11 against PostgreSQL 18.6, 2026-11-14:
+
+- In the schema: `pgPolicy(name, { as, for, to, using, withCheck })` in the table callback, `.enableRLS()` on a table without a policy (a policy enables RLS by itself), and `pgRole(name).existing()` to name the application role in `to`. drizzle-kit emits `ENABLE ROW LEVEL SECURITY` and `CREATE POLICY` with the `sql` expression verbatim, and a second generate reports no change.
+- In the custom step: `FORCE ROW LEVEL SECURITY`, every `GRANT`, the roles themselves (`pgRole` has no LOGIN, BYPASSRLS or password options), triggers and functions. drizzle-kit keeps no record of these, so it neither generates nor reverts them.
+- Review generated SQL. A policy change is emitted as `DROP POLICY` then `CREATE POLICY`. drizzle-kit writes `WITH CHECK` on a `for: 'select'` or `for: 'delete'` policy, which PostgreSQL rejects. Removing `.enableRLS()` from a table without a policy emits `DISABLE ROW LEVEL SECURITY`, which leaves FORCE set but switches the protection off.
+
 ## Isolated browser audit
 
 Runtime 0.23.0 adds the server-only `@ten98/runtime/browser-audit` entry with `createBrowserAuditControl`, `BrowserControlOptions`, `NativeBrowserResource`, `ObserverTransport`, `BrowserRequestDenial`, `BrowserControlTrace`, `createPublicEgressProxy` and `PublicEgressOptions`. The facade has no capsule startup or third-party dependencies. Use the existing `normalizeLighthouseReport` for supplied reports. Never import these Node mechanisms from browser UI.
