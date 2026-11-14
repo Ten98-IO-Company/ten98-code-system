@@ -13,17 +13,34 @@ export function inspectWaivers() {
     const items = (value) => value === undefined || Array.isArray(value) && value.length > 0 && value.every(text);
     for (const [name, entry] of Object.entries(contract.exceptions ?? {})) {
         if (!waivableRules.includes(entry?.rule) || !Array.isArray(entry.profiles) || !entry.profiles.length || entry.profiles.some(profile => !Object.hasOwn(contract.profiles, profile))
-            || !items(entry.items) || !text(entry.reason) || !text(entry.owner) || !text(entry.reviewTrigger)) {
-            errors.push(`exceptions.${name} needs a known rule, known profiles, a reason, an owner and a review trigger.`);
+            || !items(entry.items) || !text(entry.reason) || !text(entry.owner) || !text(entry.reviewTrigger) || !text(entry.review)) {
+            errors.push(`exceptions.${name} needs a known rule, known profiles, a reason, an owner, a review trigger and a review record.`);
         }
     }
+    const stack = new Set([...Object.keys(contract.appStack?.dependencies ?? {}), ...Object.keys(contract.appStack?.devDependencies ?? {})]);
     for (const [name, entry] of Object.entries(contract.transitions ?? {})) {
+        // A transition names what it still allows, so it relaxes a rule to the app's recorded current state, not entirely.
         if (!waivableRules.includes(entry?.rule) || !Object.hasOwn(contract.profiles, entry.profile) || !items(entry.items)
+            || entry.rule !== 'database.engine' && entry.items === undefined
+            || entry.rule === 'appStack' && entry.items?.some(item => !stack.has(item))
             || !text(entry.reason) || !text(entry.owner) || !text(entry.doneWhen)) {
-            errors.push(`transitions.${name} needs a known rule, a known profile, a reason, an owner and a done-when condition.`);
+            errors.push(`transitions.${name} needs a known rule, a known profile, the items it still allows, a reason, an owner and a done-when condition.`);
         }
+    }
+    // One shared stack: an app profile adds libraries and its own source and data roots, and cannot restate the stack.
+    const own = new Set(['stack', 'boundary', 'dependencies', 'devDependencies', 'sourceLanguage', 'data']);
+    for (const [name, profile] of Object.entries(contract.profiles)) {
+        if (profile.stack !== 'app')
+            continue;
+        const restated = [...Object.keys(profile).filter(key => !own.has(key)), ...Object.keys({ ...profile.dependencies, ...profile.devDependencies }).filter(item => stack.has(item))];
+        if (restated.length)
+            errors.push(`profiles.${name} restates the shared app stack (${restated.join(', ')}); change appStack or record a transition.`);
     }
     return errors;
+}
+// Whether a transition for this profile and rule allows `value`; `unset` stands for an absent field.
+function transitionAllows(profile, rule, value) {
+    return transitionsFor(profile, rule).some(entry => entry.items?.includes(value ?? 'unset'));
 }
 // Open transitions for a profile and rule; their items name what each transition still waives.
 function transitionsFor(profile, rule) {
@@ -118,7 +135,7 @@ export function checkManifest(manifest) {
     };
     same(manifest.engines?.node, contract.node, 'engines.node');
     same(manifest.type, 'module', 'type');
-    if (!transitionsFor(profileName, 'packageManager').length)
+    if (!transitionAllows(profileName, 'packageManager', manifest.packageManager))
         same(manifest.packageManager, contract.packageManager, 'packageManager');
     const drivers = new Set(contract.databasePolicy.otherDrivers);
     for (const section of [manifest.dependencies, manifest.optionalDependencies, manifest.devDependencies, manifest.peerDependencies]) {
@@ -428,42 +445,66 @@ export function updatePresentationBaseline(directory, name, options = {}) {
     return [];
 }
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-// Reads the app's own Dockerfile and compose files. Only images named exactly `postgres` are version-checked; a
-// differently named PostgreSQL image (pgvector, a mirror) is outside this check.
+// Container files at the app root and one folder below it (deploy/, docker/), skipping installed and built output.
+function containerFiles(directory, pattern) {
+    const skip = new Set(['node_modules', '.git', 'vendor', 'dist', '.output', 'build', 'coverage']), files = [];
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (entry.isFile() && pattern.test(entry.name))
+            files.push(entry.name);
+        else if (entry.isDirectory() && !skip.has(entry.name)) {
+            for (const inner of readdirSync(resolve(directory, entry.name), { withFileTypes: true }))
+                if (inner.isFile() && pattern.test(inner.name))
+                    files.push(`${entry.name}/${inner.name}`);
+        }
+    }
+    return files.sort();
+}
+// Text matching of the app's Dockerfiles and compose files, not a parser: an image named through a build argument or
+// an environment default without a literal `postgres` reference, or a differently named PostgreSQL image (pgvector,
+// a registry mirror), is outside this check.
 export function checkDeployment(directory, packageName) {
     const resolved = resolveProfile(packageName);
     if (!resolved)
         return [];
     directory = resolve(directory);
     const errors = [];
-    const dockerfile = resolve(directory, 'Dockerfile');
-    if (existsSync(dockerfile) && !transitionsFor(resolved.name, 'baseImage').length) {
-        const base = new RegExp(`^${escapeRegExp(contract.baseImage)}(?:@sha256:[0-9a-f]{64})?$`, 'u'), stages = new Set();
-        for (const line of readFileSync(dockerfile, 'utf8').split(/\r?\n/u)) {
+    const digest = '(?:@sha256:[0-9a-f]{64})?';
+    const allowed = [contract.baseImage, ...transitionsFor(resolved.name, 'baseImage').flatMap(entry => entry.items ?? [])];
+    const base = new RegExp(`^(?:${allowed.map(escapeRegExp).join('|')})${digest}$`, 'u');
+    for (const name of containerFiles(directory, /^(?:Dockerfile|Containerfile)(?:\..+)?$|\.(?:dockerfile|containerfile)$/iu)) {
+        const stages = new Set();
+        for (const line of readFileSync(resolve(directory, name), 'utf8').split(/\r?\n/u)) {
             const from = /^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?/iu.exec(line);
-            if (!from)
-                continue;
-            if (!stages.has(from[1].toLowerCase()) && !base.test(from[1]))
-                errors.push(`Dockerfile: base image ${from[1]} must be ${contract.baseImage}, optionally pinned by digest.`);
-            if (from[2])
+            // COPY --from= may name another image instead of a stage, which brings that image's files (and Node) along.
+            const copied = /^\s*COPY\s+(?:--\S+\s+)*?--from=(\S+)/iu.exec(line);
+            const image = from?.[1] ?? copied?.[1];
+            if (image && !stages.has(image.toLowerCase()) && !/^\d+$/u.test(image) && !base.test(image))
+                errors.push(`${name}: base image ${image} must be ${contract.baseImage}, optionally pinned by digest.`);
+            if (from?.[2])
                 stages.add(from[2].toLowerCase());
         }
     }
-    const postgres = new RegExp(`^postgres:${contract.databasePolicy.postgresql}(?:[.-][\\w.-]*)?(?:@sha256:[0-9a-f]{64})?$`, 'u');
-    for (const name of ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml']) {
-        const file = resolve(directory, name);
-        if (!existsSync(file))
-            continue;
-        for (const match of readFileSync(file, 'utf8').matchAll(/^\s*image:\s*["']?(postgres(?:[:@][^\s"']*)?)["']?\s*$/gmu)) {
-            if (!postgres.test(match[1]))
-                errors.push(`${name}: PostgreSQL image ${match[1]} must be major ${contract.databasePolicy.postgresql} (postgres:${contract.databasePolicy.postgresql}).`);
+    const major = contract.databasePolicy.postgresql;
+    const postgres = new RegExp(`^postgres:${major}(?:[.-][\\w.-]*)?${digest}$`, 'u');
+    for (const name of containerFiles(directory, /^(?:docker-)?compose(?:\.[\w-]+)*\.ya?ml$/iu)) {
+        for (const line of readFileSync(resolve(directory, name), 'utf8').split(/\r?\n/u)) {
+            const value = line.replace(/\s#.*$/u, '');
+            if (!/\bimage\b/u.test(value))
+                continue;
+            // Block and inline maps, quoted values and `${VAR:-postgres:16}` defaults; docker.io/library/ is the same image.
+            for (const match of value.matchAll(/(?:^|[\s"'{,=]|:-)((?:docker\.io\/)?(?:library\/)?postgres(?:[:@][^\s"',}]*)?)(?=$|[\s"',}])/gu)) {
+                const image = match[1].replace(/^(?:docker\.io\/)?(?:library\/)?/u, '');
+                if (!postgres.test(image))
+                    errors.push(`${name}: PostgreSQL image ${match[1]} must be major ${major} (postgres:${major}).`);
+            }
         }
     }
     return errors;
 }
-// A pg `.query(` call, Drizzle `sql.raw(`, or `.execute(` given SQL text. Text matching, not parsing: a statement
-// built elsewhere and passed by variable to `.execute(` is not counted.
-const RAW_STATEMENT = /\.query\s*(?:<[^<>()]*(?:<[^<>()]*>[^<>()]*)*>)?\s*\(|\bsql\.raw\s*\(|\.execute\s*\(\s*(?:sql\s*)?[`'"]/gu;
+// A pg `.query(` call (also as `['query'](` or `.query.call(`), Drizzle `sql.raw(`, or `.execute(` given SQL text,
+// each with or without a type argument. Text matching, not parsing: a statement passed by variable to `.execute(`,
+// or `sql` imported under another name, is not counted.
+const RAW_STATEMENT = /\.query\s*(?:<[^;]*?>)?\s*\(|\[\s*['"]query['"]\s*\]\s*\(|\.query\s*\.\s*(?:call|apply)\s*\(|\bsql\.raw\s*\(|\.execute\s*(?:<[^;]*?>)?\s*\(\s*(?:sql\s*(?:<[^;]*?>)?\s*)?[`'"]/gu;
 function rawStatementCounts(directory, policy) {
     const counts = {};
     const walk = (folder) => {
@@ -511,13 +552,18 @@ export function updateRawStatementBaseline(directory, packageName) {
     writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1)), null, 2)}\n`);
     return [];
 }
-/** Read-only: each consumer manifest against the current declaration. Nothing is installed, built or written. */
+/**
+ * Read-only: each consumer manifest against the current declaration. Nothing is installed, built or written. `status`
+ * is manifest drift; `adoption` lists what the folder's container files and raw statements would still fail once
+ * the consumer installs this release. Source-language and presentation checks need an install and are not run.
+ */
 export function driftReport(directories) {
     return directories.map(directory => {
         const manifest = JSON.parse(readFileSync(resolve(directory, 'package.json'), 'utf8'));
         const runtime = manifest.dependencies?.['@ten98/runtime'] ?? manifest.devDependencies?.['@ten98/runtime'] ?? '(none)';
-        const problems = checkManifest(manifest);
-        return { directory, name: String(manifest.name), status: problems.length ? 'behind' : 'current', runtime, problems };
+        const problems = checkManifest(manifest), name = String(manifest.name);
+        const adoption = [...checkDeployment(directory, name), ...checkDataAccess(directory, name)];
+        return { directory, name, status: problems.length ? 'behind' : 'current', runtime, problems, adoption };
     });
 }
 // Release mode is separate from ordinary architecture checks and reads committed evidence.
@@ -628,6 +674,8 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
                 console.log(`${row.name} (${row.directory}): ${row.status}, runtime ${row.runtime}`);
                 for (const problem of row.problems)
                     console.log(`  - ${problem}`);
+                if (row.adoption.length)
+                    console.log(`  on adoption, ${row.adoption.length} container or raw-statement findings, first: ${row.adoption[0]}`);
             }
         }
         catch (error) {

@@ -36,8 +36,14 @@ test('packageManager must be pnpm 11.19.0 unless an open transition covers the a
     const manifest = books(); manifest.packageManager = value;
     assert.match(checkManifest(manifest).join('\n'), /packageManager: expected pnpm@11\.19\.0/, String(value));
   }
-  // Campaign still installs with npm under its recorded transition.
+  // Campaign still installs with npm under its recorded transition, which allows only that current state.
   assert.deepEqual(checkManifest(campaign()), []);
+  for (const value of ['yarn@4.5.0', 'pnpm@9.0.0']) {
+    const manifest = campaign(); manifest.packageManager = value;
+    assert.match(checkManifest(manifest).join('\n'), /packageManager: expected pnpm@11\.19\.0/, value);
+  }
+  const done = campaign(); done.packageManager = 'pnpm@11.19.0';
+  assert.deepEqual(checkManifest(done), []);
 });
 
 test('a second database driver is refused by name, in any dependency section', () => {
@@ -84,6 +90,16 @@ test('Dockerfile stages use the slim base image and compose runs PostgreSQL 18',
     [{ 'compose.yaml': 'services:\n  postgres:\n    image: "postgres:18.1-trixie"\n' }, null],
     [{ 'compose.yaml': 'services:\n  postgres:\n    image: postgres:16-alpine\n' }, /PostgreSQL image postgres:16-alpine must be major 18/],
     [{ 'docker-compose.yml': 'services:\n  db:\n    image: postgres\n' }, /PostgreSQL image postgres must be major 18/],
+    [{ 'compose.yaml': 'services:\n  db:\n    image: postgres:16 # local\n' }, /compose\.yaml: PostgreSQL image postgres:16 must/],
+    [{ 'compose.override.yaml': 'services:\n  db:\n    image: postgres:16\n' }, /compose\.override\.yaml: PostgreSQL image postgres:16/],
+    [{ 'compose.yaml': 'services: { db: { image: postgres:16 } }\n' }, /PostgreSQL image postgres:16 must/],
+    [{ 'compose.yaml': 'services:\n  db:\n    image: ${PG_IMAGE:-postgres:16}\n' }, /PostgreSQL image postgres:16 must/],
+    [{ 'compose.yaml': 'services:\n  db:\n    image: docker.io/library/postgres:16\n' }, /PostgreSQL image docker\.io\/library\/postgres:16 must/],
+    [{ 'compose.yaml': 'services:\n  postgres:\n    image: bitnami/postgresql:16\n  exporter:\n    image: quay.io/x/postgres-exporter:1\n' }, null],
+    [{ Dockerfile: `FROM ${slim} AS build\nCOPY --from=build /app /app\nCOPY --chown=node --from=node:20-alpine /usr/local/bin/node /usr/local/bin/node\n` }, /Dockerfile: base image node:20-alpine/],
+    [{ 'deploy/Dockerfile': 'FROM node:22-slim\n' }, /deploy\/Dockerfile: base image node:22-slim/],
+    [{ 'Dockerfile.prod': 'FROM node:24.22.1-alpine\n' }, /Dockerfile\.prod: base image node:24\.22\.1-alpine/],
+    [{ 'node_modules/pkg/Dockerfile': 'FROM node:18\n' }, null],
   ];
   for (const [files, expected] of cases) {
     const directory = temporary(files);
@@ -92,10 +108,11 @@ test('Dockerfile stages use the slim base image and compose runs PostgreSQL 18',
       if (expected) assert.match(errors, expected); else assert.equal(errors, '');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   }
-  // Campaign's alpine image is covered by its base-image transition; its PostgreSQL image is not.
-  const directory = temporary({ Dockerfile: 'FROM node:24.22.1-alpine\n', 'compose.yaml': 'services:\n  db:\n    image: postgres:15\n' });
-  try { assert.deepEqual(checkDeployment(directory, 'ten98-campaign'), ['compose.yaml: PostgreSQL image postgres:15 must be major 18 (postgres:18).']); }
-  finally { rmSync(directory, { recursive: true, force: true }); }
+  // Campaign's transition allows its current alpine image only; its PostgreSQL image is not covered.
+  const directory = temporary({ Dockerfile: 'FROM node:24.22.1-alpine\nFROM node:18-slim\n', 'compose.yaml': 'services:\n  db:\n    image: postgres:15\n' });
+  try {
+    assert.deepEqual(checkDeployment(directory, 'ten98-campaign'), ['Dockerfile: base image node:18-slim must be node:24.22.1-slim, optionally pinned by digest.', 'compose.yaml: PostgreSQL image postgres:15 must be major 18 (postgres:18).']);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
 test('check.mjs refuses a raw statement outside the allowlist and accepts it once allowlisted', () => {
@@ -118,7 +135,9 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
 
     writeFileSync(source, "import { db } from './db.ts';\nexport const rows = await db.select().from(ledger).where(eq(ledger.companyId, id));\n");
     assert.equal(run().status, 0, run().stderr);
-    for (const statement of ["await pool.query('SELECT 1')", 'await client.query<{ id: string }>(`SELECT id FROM t`)', 'await db.execute(sql`SELECT 1`)', "sql.raw('now()')"]) {
+    for (const statement of ["await pool.query('SELECT 1')", 'await client.query<{ id: string }>(`SELECT id FROM t`)', 'await db.execute(sql`SELECT 1`)', "sql.raw('now()')",
+      'await db.execute<{ id: string }>(sql`SELECT 1`)', 'await db.execute(sql<number>`SELECT 1`)', "await tx.execute<{ pid: number }>('SELECT pg_backend_pid()')",
+      "await pool.query<{ f: () => void }>('SELECT 1')", "await pool.query<{ a: Map<string, Set<number>> }>('SELECT 1')", "await pool['query']('SELECT 1')", "await pool.query.call(pool, 'SELECT 1')"]) {
       writeFileSync(source, `${statement};\n`);
       const refused = run();
       assert.equal(refused.status, 1, statement);
@@ -146,4 +165,33 @@ test('the drift report lists each consumer as current or behind without failing'
     assert.deepEqual(rows.map(row => [row.name, row.status]), [['ten98-books', 'current'], ['ten98-campaign', 'behind']]);
     assert.match(rows[1].problems.join('\n'), /ten98-runtime-0\.10\.0/);
   } finally { for (const directory of [current, old]) rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('the declaration keeps one shared app stack and waivers that name what they allow', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ten98-declaration-'));
+  try {
+    for (const name of ['check.mjs', 'database-policy.mjs']) writeFileSync(join(directory, name), readFileSync(new URL(`../${name}`, import.meta.url)));
+    writeFileSync(join(directory, 'package.json'), JSON.stringify(books()));
+    const pristine = readFileSync(new URL('../architecture.json', import.meta.url), 'utf8');
+    // The checker reads the declaration beside itself, so each case writes a changed copy and imports it fresh.
+    const run = (change: (contract: Record<string, any>) => void): string => {
+      const contract = JSON.parse(pristine); change(contract);
+      writeFileSync(join(directory, 'architecture.json'), JSON.stringify(contract));
+      const result = spawnSync(process.execPath, ['--input-type=module', '-'], { cwd: directory, encoding: 'utf8', timeout: 10_000, windowsHide: true,
+        input: "import { checkManifest } from './check.mjs'; import { readFileSync } from 'node:fs'; console.log(checkManifest(JSON.parse(readFileSync('package.json', 'utf8'))).join('\\n'));" });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout;
+    };
+    assert.equal(run(() => undefined).trim(), '');
+    for (const [change, expected] of [
+      [c => { c.profiles['ten98-books'].checkScripts = ['build']; }, /profiles\.ten98-books restates the shared app stack \(checkScripts\)/],
+      [c => { c.profiles['ten98-campaign'].dependencies.zod = '3.0.0'; }, /profiles\.ten98-campaign restates the shared app stack \(zod\)/],
+      [c => { c.transitions['campaign-app-stack'].items.push('react'); }, /transitions\.campaign-app-stack needs/],
+      [c => { delete c.transitions['campaign-pnpm'].items; }, /transitions\.campaign-pnpm needs/],
+      [c => { delete c.transitions['campaign-base-image'].owner; }, /transitions\.campaign-base-image needs/],
+      [c => { c.transitions['campaign-pnpm'].rule = 'packagemanager'; }, /transitions\.campaign-pnpm needs/],
+      [c => { delete c.exceptions['cloudflare-d1'].review; }, /exceptions\.cloudflare-d1 needs/],
+      [c => { c.exceptions['cloudflare-d1'].reviewTrigger = ' '; }, /exceptions\.cloudflare-d1 needs/],
+    ] satisfies [(contract: Record<string, any>) => void, RegExp][]) assert.match(run(change), expected);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });

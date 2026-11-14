@@ -110,13 +110,18 @@ export declare function updatePresentationBaseline(directory: string, name: stri
 export declare function checkDeployment(directory: string, packageName: string): string[];
 export declare function checkDataAccess(directory: string, packageName: string): string[];
 export declare function updateRawStatementBaseline(directory: string, packageName: string): string[];
-/** Read-only: each consumer manifest against the current declaration. Nothing is installed, built or written. */
+/**
+ * Read-only: each consumer manifest against the current declaration. Nothing is installed, built or written. `status`
+ * is manifest drift; `adoption` lists what the folder's container files and raw statements would still fail once
+ * the consumer installs this release. Source-language and presentation checks need an install and are not run.
+ */
 export declare function driftReport(directories: string[]): {
     directory: string;
     name: string;
     status: 'current' | 'behind';
     runtime: string;
     problems: string[];
+    adoption: string[];
 }[];
 export declare function collectReleaseIdentity(directory: string, { tag, commit, tagObject, archive, archiveSha256, event }?: ReleaseOptions): ReleaseEvidence;
 export {};
