@@ -34,6 +34,10 @@ Every app forces row-level security and connects as a non-owner role without BYP
 - In the custom step: `FORCE ROW LEVEL SECURITY`, every `GRANT`, the roles themselves (`pgRole` has no LOGIN, BYPASSRLS or password options), triggers and functions. drizzle-kit keeps no record of these, so it neither generates nor reverts them.
 - Review generated SQL. A policy change is emitted as `DROP POLICY` then `CREATE POLICY`. drizzle-kit writes `WITH CHECK` on a `for: 'select'` or `for: 'delete'` policy, which PostgreSQL rejects. Removing `.enableRLS()` from a table without a policy emits `DISABLE ROW LEVEL SECURITY`, which leaves FORCE set but switches the protection off.
 
+`@ten98/runtime/tenancy` carries this split: `createTenancy({ setting, column, tables })` returns `policy(name)` for each scoped table's Drizzle callback, `forceRowLevelSecurity()` for the custom step, `withWorkspace` and `withWorkspaces` for scoped Drizzle transactions, and `assertDatabaseRoles` for start-up. Grants and roles stay in the app's custom step. `@ten98/runtime/db` provides the pool, the int8 and DATE parsers, the one-pool-per-process slot and the team tables.
+
+Application queries are typed Drizzle queries. The architecture check counts raw statements (`.query(`, `sql.raw(`, `.execute(` given SQL text) in each app's data roots against the app's committed `raw-statements.json`, and refuses any file whose count rises. `node node_modules/@ten98/runtime/check.mjs --update-raw-statement-baseline .` records the first allowlist and afterwards only lowers it.
+
 ## Isolated browser audit
 
 Runtime 0.23.0 adds the server-only `@ten98/runtime/browser-audit` entry with `createBrowserAuditControl`, `BrowserControlOptions`, `NativeBrowserResource`, `ObserverTransport`, `BrowserRequestDenial`, `BrowserControlTrace`, `createPublicEgressProxy` and `PublicEgressOptions`. The facade has no capsule startup or third-party dependencies. Use the existing `normalizeLighthouseReport` for supplied reports. Never import these Node mechanisms from browser UI.

@@ -9,8 +9,29 @@ interface SourceLanguagePolicy {
     nativeFiles?: StringMap;
     compilerProjects: string[];
 }
+interface PresentationPolicy {
+    roots: string[];
+    baseline?: string;
+    owner: string;
+}
+interface DataPolicy {
+    roots: string[];
+    baseline: string;
+}
+interface Profile {
+    dependencies: StringMap;
+    devDependencies: StringMap;
+    sharedDependencies: string[];
+    sharedDevDependencies: string[];
+    peerDependencies: StringMap;
+    checkScripts: string[];
+    sourceLanguage?: SourceLanguagePolicy;
+    presentation?: PresentationPolicy;
+    data?: DataPolicy;
+}
 export interface PackageManifest {
     name?: string;
+    packageManager?: string;
     type?: string;
     engines?: {
         node?: string;
@@ -69,6 +90,12 @@ export interface ReleaseEvidence {
         priorBytesVerified: boolean;
     };
 }
+export declare function inspectWaivers(): string[];
+/** The profile a package name resolves to, with an app profile merged over the shared app stack. */
+export declare function resolveProfile(packageName: string): {
+    name: string;
+    profile: Profile;
+} | undefined;
 export declare function checkRuntimeVersion(version?: unknown): string[];
 export declare function checkVendoredFloors(directory: string, manifest: PackageManifest): string[];
 export declare function checkManifest(manifest: PackageManifest): string[];
@@ -80,5 +107,16 @@ export declare function checkPresentation(directory: string, name: string, { par
 export declare function updatePresentationBaseline(directory: string, name: string, options?: {
     parseAst?: ParseAst;
 }): string[];
+export declare function checkDeployment(directory: string, packageName: string): string[];
+export declare function checkDataAccess(directory: string, packageName: string): string[];
+export declare function updateRawStatementBaseline(directory: string, packageName: string): string[];
+/** Read-only: each consumer manifest against the current declaration. Nothing is installed, built or written. */
+export declare function driftReport(directories: string[]): {
+    directory: string;
+    name: string;
+    status: 'current' | 'behind';
+    runtime: string;
+    problems: string[];
+}[];
 export declare function collectReleaseIdentity(directory: string, { tag, commit, tagObject, archive, archiveSha256, event }?: ReleaseOptions): ReleaseEvidence;
 export {};

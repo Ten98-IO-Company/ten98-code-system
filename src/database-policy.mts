@@ -11,31 +11,34 @@ function text(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-/** Inspect canonical declarations only; this does not discover or migrate databases. */
-export function inspectDatabasePolicy(policy: unknown, profiles: unknown): string[] {
-  if (!object(policy) || !object(profiles)) return ['Missing canonical database policy or profiles.'];
+const list = (value: unknown): string[] | undefined => Array.isArray(value) && value.length > 0 && value.every(text) ? value : undefined;
+
+/**
+ * Inspect canonical declarations only; this does not discover or migrate databases. `exceptions` and `transitions` are
+ * the declaration's general lists; entries for rule `database.engine` name the engine in `items`.
+ */
+export function inspectDatabasePolicy(policy: unknown, profiles: unknown, exceptions: unknown = {}, transitions: unknown = {}): string[] {
+  if (!object(policy) || !object(profiles) || !object(exceptions) || !object(transitions)) return ['Missing canonical database policy, profiles, exceptions or transitions.'];
   const errors: string[] = [];
   if (policy.default !== defaultEngine) errors.push(`databasePolicy.default must be ${defaultEngine}.`);
   if (policy.integration !== 'drizzle') errors.push('databasePolicy.integration must be drizzle.');
   if (policy.stateless !== 'none') errors.push('Stateless packages must declare no database.');
-  const exceptions = object(policy.exceptions) ? policy.exceptions : {};
-  const transitions = object(policy.transitions) ? policy.transitions : {};
-  if (!object(policy.exceptions) || !object(policy.transitions)) errors.push('Database exceptions and transitions must be centrally recorded.');
+  if (policy.driver !== 'pg') errors.push('databasePolicy.driver must be pg.');
+  if (!text(policy.postgresql) || !/^\d+$/u.test(policy.postgresql)) errors.push('databasePolicy.postgresql must name the PostgreSQL major version.');
+  if (!list(policy.otherDrivers) || list(policy.otherDrivers)?.includes('pg')) errors.push('databasePolicy.otherDrivers must list the database drivers apps may not add beside pg.');
 
+  const engineOf = (entry: unknown): string | undefined => object(entry) && entry.rule === 'database.engine' && list(entry.items)?.length === 1 ? (entry.items as string[])[0] : undefined;
   for (const [name, entry] of Object.entries(exceptions)) {
-    if (!object(entry) || !text(entry.engine) || ['none', defaultEngine].includes(entry.engine)
-      || !text(entry.purpose) || !['native-platform-binding', 'approved-requirement'].includes(entry.purpose)
-      || !text(entry.requirement) || !text(entry.review) || !Array.isArray(entry.profiles)
-      || entry.profiles.length === 0 || entry.profiles.some(profile => !text(profile) || !Object.hasOwn(profiles, profile))) {
-      errors.push(`Database exception ${name} needs an explicit engine, approved purpose, requirement, review and known profiles.`);
+    if (!object(entry) || entry.rule !== 'database.engine') continue;
+    const engine = engineOf(entry);
+    if (!engine || ['none', defaultEngine].includes(engine) || typeof entry.purpose !== 'string' || !['native-platform-binding', 'approved-requirement'].includes(entry.purpose)) {
+      errors.push(`Database exception ${name} needs exactly one nondefault engine in items and an approved purpose.`);
     }
   }
   for (const [name, entry] of Object.entries(transitions)) {
-    if (!object(entry) || !text(entry.engine) || ['none', defaultEngine].includes(entry.engine)
-      || entry.target !== defaultEngine || !text(entry.profile) || !Object.hasOwn(profiles, entry.profile)
-      || !text(entry.reason) || !text(entry.review)) {
-      errors.push(`Database transition ${name} must preserve a named current implementation and target ${defaultEngine} with a reason and review.`);
-    }
+    if (!object(entry) || entry.rule !== 'database.engine') continue;
+    const engine = engineOf(entry);
+    if (!engine || ['none', defaultEngine].includes(engine)) errors.push(`Database transition ${name} must name the one current nondefault engine it moves to ${defaultEngine}.`);
   }
   for (const [name, profile] of Object.entries(profiles)) {
     const database = object(profile) && object(profile.database) ? profile.database : undefined;
@@ -49,10 +52,10 @@ export function inspectDatabasePolicy(policy: unknown, profiles: unknown): strin
     }
     if (text(database.exception) && database.transition === undefined) {
       const entry = exceptions[database.exception];
-      if (object(entry) && entry.engine === database.engine && Array.isArray(entry.profiles) && entry.profiles.includes(name)) continue;
+      if (object(entry) && engineOf(entry) === database.engine && list(entry.profiles)?.includes(name)) continue;
     } else if (text(database.transition) && database.exception === undefined) {
       const entry = transitions[database.transition];
-      if (object(entry) && entry.engine === database.engine && entry.profile === name && entry.target === defaultEngine) continue;
+      if (object(entry) && engineOf(entry) === database.engine && entry.profile === name) continue;
     }
     errors.push(`profiles.${name}.database: nondefault engine ${database.engine} needs a matching centrally reviewed purpose or ${defaultEngine} transition.`);
   }

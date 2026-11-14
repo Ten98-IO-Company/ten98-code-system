@@ -1,5 +1,7 @@
 {
   "node": ">=24.22.1 <25",
+  "packageManager": "pnpm@11.19.0",
+  "baseImage": "node:24.22.1-slim",
   "sharedVersions": {
     "react": "19.2.8",
     "react-dom": "19.2.8",
@@ -14,42 +16,73 @@
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
   },
+  "appStack": {
+    "dependencies": {
+      "@tanstack/react-router": "1.170.42",
+      "@tanstack/react-start": "1.168.61",
+      "better-auth": "1.7.7",
+      "drizzle-orm": "0.45.2",
+      "nodemailer": "10.1.4",
+      "pg": "8.23.0",
+      "pg-boss": "12.37.1",
+      "zod": "4.6.6"
+    },
+    "devDependencies": {
+      "@types/node": "24.10.1",
+      "@types/pg": "8.15.6",
+      "@vitejs/plugin-react": "6.1.1",
+      "nitro": "3.0.260903-beta"
+    },
+    "sharedDependencies": [
+      "react",
+      "react-dom",
+      "@ten98/ui",
+      "@ten98/runtime"
+    ],
+    "sharedDevDependencies": [
+      "typescript",
+      "vite",
+      "@types/react",
+      "@types/react-dom"
+    ],
+    "peerDependencies": {},
+    "checkScripts": [
+      "test",
+      "build"
+    ],
+    "presentation": {
+      "owner": "@ten98/ui",
+      "roots": [
+        "src"
+      ],
+      "baseline": "presentation-baseline.json"
+    },
+    "data": {
+      "roots": [
+        "src"
+      ],
+      "baseline": "raw-statements.json"
+    },
+    "database": {
+      "engine": "postgresql"
+    }
+  },
   "profiles": {
     "ten98-campaign": {
+      "stack": "app",
       "boundary": "Node HTTP, PostgreSQL with Drizzle, and openid-client; application owns sessions, authorization and paid-work accounting.",
       "dependencies": {
-        "drizzle-orm": "0.45.2",
         "openid-client": "6.8.8",
-        "pg": "8.23.0",
         "qrcode-generator": "2.0.4"
       },
-      "devDependencies": {
-        "@types/node": "24.10.1",
-        "@types/pg": "8.15.6"
-      },
-      "sharedDependencies": [
-        "react",
-        "react-dom",
-        "@ten98/ui",
-        "@ten98/runtime"
-      ],
-      "sharedDevDependencies": [
-        "typescript",
-        "vite",
-        "@types/react",
-        "@types/react-dom"
-      ],
-      "peerDependencies": {},
-      "checkScripts": [
-        "test",
-        "build"
-      ],
-      "presentation": {
-        "owner": "@ten98/ui",
+      "devDependencies": {},
+      "data": {
         "roots": [
-          "src"
+          "src",
+          "server",
+          "shared"
         ],
-        "baseline": "presentation-baseline.json"
+        "baseline": "raw-statements.json"
       },
       "sourceLanguage": {
         "default": "typescript",
@@ -245,59 +278,21 @@
           "tsconfig.json",
           "tsconfig.backend.json"
         ]
-      },
-      "database": {
-        "engine": "postgresql"
       }
     },
-    "ten98-monitor": {
+    "ten98-discover": {
+      "stack": "app",
       "boundary": "TanStack Start and Nitro, PostgreSQL, Drizzle and Better Auth; application owns sessions, workspace authorization and provider ledger.",
       "dependencies": {
         "@modelcontextprotocol/server": "2.3.1",
-        "@tanstack/react-router": "1.170.42",
-        "@tanstack/react-start": "1.168.61",
-        "better-auth": "1.7.7",
         "detect-browser": "5.3.0",
-        "drizzle-orm": "0.45.2",
         "mmdb-lib": "3.0.3",
-        "nodemailer": "10.1.4",
         "parse5": "8.0.1",
-        "pg": "8.23.0",
-        "pg-boss": "12.37.1",
         "saxes": "6.0.0",
-        "ua-parser-js": "1.0.41",
-        "zod": "4.6.6"
+        "ua-parser-js": "1.0.41"
       },
       "devDependencies": {
-        "@types/node": "24.10.1",
-        "@types/pg": "8.15.6",
-        "@types/ua-parser-js": "0.7.39",
-        "@vitejs/plugin-react": "6.1.1",
-        "nitro": "3.0.260903-beta"
-      },
-      "sharedDependencies": [
-        "react",
-        "react-dom",
-        "@ten98/ui",
-        "@ten98/runtime"
-      ],
-      "sharedDevDependencies": [
-        "typescript",
-        "vite",
-        "@types/react",
-        "@types/react-dom"
-      ],
-      "peerDependencies": {},
-      "checkScripts": [
-        "test",
-        "build"
-      ],
-      "presentation": {
-        "owner": "@ten98/ui",
-        "roots": [
-          "src"
-        ],
-        "baseline": "presentation-baseline.json"
+        "@types/ua-parser-js": "0.7.39"
       },
       "sourceLanguage": {
         "default": "typescript",
@@ -468,53 +463,13 @@
         "compilerProjects": [
           "tsconfig.json"
         ]
-      },
-      "database": {
-        "engine": "postgresql"
       }
     },
     "ten98-books": {
+      "stack": "app",
       "boundary": "TanStack Start and Nitro, PostgreSQL, Drizzle and Better Auth; application owns sessions, workspace/company authorization and the ledger.",
-      "dependencies": {
-        "@tanstack/react-router": "1.170.42",
-        "@tanstack/react-start": "1.168.61",
-        "better-auth": "1.7.7",
-        "drizzle-orm": "0.45.2",
-        "nodemailer": "10.1.4",
-        "pg": "8.23.0",
-        "pg-boss": "12.37.1",
-        "zod": "4.6.6"
-      },
-      "devDependencies": {
-        "@types/node": "24.10.1",
-        "@types/pg": "8.15.6",
-        "@vitejs/plugin-react": "6.1.1",
-        "nitro": "3.0.260903-beta"
-      },
-      "sharedDependencies": [
-        "react",
-        "react-dom",
-        "@ten98/ui",
-        "@ten98/runtime"
-      ],
-      "sharedDevDependencies": [
-        "typescript",
-        "vite",
-        "@types/react",
-        "@types/react-dom"
-      ],
-      "peerDependencies": {},
-      "checkScripts": [
-        "test",
-        "build"
-      ],
-      "presentation": {
-        "owner": "@ten98/ui",
-        "roots": [
-          "src"
-        ],
-        "baseline": "presentation-baseline.json"
-      },
+      "dependencies": {},
+      "devDependencies": {},
       "sourceLanguage": {
         "default": "typescript",
         "roots": [
@@ -556,9 +511,6 @@
         "compilerProjects": [
           "tsconfig.json"
         ]
-      },
-      "database": {
-        "engine": "postgresql"
       }
     },
     "@ten98/ui": {
@@ -668,20 +620,23 @@
       }
     },
     "@ten98/runtime": {
-      "boundary": "Node standard library and web platform primitives; no framework, database or provider accounting. The optional ./auth entry is a better-auth preset (an exact, optional peer) with no controller of its own: apps keep routes, transactions and storage.",
+      "boundary": "The shared framework for ten98 Node applications: Node standard library and web platform primitives in the root entry, and optional entries (./auth, ./db, ./tenancy) whose libraries are exact optional peers. Entries provide mechanisms; apps keep their routes, authorization decisions, storage controllers and paid-work accounting.",
       "dependencies": {},
       "devDependencies": {
         "@types/node": "24.10.1",
+        "@types/pg": "8.15.6",
         "better-auth": "1.7.7",
-        "pg": "8.23.0",
-        "@types/pg": "8.15.6"
+        "drizzle-orm": "0.45.2",
+        "pg": "8.23.0"
       },
       "sharedDependencies": [],
       "sharedDevDependencies": [
         "typescript"
       ],
       "peerDependencies": {
-        "better-auth": "1.7.7"
+        "better-auth": "1.7.7",
+        "drizzle-orm": "0.45.2",
+        "pg": "8.23.0"
       },
       "checkScripts": [
         "test",
@@ -759,7 +714,11 @@
           "browser-audit-egress.mjs": "Generated server-only executable from src/browser-audit-egress.mts; capsule runs only as an explicit process entrypoint.",
           "browser-audit-egress.d.mts": "Generated declarations from src/browser-audit-egress.mts.",
           "browser-audit-capsule.mjs": "Generated server-only executable from src/browser-audit-capsule.mts; capsule runs only as an explicit process entrypoint.",
-          "browser-audit-capsule.d.mts": "Generated declarations from src/browser-audit-capsule.mts."
+          "browser-audit-capsule.d.mts": "Generated declarations from src/browser-audit-capsule.mts.",
+          "db.mjs": "Generated PostgreSQL pool and Drizzle entry from src/db.mts, exported as ./db only; needs the optional drizzle-orm and pg peers.",
+          "db.d.mts": "Generated declarations from src/db.mts.",
+          "tenancy.mjs": "Generated row-level security tenancy entry from src/tenancy.mts, exported as ./tenancy only; needs the optional drizzle-orm and pg peers.",
+          "tenancy.d.mts": "Generated declarations from src/tenancy.mts."
         },
         "compilerProjects": [
           "tsconfig.json",
@@ -834,17 +793,103 @@
     "default": "postgresql",
     "integration": "drizzle",
     "stateless": "none",
-    "exceptions": {
-      "cloudflare-d1": {
-        "engine": "d1",
-        "profiles": [
-          "ten98-io"
-        ],
-        "purpose": "native-platform-binding",
-        "requirement": "Use native Cloudflare D1 bindings without a Node database server.",
-        "review": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/7#issuecomment-6283899904"
-      }
+    "postgresql": "18",
+    "driver": "pg",
+    "otherDrivers": [
+      "postgres",
+      "@neondatabase/serverless",
+      "@vercel/postgres",
+      "pg-promise",
+      "slonik",
+      "kysely",
+      "knex",
+      "prisma",
+      "@prisma/client",
+      "typeorm",
+      "sequelize",
+      "mikro-orm",
+      "@mikro-orm/core",
+      "mysql",
+      "mysql2",
+      "better-sqlite3",
+      "sqlite3",
+      "@libsql/client",
+      "@electric-sql/pglite",
+      "mongodb",
+      "mongoose"
+    ]
+  },
+  "exceptions": {
+    "cloudflare-d1": {
+      "rule": "database.engine",
+      "profiles": [
+        "ten98-io"
+      ],
+      "items": [
+        "d1"
+      ],
+      "purpose": "native-platform-binding",
+      "reason": "Use native Cloudflare D1 bindings without a Node database server.",
+      "owner": "ten98-io",
+      "reviewTrigger": "ten98-io needs a Node server, data shared with another app, or a database capability D1 lacks.",
+      "review": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/7#issuecomment-6283899904"
+    }
+  },
+  "transitions": {
+    "campaign-app-stack": {
+      "rule": "appStack",
+      "profile": "ten98-campaign",
+      "items": [
+        "@tanstack/react-router",
+        "@tanstack/react-start",
+        "better-auth",
+        "nodemailer",
+        "pg-boss",
+        "zod",
+        "@vitejs/plugin-react",
+        "nitro"
+      ],
+      "reason": "Campaign runs a plain Node HTTP server with its own accounts and timers; it moves onto the shared app stack in stages.",
+      "owner": "ten98-campaign",
+      "doneWhen": "Campaign serves through TanStack Start with Better Auth, zod route validation and a pg-boss worker, and declares every appStack dependency."
     },
-    "transitions": {}
+    "campaign-pnpm": {
+      "rule": "packageManager",
+      "profile": "ten98-campaign",
+      "reason": "Campaign installs with npm from package-lock.json.",
+      "owner": "ten98-campaign",
+      "doneWhen": "Campaign declares pnpm@11.19.0 and commits pnpm-lock.yaml in place of package-lock.json."
+    },
+    "campaign-base-image": {
+      "rule": "baseImage",
+      "profile": "ten98-campaign",
+      "reason": "Campaign builds on node:24.22.1-alpine.",
+      "owner": "ten98-campaign",
+      "doneWhen": "Every Dockerfile stage in Campaign uses node:24.22.1-slim."
+    },
+    "ui-pnpm": {
+      "rule": "packageManager",
+      "profile": "@ten98/ui",
+      "reason": "The design system installs with npm from package-lock.json.",
+      "owner": "@ten98/ui",
+      "doneWhen": "@ten98/ui declares pnpm@11.19.0 and commits pnpm-lock.yaml in place of package-lock.json."
+    },
+    "io-pnpm": {
+      "rule": "packageManager",
+      "profile": "ten98-io",
+      "reason": "ten98-io installs with npm from package-lock.json.",
+      "owner": "ten98-io",
+      "doneWhen": "ten98-io declares pnpm@11.19.0 and commits pnpm-lock.yaml in place of package-lock.json."
+    },
+    "discover-package-rename": {
+      "rule": "profile.name",
+      "profile": "ten98-discover",
+      "items": [
+        "ten98-monitor"
+      ],
+      "reason": "Discover still publishes its package as ten98-monitor.",
+      "owner": "ten98-discover",
+      "doneWhen": "Discover's package.json is named ten98-discover."
+    }
   }
 }
