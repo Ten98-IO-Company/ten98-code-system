@@ -7,7 +7,8 @@
 // Drizzle declares the policy (`policy`) and ENABLE ROW LEVEL SECURITY (`pgTable(...).enableRLS()`). FORCE, the roles
 // and their grants are SQL in the app's custom migration step; `forceRowLevelSecurity` writes the FORCE part.
 import { and, eq, inArray, sql } from 'drizzle-orm';
-import { pgPolicy, type PgDatabase, type PgPolicy, type PgQueryResultHKT, type PgTransaction } from 'drizzle-orm/pg-core';
+import { NodePgSession } from 'drizzle-orm/node-postgres';
+import { pgPolicy, type PgDatabase, type PgDialect, type PgPolicy, type PgQueryResultHKT, type PgTransaction } from 'drizzle-orm/pg-core';
 import type pg from 'pg';
 import type { WorkspaceRole } from './browser.mjs';
 import { membership, workspace } from './db.mjs';
@@ -45,6 +46,35 @@ export interface TenancyOptions<TTable extends string> {
   tables: readonly TTable[];
 }
 
+// The parts of a node-postgres Drizzle database that `transaction` rebinds to one checked-out connection. `dialect`
+// and the session's `schema` and `options` are internal to drizzle-orm, which is pinned exactly for this reason.
+type PooledDatabase = { dialect: PgDialect; _?: { session?: unknown }; $client: pg.Pool };
+
+/**
+ * Drizzle's transaction (0.45.2, node-postgres/session.js) sends BEGIN before its `try`, so a failed BEGIN never
+ * releases the pooled connection, and a failed ROLLBACK replaces the error that caused it. Over a pool this checks the
+ * connection out itself, as Books' tenancy did: it always releases it, discards it when BEGIN, COMMIT or ROLLBACK
+ * failed (its state is then unknown), and rethrows the callback's own error. Anything else, such as a transaction for
+ * a savepoint, keeps Drizzle's own `transaction`.
+ */
+async function transaction<TDatabase extends AnyDatabase, T>(db: TDatabase, run: (tx: ScopedTransaction<TDatabase>) => Promise<T>): Promise<T> {
+  const pooled = db as unknown as PooledDatabase, client: unknown = pooled.$client;
+  const isPool = client instanceof Object && typeof (client as pg.Pool).connect === 'function' && Object.getPrototypeOf(client).constructor.name.includes('Pool');
+  const session = pooled._?.session;
+  if (!(session instanceof NodePgSession) || !isPool) return db.transaction(tx => run(tx as ScopedTransaction<TDatabase>));
+  const connection = await pooled.$client.connect();
+  let failure: { error: unknown } | undefined, broken = false;
+  try {
+    const { schema, options } = session as unknown as { schema: never; options: never };
+    return await new NodePgSession(connection, pooled.dialect, schema, options).transaction(async tx => {
+      try { return await run(tx as unknown as ScopedTransaction<TDatabase>); } catch (error) { failure = { error }; throw error; }
+    });
+  } catch (error) {
+    broken = !failure || error !== failure.error;
+    throw failure ? failure.error : error;
+  } finally { connection.release(broken); }
+}
+
 const writers: readonly WorkspaceRole[] = ['owner', 'admin', 'editor'];
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Lowercase names only: they go into SQL text unquoted, and PostgreSQL's stored policy then matches them verbatim.
@@ -57,11 +87,15 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
   if (typeof setting !== 'string' || !settingName.test(setting)) throw new TypeError('The tenancy setting must be a lowercase custom setting name such as app.workspace_ids.');
   if (typeof column !== 'string' || !identifier.test(column)) throw new TypeError('The tenancy column must be a lowercase SQL identifier.');
   if (!Array.isArray(tables) || !tables.length || !tables.every(table => typeof table === 'string' && identifier.test(table))) throw new TypeError('The tenancy tables must be lowercase SQL identifiers.');
+  // Raw by necessity: a policy is DDL, which takes no bind parameters. Only the two names checked above are interpolated.
   const scope = sql.raw(`${column} = ANY (string_to_array(current_setting('${setting}', true), ','))`);
   // The scope as PostgreSQL stores it in pg_policies once `deparseNoise` is removed.
   const storedScope = `${column}=ANYstring_to_arraycurrent_setting'${setting}',true,','`;
 
-  /** Sets, for the rest of the current transaction only, the workspaces row-level security admits. */
+  /**
+   * Sets, for the rest of the current transaction only, the workspaces row-level security admits. A parameterised `sql`
+   * statement by necessity: Drizzle has no builder for set_config.
+   */
   async function setScope(tx: Pick<AnyDatabase, 'execute'>, workspaceIds: readonly string[]): Promise<void> {
     await tx.execute(sql`SELECT set_config(${setting}, ${workspaceIds.join(',')}, true)`);
   }
@@ -88,7 +122,10 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
     policy(name: string): PgPolicy {
       return pgPolicy(name, { as: 'permissive', for: 'all', to: 'public', using: scope, withCheck: scope });
     },
-    /** The custom migration step's FORCE statements, separated as drizzle-kit separates statements. */
+    /**
+     * The custom migration step's FORCE statements, separated as drizzle-kit separates statements. Returned as text for
+     * the migration file, never executed here; the table names are the identifiers checked by `createTenancy`.
+     */
     forceRowLevelSecurity(): string {
       return tables.map(table => `ALTER TABLE "${table}" FORCE ROW LEVEL SECURITY;`).join('\n--> statement-breakpoint\n');
     },
@@ -106,7 +143,7 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
         await setScope(tx, [access.workspaceId]);
         return run(tx, access);
       };
-      return outer ? scoped(outer) : db.transaction(tx => scoped(tx as ScopedTransaction<TDatabase>));
+      return outer ? scoped(outer) : transaction(db, scoped);
     },
     /**
      * For reads: runs `run` in one transaction scoped to those of `workspaceIds` the user is a member of. Ids the user
@@ -114,10 +151,10 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
      */
     withWorkspaces<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceIds: readonly string[],
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess[]) => Promise<T>): Promise<T> {
-      return db.transaction(async tx => {
+      return transaction(db, async tx => {
         const access = await memberships(tx, userId, workspaceIds);
         await setScope(tx, access.map(item => item.workspaceId));
-        return run(tx as ScopedTransaction<TDatabase>, access);
+        return run(tx, access);
       });
     },
     /**
@@ -127,6 +164,8 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
      * CHECK). Without this the policies are silently inert or could be widened by an extra permissive policy.
      */
     async assertDatabaseRoles(pool: Queryable, checked: readonly string[] = tables): Promise<void> {
+      // A raw, parameterised statement by necessity: it reads the system catalogues, which have no Drizzle schema, and
+      // takes a pg pool so it can run at boot before any Drizzle database exists.
       const { rows } = await pool.query<{ rolsuper: boolean; rolbypassrls: boolean; owned: string[]; unforced: string[]; unpolicied: string[] }>(
         `SELECT r.rolsuper, r.rolbypassrls,
            ARRAY(SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

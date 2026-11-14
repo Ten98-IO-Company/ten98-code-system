@@ -42,6 +42,53 @@ test('forceRowLevelSecurity() writes one FORCE statement per table with drizzle-
     'ALTER TABLE "company" FORCE ROW LEVEL SECURITY;\n--> statement-breakpoint\nALTER TABLE "ledger" FORCE ROW LEVEL SECURITY;\n--> statement-breakpoint\nALTER TABLE "voucher_line" FORCE ROW LEVEL SECURITY;');
 });
 
+// A pool that hands out one scripted connection, so a failing BEGIN or ROLLBACK needs no real server. Drizzle treats a
+// client as a pool by its constructor's name, as it does pg's Pool.
+class ScriptedPool {
+  readonly sent: string[] = [];
+  readonly released: unknown[] = [];
+  readonly fail: Partial<Record<'begin' | 'rollback' | 'commit', Error>>;
+  constructor(fail: Partial<Record<'begin' | 'rollback' | 'commit', Error>>) { this.fail = fail; }
+  async connect() {
+    return {
+      query: async (config: string | { text: string }) => {
+        const text = typeof config === 'string' ? config : config.text;
+        this.sent.push(text.split(/\s/u)[0]!.toLowerCase());
+        const failure = this.fail[text as 'begin' | 'rollback' | 'commit'];
+        if (failure) throw failure;
+        // The membership query, in Drizzle's array row mode: workspace id, name, role.
+        return { rows: text.startsWith('select "workspace"') ? [[fakeWorkspace, 'W', 'owner']] : [], fields: [], command: 'SELECT', rowCount: 0 };
+      },
+      release: (destroy?: unknown) => { this.released.push(destroy); },
+    };
+  }
+}
+const fakeWorkspace = '00000000-0000-4000-8000-000000000001';
+
+test('a scoped transaction releases its connection when BEGIN fails, and discards it', async () => {
+  const lost = new Error('connection reset during BEGIN');
+  for (const call of [
+    (db: ReturnType<typeof drizzle>) => tenancy.withWorkspace(db, 'u', fakeWorkspace, 'read', async () => 'unreached'),
+    (db: ReturnType<typeof drizzle>) => tenancy.withWorkspaces(db, 'u', [fakeWorkspace], async () => 'unreached'),
+  ]) {
+    const pool = new ScriptedPool({ begin: lost });
+    await assert.rejects(call(drizzle(pool as never)), error => error === lost || (error as { cause?: unknown }).cause === lost);
+    // Drizzle 0.45.2 alone leaves the connection checked out here: `released` stays empty.
+    assert.deepEqual(pool.released, [true]);
+  }
+});
+
+test('a failed ROLLBACK neither hides the callback\'s error nor returns the connection to the pool', async () => {
+  const original = new Error('the callback failed'), pool = new ScriptedPool({ rollback: new Error('rollback failed') });
+  await assert.rejects(tenancy.withWorkspace(drizzle(pool as never), 'u', fakeWorkspace, 'write', async () => { throw original; }), error => error === original);
+  assert.deepEqual([pool.sent, pool.released], [['begin', 'select', 'select', 'rollback'], [true]]);
+  // A callback error with a working ROLLBACK keeps the connection; so does a commit.
+  const kept = new ScriptedPool({});
+  await assert.rejects(tenancy.withWorkspace(drizzle(kept as never), 'u', fakeWorkspace, 'write', async () => { throw original; }), error => error === original);
+  assert.equal(await tenancy.withWorkspace(drizzle(kept as never), 'u', fakeWorkspace, 'write', async (_tx, access) => access.role), 'owner');
+  assert.deepEqual([kept.sent, kept.released], [['begin', 'select', 'select', 'rollback', 'begin', 'select', 'select', 'commit'], [false, false]]);
+});
+
 // Integration tests on real PostgreSQL, opt-in: set TEN98_TEST_DATABASE_URL to a disposable server (a superuser URL; each
 // run creates and drops its own database and roles). Without it the suite is skipped, like the other opt-in checks.
 const admin = process.env.TEN98_TEST_DATABASE_URL;

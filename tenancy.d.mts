@@ -37,7 +37,10 @@ export declare function createTenancy<TTable extends string>({ setting, column, 
     tables: any[];
     /** The policy for a scoped table's Drizzle callback: every command, every role, USING and WITH CHECK the scope. */
     policy(name: string): PgPolicy;
-    /** The custom migration step's FORCE statements, separated as drizzle-kit separates statements. */
+    /**
+     * The custom migration step's FORCE statements, separated as drizzle-kit separates statements. Returned as text for
+     * the migration file, never executed here; the table names are the identifiers checked by `createTenancy`.
+     */
     forceRowLevelSecurity(): string;
     setScope: (tx: Pick<AnyDatabase, 'execute'>, workspaceIds: readonly string[]) => Promise<void>;
     /**

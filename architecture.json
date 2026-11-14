@@ -726,6 +726,12 @@
           "tests/tsconfig.tests.json"
         ]
       },
+      "data": {
+        "roots": [
+          "src"
+        ],
+        "baseline": "raw-statements.json"
+      },
       "database": {
         "engine": "none"
       }

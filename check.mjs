@@ -501,10 +501,56 @@ export function checkDeployment(directory, packageName) {
     }
     return errors;
 }
-// A pg `.query(` call (also as `['query'](` or `.query.call(`), Drizzle `sql.raw(`, or `.execute(` given SQL text,
-// each with or without a type argument. Text matching, not parsing: a statement passed by variable to `.execute(`,
-// or `sql` imported under another name, is not counted.
-const RAW_STATEMENT = /\.query\s*(?:<[^;]*?>)?\s*\(|\[\s*['"]query['"]\s*\]\s*\(|\.query\s*\.\s*(?:call|apply)\s*\(|\bsql\.raw\s*\(|\.execute\s*(?:<[^;]*?>)?\s*\(\s*(?:sql\s*(?:<[^;]*?>)?\s*)?[`'"]/gu;
+// The index after an optional type argument starting at `index` (whitespace first), or `index` when there is none.
+// Brackets are balanced so object types with `;`, nested generics and `=>` arrows are skipped whole.
+function afterTypeArgument(text, index) {
+    let at = index;
+    while (/\s/u.test(text[at] ?? ''))
+        at++;
+    if (text[at] !== '<')
+        return index;
+    for (let depth = 0, end = Math.min(text.length, at + 4000); at < end; at++) {
+        if (text[at] === '<')
+            depth++;
+        else if (text[at] === '>' && text[at - 1] !== '=' && --depth === 0)
+            return at + 1;
+    }
+    return index;
+}
+// Counts raw statements in one file: a pg `.query(` call (also `['query'](` and `.query.call(`, `.apply(`, `.bind(`),
+// Drizzle `sql.raw(`, and `.execute(` given SQL text or a `sql` template, each with or without a type argument, and
+// with `sql` under any name it is imported as from drizzle-orm. Text matching, not parsing: a statement passed by
+// variable to `.execute(` or reached through a computed key is not counted, while a comment or an unrelated
+// `.query(` method is; the per-file allowlist absorbs the second kind.
+function countRawStatements(text) {
+    const names = ['sql'];
+    for (const [, list] of text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]drizzle-orm(?:\/[^'"]*)?['"]/gu)) {
+        for (const [, alias] of list.matchAll(/\bsql\s+as\s+([A-Za-z_$][\w$]*)/gu))
+            names.push(alias.replaceAll('$', '\\$'));
+    }
+    const sqlName = `(?:${names.join('|')})`, tag = new RegExp(String.raw `^${sqlName}\b`, 'u');
+    const call = /^\s*\(/u, method = /^\s*\.\s*(?:call|apply|bind)\s*\(/u, opening = /^\s*\(\s*/u, quote = /^\s*[`'"]/u;
+    let count = 0;
+    for (const match of text.matchAll(new RegExp(String.raw `\.query\b|\[\s*['"]query['"]\s*\]|\b${sqlName}\.raw\b|\.execute\b`, 'gu'))) {
+        const rest = text.slice(afterTypeArgument(text, match.index + match[0].length));
+        if (match[0].endsWith('.raw'))
+            count += Number(call.test(rest));
+        else if (match[0] !== '.execute')
+            count += Number(call.test(rest) || method.test(rest));
+        else {
+            // `.execute(` counts when its argument is SQL text or a `sql` template, itself with an optional type argument.
+            const opened = opening.exec(rest);
+            if (!opened)
+                continue;
+            let argument = rest.slice(opened[0].length);
+            const named = tag.exec(argument);
+            if (named)
+                argument = argument.slice(afterTypeArgument(argument, named[0].length));
+            count += Number(quote.test(argument));
+        }
+    }
+    return count;
+}
 function rawStatementCounts(directory, policy) {
     const counts = {};
     const walk = (folder) => {
@@ -515,7 +561,7 @@ function rawStatementCounts(directory, policy) {
             if (entry.isDirectory())
                 walk(file);
             else if (entry.isFile() && /\.(?:[cm]?[jt]s|[jt]sx)$/u.test(entry.name) && !/\.d\.[cm]?ts$/u.test(entry.name)) {
-                const found = readFileSync(file, 'utf8').match(RAW_STATEMENT)?.length ?? 0;
+                const found = countRawStatements(readFileSync(file, 'utf8'));
                 if (found)
                     counts[relative(directory, file).replaceAll('\\', '/')] = found;
             }

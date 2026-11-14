@@ -7,6 +7,7 @@
 // Drizzle declares the policy (`policy`) and ENABLE ROW LEVEL SECURITY (`pgTable(...).enableRLS()`). FORCE, the roles
 // and their grants are SQL in the app's custom migration step; `forceRowLevelSecurity` writes the FORCE part.
 import { and, eq, inArray, sql } from 'drizzle-orm';
+import { NodePgSession } from 'drizzle-orm/node-postgres';
 import { pgPolicy } from 'drizzle-orm/pg-core';
 import { membership, workspace } from './db.mjs';
 /** One answer for a missing workspace and for a workspace the user may not reach (or not write), so ids reveal nothing. */
@@ -20,6 +21,41 @@ export class DatabaseRoleError extends Error {
     constructor(problems) {
         super(`The application database role is unsafe for workspace data: ${problems.join('; ')}. Connect web and worker with the non-owner application role.`);
         this.name = 'DatabaseRoleError';
+    }
+}
+/**
+ * Drizzle's transaction (0.45.2, node-postgres/session.js) sends BEGIN before its `try`, so a failed BEGIN never
+ * releases the pooled connection, and a failed ROLLBACK replaces the error that caused it. Over a pool this checks the
+ * connection out itself, as Books' tenancy did: it always releases it, discards it when BEGIN, COMMIT or ROLLBACK
+ * failed (its state is then unknown), and rethrows the callback's own error. Anything else, such as a transaction for
+ * a savepoint, keeps Drizzle's own `transaction`.
+ */
+async function transaction(db, run) {
+    const pooled = db, client = pooled.$client;
+    const isPool = client instanceof Object && typeof client.connect === 'function' && Object.getPrototypeOf(client).constructor.name.includes('Pool');
+    const session = pooled._?.session;
+    if (!(session instanceof NodePgSession) || !isPool)
+        return db.transaction(tx => run(tx));
+    const connection = await pooled.$client.connect();
+    let failure, broken = false;
+    try {
+        const { schema, options } = session;
+        return await new NodePgSession(connection, pooled.dialect, schema, options).transaction(async (tx) => {
+            try {
+                return await run(tx);
+            }
+            catch (error) {
+                failure = { error };
+                throw error;
+            }
+        });
+    }
+    catch (error) {
+        broken = !failure || error !== failure.error;
+        throw failure ? failure.error : error;
+    }
+    finally {
+        connection.release(broken);
     }
 }
 const writers = ['owner', 'admin', 'editor'];
@@ -36,10 +72,14 @@ export function createTenancy({ setting, column, tables }) {
         throw new TypeError('The tenancy column must be a lowercase SQL identifier.');
     if (!Array.isArray(tables) || !tables.length || !tables.every(table => typeof table === 'string' && identifier.test(table)))
         throw new TypeError('The tenancy tables must be lowercase SQL identifiers.');
+    // Raw by necessity: a policy is DDL, which takes no bind parameters. Only the two names checked above are interpolated.
     const scope = sql.raw(`${column} = ANY (string_to_array(current_setting('${setting}', true), ','))`);
     // The scope as PostgreSQL stores it in pg_policies once `deparseNoise` is removed.
     const storedScope = `${column}=ANYstring_to_arraycurrent_setting'${setting}',true,','`;
-    /** Sets, for the rest of the current transaction only, the workspaces row-level security admits. */
+    /**
+     * Sets, for the rest of the current transaction only, the workspaces row-level security admits. A parameterised `sql`
+     * statement by necessity: Drizzle has no builder for set_config.
+     */
     async function setScope(tx, workspaceIds) {
         await tx.execute(sql `SELECT set_config(${setting}, ${workspaceIds.join(',')}, true)`);
     }
@@ -65,7 +105,10 @@ export function createTenancy({ setting, column, tables }) {
         policy(name) {
             return pgPolicy(name, { as: 'permissive', for: 'all', to: 'public', using: scope, withCheck: scope });
         },
-        /** The custom migration step's FORCE statements, separated as drizzle-kit separates statements. */
+        /**
+         * The custom migration step's FORCE statements, separated as drizzle-kit separates statements. Returned as text for
+         * the migration file, never executed here; the table names are the identifiers checked by `createTenancy`.
+         */
         forceRowLevelSecurity() {
             return tables.map(table => `ALTER TABLE "${table}" FORCE ROW LEVEL SECURITY;`).join('\n--> statement-breakpoint\n');
         },
@@ -83,14 +126,14 @@ export function createTenancy({ setting, column, tables }) {
                 await setScope(tx, [access.workspaceId]);
                 return run(tx, access);
             };
-            return outer ? scoped(outer) : db.transaction(tx => scoped(tx));
+            return outer ? scoped(outer) : transaction(db, scoped);
         },
         /**
          * For reads: runs `run` in one transaction scoped to those of `workspaceIds` the user is a member of. Ids the user
          * cannot reach are left out silently; `run` receives the ones admitted.
          */
         withWorkspaces(db, userId, workspaceIds, run) {
-            return db.transaction(async (tx) => {
+            return transaction(db, async (tx) => {
                 const access = await memberships(tx, userId, workspaceIds);
                 await setScope(tx, access.map(item => item.workspaceId));
                 return run(tx, access);
@@ -103,6 +146,8 @@ export function createTenancy({ setting, column, tables }) {
          * CHECK). Without this the policies are silently inert or could be widened by an extra permissive policy.
          */
         async assertDatabaseRoles(pool, checked = tables) {
+            // A raw, parameterised statement by necessity: it reads the system catalogues, which have no Drizzle schema, and
+            // takes a pg pool so it can run at boot before any Drizzle database exists.
             const { rows } = await pool.query(`SELECT r.rolsuper, r.rolbypassrls,
            ARRAY(SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                  WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND pg_has_role(current_user, c.relowner, 'MEMBER') ORDER BY 1) AS owned,
