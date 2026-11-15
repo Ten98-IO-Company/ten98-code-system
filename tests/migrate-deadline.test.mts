@@ -15,7 +15,9 @@ function pool(script: Script = {}) {
   const releases: (Error | boolean | undefined)[] = [];
   let connectFailures = script.connectFailures ?? 0;
   const locks = [...(script.locks ?? [true])];
+  let connects = 0;
   const connect = async (): Promise<MigrationPoolClient> => {
+    connects++;
     if (script.connectDelayMs) await delay(script.connectDelayMs);
     if (connectFailures-- > 0) throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
     let statementTimeout = 10, discarded = false;
@@ -41,7 +43,7 @@ function pool(script: Script = {}) {
       release(error?: Error | boolean) { releases.push(error); if (error) discarded = true; },
     };
   };
-  return { calls, releases, pool: { connect } };
+  return { calls, releases, connects: () => connects, pool: { connect } };
 }
 function ledgerWith(sql: string) {
   const directory = mkdtempSync(join(tmpdir(), 'ten98-deadline-'));
@@ -91,6 +93,8 @@ test('migrateWithDeadline bounds a connection that hangs past the deadline and d
     await assert.rejects(ledger.migrateWithDeadline(hung.pool, { timeoutMs: 40 }), (error: unknown) => (error as { code?: string }).code === 'MIGRATION_TIMEOUT' && /accept connections/.test((error as Error).message));
     assert.ok(Date.now() - started < 150);
     await delay(250);
+    // Every connection that arrives late is discarded exactly once, however many attempts the deadline allowed (#127).
+    assert.equal(hung.connects(), 1, "no retry is attempted when the deadline leaves no time for it");
     assert.deepEqual(hung.releases, [true]);
     assert.equal(hung.calls.length, 0);
   } finally { cleanup(); }

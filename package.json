@@ -1,6 +1,6 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.27.1",
+  "version": "0.28.0",
   "packageManager": "pnpm@11.19.0",
   "description": "Shared framework for ten98 applications: HTTP, provider, email, migration, OIDC, identity, database and tenancy mechanisms",
   "type": "module",
@@ -39,6 +39,14 @@
     "./tenancy/testing": {
       "types": "./tenancy-testing.d.mts",
       "import": "./tenancy-testing.mjs"
+    },
+    "./config": {
+      "types": "./config.d.mts",
+      "import": "./config.mjs"
+    },
+    "./email": {
+      "types": "./email.d.mts",
+      "import": "./email.mjs"
     }
   },
   "files": [
@@ -139,7 +147,13 @@
     "src/tenancy.mts",
     "tenancy-testing.mjs",
     "tenancy-testing.d.mts",
-    "src/tenancy-testing.mts"
+    "src/tenancy-testing.mts",
+    "config.mjs",
+    "config.d.mts",
+    "src/config.mts",
+    "email.mjs",
+    "email.d.mts",
+    "src/email.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
@@ -160,13 +174,17 @@
     "@types/pg": "8.15.6",
     "better-auth": "1.7.7",
     "drizzle-orm": "0.45.2",
+    "nodemailer": "10.1.4",
     "pg": "8.23.0",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "zod": "4.6.6"
   },
   "peerDependencies": {
     "better-auth": "1.7.7",
     "drizzle-orm": "0.45.2",
-    "pg": "8.23.0"
+    "nodemailer": "10.1.4",
+    "pg": "8.23.0",
+    "zod": "4.6.6"
   },
   "peerDependenciesMeta": {
     "better-auth": {
@@ -175,7 +193,13 @@
     "drizzle-orm": {
       "optional": true
     },
+    "nodemailer": {
+      "optional": true
+    },
     "pg": {
+      "optional": true
+    },
+    "zod": {
       "optional": true
     }
   }

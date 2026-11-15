@@ -575,6 +575,14 @@ test('a lock record never outlives its transaction: a stale transaction object i
   assert.deepEqual(await tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], tx => tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'read', visible)), [fixture.w1]);
 });
 
+test('a session time zone change inside a helper read never refuses a correctly locked nested read (#128)', { skip }, async () => {
+  const db = appDb(), visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note)).map(row => row.id);
+  assert.deepEqual(await tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], async tx => {
+    await tx.execute(sql`SET LOCAL TIME ZONE 'Pacific/Kiritimati'`);
+    return tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'read', visible);
+  }), [fixture.w1]);
+});
+
 // Last: this changes D's membership.
 test('a demotion waits for an in-flight workspace write; then the viewer cannot write', { skip }, async () => {
   const db = appDb();
