@@ -72,8 +72,8 @@ test('apps share one stack; a transition waives only its named missing libraries
   assert.match(checkManifest(drifted).join('\n'), /dependencies\.drizzle-orm/);
 });
 
-test('the discover profile is ten98-discover and still accepts its current package name', () => {
-  assert.equal(resolveProfile('ten98-monitor')?.name, 'ten98-discover');
+test('the discover profile is ten98-discover, and its old package name is no longer accepted', () => {
+  assert.equal(resolveProfile('ten98-monitor'), undefined);
   assert.equal(resolveProfile('ten98-discover')?.name, 'ten98-discover');
   assert.equal(resolveProfile('ten98-unknown'), undefined);
   assert.equal(resolveProfile('ten98-discover')?.profile.dependencies['ua-parser-js'], '1.0.41');
