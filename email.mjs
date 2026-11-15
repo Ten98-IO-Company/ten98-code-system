@@ -48,8 +48,9 @@ function configuration(env) {
         };
     const tls = z.enum(['starttls', 'tls']).parse(read('EMAIL_SMTP_TLS') || 'starttls');
     // A name, never an IP literal, so the certificate is verified against the configured host. A last label of digits
-    // only is refused too: no top-level domain is numeric, and resolvers read `2130706433` or `127.1` as addresses.
-    const host = z.string().max(253).regex(hostname).refine(v => !isIP(v) && !/(?:^|\.)\d+$/u.test(v)).parse(read('EMAIL_SMTP_HOST'));
+    // only, or a hex label (`0x7f000001`, `127.0x1`), is refused too: no top-level domain is numeric, and resolvers read
+    // those as addresses.
+    const host = z.string().max(253).regex(hostname).refine(v => !isIP(v) && !/(?:^|\.)(?:\d+|0x[0-9a-f]*)$/iu.test(v) && !/(?:^|\.)0x[0-9a-f]*\./iu.test(v)).parse(read('EMAIL_SMTP_HOST'));
     const portText = z.string().regex(/^[1-9]\d{0,4}$/).parse(read('EMAIL_SMTP_PORT') || (tls === 'tls' ? '465' : '587'));
     const port = z.number().int().min(1).max(65_535).parse(Number(portText));
     const user = z.string().min(1).max(256).refine(v => !/[\u0000-\u001f\u007f]/.test(v) && !malformedUnicode.test(v)).parse(read('EMAIL_SMTP_USER'));

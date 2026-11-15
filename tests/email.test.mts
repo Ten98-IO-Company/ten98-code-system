@@ -284,7 +284,7 @@ test('isSuppressed is required: missing options or a non-function, non-false val
 });
 
 test('an SMTP host whose last label is numeric is refused, as an address in disguise', async () => {
-  for (const host of ['2130706433', '127.1', '10.0.0.1.', 'mail.123']) {
+  for (const host of ['2130706433', '127.1', '10.0.0.1.', 'mail.123', '0x7f000001', '127.0x1', '0x7f.0.0.1']) {
     await assert.rejects(sendTransactionalEmail(message, { isSuppressed: false, env: { ...smtp, EMAIL_SMTP_HOST: host } }), unconfirmed, host);
     // Refused as configuration, before any DNS lookup: getEmailStatus reads the host rule alone.
     assert.deepEqual(getEmailStatus({ ...smtp, EMAIL_SMTP_HOST: host }), { configured: false, transport: 'disabled' }, host);

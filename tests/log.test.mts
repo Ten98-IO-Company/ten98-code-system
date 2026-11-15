@@ -113,7 +113,10 @@ test('requestId keeps a valid incoming x-request-id and replaces anything else w
 test('every common secret name is redacted, in any case and separator style (check of 9e03146)', () => {
   const { log, records } = capture();
   const names = ['pass', 'passwd', 'pwd', 'passphrase', 'auth', 'credential', 'credentials', 'session', 'sessionId', 'sid', 'jwt', 'bearer',
-    'signature', 'otp', 'dsn', 'databaseUrl', 'DATABASE_URL', 'connectionString', 'connection-string', 'privateKey', 'x-api-key', 'refresh_token'];
+    'signature', 'otp', 'dsn', 'databaseUrl', 'DATABASE_URL', 'connectionString', 'connection-string', 'privateKey', 'x-api-key', 'refresh_token',
+    'cvv', 'cardNumber', 'mnemonic', 'seed', 'psk', 'csrf', 'hmac', 'salt', 'clientSecret', 'accessToken', 'set-cookie', 'Authorization',
+    // Deliberate: `tokens` is usually a list of tokens, and a name ending in `key` cannot tell an id key from a secret key.
+    'tokens', 'primaryKey'];
   log.info('config', Object.fromEntries(names.map(name => [name, 'visible-secret'])));
   const line = records()[0]!;
   for (const name of names) assert.equal(line[name], '[redacted]', name);
@@ -123,16 +126,46 @@ test('every common secret name is redacted, in any case and separator style (che
   assert.doesNotMatch(JSON.stringify(records()[1]), /visible-secret/);
 });
 
+test('ordinary names that only contain a secret word are written as given (check of PR 138)', () => {
+  const { log, records } = capture();
+  const names = ['author', 'authorId', 'passed', 'bypass', 'compass', 'keyboard', 'monkey', 'sessionCount', 'tokenCount', 'otpEnabled',
+    'signatureValid', 'isPrivate', 'keyset', 'keyword', 'turkey', 'hotpath', 'passengerCount', 'authenticated'];
+  log.info('ordinary', Object.fromEntries(names.map(name => [name, `value-of-${name}`])));
+  const line = records()[0]!;
+  for (const name of names) assert.equal(line[name], `value-of-${name}`, name);
+});
+
 test('credentials embedded in a URL are removed from any string value, whatever the field is called', () => {
   const { log, records } = capture();
   log.error('connect failed postgres://app:p4ss@db.internal:5432/app', {
     target: 'postgres://app:p4ss@db.internal:5432/app', mirror: 'redis://:t0ken@cache:6379', hook: 'https://user@example.com/x',
-    note: 'retrying smtp://mailer:hunter2@smtp.example.com now', error: new Error('ECONNREFUSED postgres://app:p4ss@db.internal/app'), plain: 'https://example.com/a@b',
+    note: 'retrying smtp://mailer:hunter2@smtp.example.com now', error: new Error('ECONNREFUSED postgres://app:p4ss@db.internal/app'),
+    // A password holding a raw @, space or / (check of PR 138): everything up to the LAST @ goes.
+    atSign: 'postgres://app:S3CR@T@h/db', space: 'postgres://app:S3 CRET@h/db', slash: 'postgres://app:S3/CRET@h/db',
+    plain: 'https://example.com/a@b',
   });
-  const text = JSON.stringify(records()[0]);
-  for (const secret of ['p4ss', 't0ken', 'hunter2', 'user@']) assert.doesNotMatch(text, new RegExp(secret), secret);
+  const line = records()[0]!, text = JSON.stringify(line);
+  for (const secret of ['p4ss', 't0ken', 'hunter2', 'user@', 'S3CR', 'CRET']) assert.doesNotMatch(text, new RegExp(secret), secret);
   assert.match(text, /postgres:\/\/\[redacted\]@db\.internal:5432\/app/);
-  assert.equal(records()[0]!.plain, 'https://example.com/a@b', 'an @ in the path is not a credential');
+  for (const name of ['atSign', 'space', 'slash']) assert.equal(line[name], 'postgres://[redacted]@h/db', name);
+  // Taking the last @ over-redacts a URL with an @ in its path: the price of catching the passwords above.
+  assert.equal(line.plain, 'https://[redacted]@b');
+});
+
+test('a long hostile string is scanned in linear time and cut to length (check of PR 138)', () => {
+  const { log, records } = capture();
+  const hostile = ['a'.repeat(1_000_000), 'a+.-'.repeat(250_000), 'a://'.repeat(250_000), `x${'://'.repeat(333_333)}`, `${'a@'.repeat(500_000)}`];
+  const started = performance.now();
+  for (const value of hostile) log.info('payload', { value });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 1000, `five 1 MB strings took ${elapsed.toFixed(0)} ms`);
+  for (const line of records()) {
+    assert.ok((line.value as string).length < 8300, 'cut to length');
+    assert.match(line.value as string, /…\[truncated \d+ characters\]$/u);
+  }
+  // A credential beyond the cut is still redacted rather than half-written.
+  log.info('edge', { value: `${'x'.repeat(8180)} postgres://app:LONGSECRET@host/db` });
+  assert.doesNotMatch(JSON.stringify(records().at(-1)), /LONGSECRET|LONGSEC|app:L/u);
 });
 
 test('a log call never throws: throwing getters, unserialisable values and a failing sink', () => {

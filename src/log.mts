@@ -23,16 +23,59 @@ export interface LoggerOptions {
 
 const SEVERITY: Readonly<Record<LogLevel, number>> = { debug: 10, info: 20, warn: 30, error: 40 };
 const CORE = new Set(['time', 'level', 'service', 'message', 'requestId']);
-// Field names are compared lowercased with `-`, `_`, `.` and spaces removed, so DATABASE_URL, x-api-key and
-// connection_string match. A substring match over-redacts (cacheKey, author, compass) rather than miss a secret.
-const SECRET_PARTS = /pass|pwd|secret|token|auth|cookie|key|credential|session|jwt|bearer|signature|otp|dsn|databaseurl|connectionstring|private/u;
-const SECRET_EXACT = new Set(['sid']);
+/**
+ * Field names are split into lowercase segments at case changes and separators (`sessionId` → session, id;
+ * `x-api-key` → x, api, key; `DATABASE_URL` → database, url). A name is secret when its LAST segment is a secret
+ * word, or when two adjacent segments form a secret pair, so `accessToken`, `apiKey`, `sessionId` and `databaseUrl`
+ * are redacted while `tokenCount`, `keyword`, `authorId` and `otpEnabled` are not. Deliberate choices: `tokens`
+ * (usually a list of tokens) and any name ending in `key`, `primaryKey` included, are redacted, because a name cannot
+ * tell an id key from a secret key.
+ */
+const SECRET_WORDS = new Set(['password', 'passwords', 'passwd', 'pass', 'pwd', 'passphrase', 'secret', 'secrets', 'token', 'tokens', 'auth',
+  'authorization', 'cookie', 'cookies', 'key', 'keys', 'apikey', 'credential', 'credentials', 'session', 'sid', 'jwt', 'bearer', 'signature',
+  'otp', 'dsn', 'cvv', 'mnemonic', 'seed', 'psk', 'csrf', 'hmac', 'salt']);
+const SECRET_PAIRS = new Set(['session id', 'session token', 'database url', 'connection string', 'card number', 'private key', 'secret key',
+  'access key', 'api key', 'cookie header', 'auth header', 'authorization header', 'set cookie']);
+const segments = (name: string): string[] => name.replace(/([a-z0-9])([A-Z])/gu, '$1 $2').replace(/([A-Z]+)([A-Z][a-z])/gu, '$1 $2')
+  .split(/[-_.\s]+/u).filter(Boolean).map(part => part.toLowerCase());
 const secretName = (name: string): boolean => {
-  const plain = name.toLowerCase().replace(/[-_.\s]/gu, '');
-  return SECRET_PARTS.test(plain) || SECRET_EXACT.has(plain);
+  const parts = segments(name);
+  if (!parts.length) return false;
+  if (SECRET_WORDS.has(parts.at(-1)!)) return true;
+  for (let i = 1; i < parts.length; i++) if (SECRET_PAIRS.has(`${parts[i - 1]} ${parts[i]}`)) return true;
+  return false;
 };
-// Credentials embedded in a URL (`scheme://user:pass@host`, or `scheme://token@host`), whatever the field is called.
-const URL_CREDENTIALS = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/giu;
+
+// Strings are scanned and written up to this many characters; a longer one ends with a truncation marker.
+const MAX_STRING = 8192;
+const SCHEME_CHARACTER = /[a-z0-9+.-]/iu;
+/**
+ * Removes credentials embedded in URLs, whatever the field is called, in time linear in the string. For each `://`
+ * preceded by a scheme (a letter, then letters, digits, `+`, `.`, `-`, at most 32 characters), everything from `//` to
+ * the LAST `@` within the next 256 characters (stopping at a line break or the next `://`) is replaced. Taking the last
+ * `@` catches a password that itself holds `@`, a space or `/`; it over-redacts a URL with an `@` in its path.
+ */
+function withoutUrlCredentials(text: string): string {
+  let out = '', from = 0;
+  for (let at = text.indexOf('://'); at !== -1; at = text.indexOf('://', at + 3)) {
+    let start = at;
+    while (start > 0 && at - start < 32 && SCHEME_CHARACTER.test(text[start - 1]!)) start--;
+    // No scheme, or a `://` inside a span already redacted.
+    if (start === at || !/[a-z]/iu.test(text[start]!) || at < from) continue;
+    const next = text.indexOf('://', at + 3), limit = Math.min(text.length, at + 3 + 256, next === -1 ? Infinity : next);
+    let end = -1;
+    for (let i = at + 3; i < limit; i++) { if (text[i] === '\n' || text[i] === '\r') break; if (text[i] === '@') end = i; }
+    if (end === -1) continue;
+    out += `${text.slice(from, at + 3)}[redacted]`;
+    from = end;
+  }
+  return from === 0 ? text : out + text.slice(from);
+}
+const safeString = (value: string): string => {
+  // Scan a bounded prefix (a credential span is at most 256 characters past its `://`), then cut it to length.
+  const scanned = withoutUrlCredentials(value.length > MAX_STRING + 300 ? value.slice(0, MAX_STRING + 300) : value);
+  return scanned.length > MAX_STRING ? `${scanned.slice(0, MAX_STRING)}…[truncated ${value.length - MAX_STRING} characters]` : scanned;
+};
 const REQUEST_ID = /^[A-Za-z0-9._-]{8,128}$/u;
 
 function record(level: LogLevel, service: string, message: string, fields: LogFields): Record<string, unknown> {
@@ -49,7 +92,7 @@ function replacer(name: string, value: unknown): unknown {
   // JSON.stringify passes the returned object's strings back through here, so their URL credentials are removed too.
   if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack };
   if (typeof value === 'bigint') return value.toString();
-  if (typeof value === 'string') return value.replace(URL_CREDENTIALS, '$1[redacted]@');
+  if (typeof value === 'string') return safeString(value);
   return value;
 }
 
