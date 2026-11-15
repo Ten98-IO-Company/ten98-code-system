@@ -698,15 +698,17 @@ function readSharedFlowRegister(directory, policy) {
         return { errors: [`${policy.register} cannot be parsed: ${messageOf(error)}`] };
     }
     if (!isRecord(parsed) || !isRecord(parsed.features))
-        return { errors: [`${policy.register} must hold { "leaveGuardAdapter": "<file>", "features": { "<id>": { "status": … } } }.`] };
+        return { errors: [`${policy.register} must hold { "features": { "<id>": { "status": … } } }, and optionally "leaveGuardAdapter": "<file>".`] };
     return { register: { leaveGuardAdapter: parsed.leaveGuardAdapter, features: parsed.features }, errors: [] };
 }
 // Each listed feature is declared once: "uses" needs every export imported from its entry and referred to again,
 // "absent" a reason and no import of the export, "exception" a reason and a review trigger that has not yet come due.
 function inspectSharedFlowRegister(policy, list, version, register, scan, adapter) {
     const file = policy.sharedFlows.register, roots = policy.roots.join(', '), errors = [], installed = versionParts(version);
-    if (adapter === undefined || !scan.files.has(adapter))
-        errors.push(`${file}: leaveGuardAdapter must name the app's leave-guard adapter, a script file under ${roots}.`);
+    // The adapter is optional: without one no file is exempt from router-blocker. When given, it must be a real file.
+    if (register.leaveGuardAdapter !== undefined && (adapter === undefined || !scan.files.has(adapter))) {
+        errors.push(`${file}: leaveGuardAdapter, when given, must name the app's leave-guard adapter, a script file under ${roots}.`);
+    }
     for (const id of Object.keys(list))
         if (!Object.hasOwn(register.features, id))
             errors.push(`${file}: ${id} is missing; declare it "uses", "absent" or "exception".`);
@@ -825,7 +827,8 @@ export function updatePresentationBaseline(directory, name, options = {}) {
 }
 // Writes the app's first register: "uses" where every export of a feature is already imported and referred to, and
 // otherwise an exception with an empty reason and no trigger, which fails until someone writes the reason and trigger
-// or changes it to "absent". leaveGuardAdapter is left empty for the same reason. An existing register is never replaced.
+// or changes it to "absent". leaveGuardAdapter is left out until someone names the adapter. An existing register is
+// never replaced.
 export function recordSharedFlows(directory, name, options = {}) {
     const policy = resolveProfile(name)?.profile.presentation, sharedFlows = policy?.sharedFlows;
     if (!policy || !sharedFlows)
@@ -845,7 +848,7 @@ export function recordSharedFlows(directory, name, options = {}) {
         return scan.errors;
     const features = Object.fromEntries(Object.entries(list).map(([id, exports]) => [id,
         exports.every(({ name: exported, entry }) => scan.used.has(exportKey(entry, exported))) ? { status: 'uses' } : { status: 'exception', reason: '' }]));
-    writeFileSync(file, `${JSON.stringify({ leaveGuardAdapter: '', features }, null, 2)}\n`);
+    writeFileSync(file, `${JSON.stringify({ features }, null, 2)}\n`);
     return checkPresentation(directory, name, { ...options, parseAst });
 }
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');

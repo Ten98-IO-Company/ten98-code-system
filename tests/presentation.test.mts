@@ -159,7 +159,7 @@ test('update mode records the ratchet rules once on a baseline from before them,
 }));
 
 test('update mode refuses while the register has errors', needsParser, () => consumer({ files: ['element.tsx'], register: register(() => undefined, '') }, root => {
-  assert.match(updatePresentationBaseline(root, profile, { parseAst }).join('\n'), /leaveGuardAdapter must name/);
+  assert.match(updatePresentationBaseline(root, profile, { parseAst }).join('\n'), /leaveGuardAdapter, when given, must name/);
   assert.equal(existsSync(join(root, baselineName)), false);
 }));
 
@@ -234,7 +234,7 @@ test('the leave-guard adapter alone may import useBlocker', needsParser, () => {
   consumer({ sources: { 'src/page.tsx': adapterSource } }, root => {
     assert.deepEqual(check(root), ['src/page.tsx: router-blocker 1 exceeds baseline 0 (presentation is owned by @ten98/ui).']);
   });
-  // Without a valid register entry, the adapter file is counted too.
+  // With an adapter that names no real file, the adapter file is counted too.
   consumer({ register: register(() => undefined, 'src/missing.ts') }, root => {
     assert.match(check(root).join('\n'), /src\/leave-guard\.ts: router-blocker 1 exceeds baseline 0/);
   });
@@ -358,14 +358,24 @@ test('the register refuses an unknown status', needsParser, () => consumer({ reg
   ]);
 }));
 
-test('the register needs a leave-guard adapter that is a script file under the roots', needsParser, () => {
-  for (const adapter of [undefined, '', 'src/missing.ts', 'scripts/leave-guard.ts', '../leave-guard.ts', 'src/styles.css']) {
+test('a given leave-guard adapter must be a script file under the roots', needsParser, () => {
+  for (const adapter of ['', 'src/missing.ts', 'scripts/leave-guard.ts', '../leave-guard.ts', 'src/styles.css', 42, null]) {
     consumer({ register: flows(() => undefined, adapter), sources: { 'scripts/leave-guard.ts': adapterSource, 'src/styles.css': '' } }, root => {
-      assert.match(check(root).join('\n'), new RegExp(`${registerName}: leaveGuardAdapter must name the app's leave-guard adapter, a script file under src\\.`), String(adapter));
+      assert.match(check(root).join('\n'), new RegExp(`${registerName}: leaveGuardAdapter, when given, must name the app's leave-guard adapter, a script file under src\\.`), String(adapter));
     });
   }
   consumer({ register: flows(() => undefined, './src/leave-guard.ts') }, root => assert.deepEqual(check(root), []));
 });
+
+test('the leave-guard adapter is optional, and without one every useBlocker import counts', needsParser, () => consumer({
+  register: flows(() => undefined, undefined), sources: { 'src/page.tsx': adapterSource },
+}, root => {
+  assert.equal(JSON.parse(readFileSync(join(root, registerName), 'utf8')).leaveGuardAdapter, undefined);
+  assert.deepEqual(check(root).sort(), [
+    'src/leave-guard.ts: router-blocker 1 exceeds baseline 0 (presentation is owned by @ten98/ui).',
+    'src/page.tsx: router-blocker 1 exceeds baseline 0 (presentation is owned by @ten98/ui).',
+  ]);
+}));
 
 test('the register itself must exist and parse', needsParser, () => {
   consumer({ register: null }, root => {
@@ -410,14 +420,15 @@ test('record writes the first register once, marking uses and leaving empty exce
 }, root => {
   const errors = recordSharedFlows(root, profile, { parseAst });
   const written = JSON.parse(readFileSync(join(root, registerName), 'utf8'));
-  assert.deepEqual(Object.keys(written), ['leaveGuardAdapter', 'features']);
-  assert.equal(written.leaveGuardAdapter, '');
+  // The adapter is left out, so no file is exempt until someone names it.
+  assert.deepEqual(Object.keys(written), ['features']);
   assert.deepEqual(Object.keys(written.features), Object.keys(listed));
   assert.deepEqual(written.features.team, { status: 'uses' });
   assert.deepEqual(written.features['api-keys'], { status: 'exception', reason: '' });
   assert.deepEqual(written.features.sessions, { status: 'exception', reason: '' });
-  // Every exception fails until its reason and trigger are written, and the adapter until it is named.
-  assert.match(errors.join('\n'), /leaveGuardAdapter must name/);
+  // Every exception fails until its reason and trigger are written.
+  assert.doesNotMatch(errors.join('\n'), /leaveGuardAdapter/);
+  assert.match(errors.join('\n'), /src\/leave-guard\.ts: router-blocker 1 exceeds baseline 0/);
   assert.match(errors.join('\n'), /api-keys needs a reason of 1 to 500 characters\./);
   assert.match(errors.join('\n'), /sessions needs a review trigger/);
   assert.doesNotMatch(errors.join('\n'), /: team /);
@@ -452,9 +463,10 @@ test('check.mjs prints the remaining ratchet counts on every run and records the
       const remaining = /presentation counts remaining: native-dialog 1, router-blocker 0, t98-selector 0, t98-class 0, t98-dom 0\./;
       const recorded = cli('--record-shared-flows');
       assert.equal(recorded.status, 1);
-      // The recorded register names no adapter yet, so the adapter's useBlocker import is counted until it is named.
+      // The recorded register names no adapter, so the adapter's useBlocker import is counted until it is named.
       assert.match(recorded.stdout, /presentation counts remaining: native-dialog 1, router-blocker 1, t98-selector 0, t98-class 0, t98-dom 0\./);
-      assert.match(recorded.stderr, /leaveGuardAdapter must name/);
+      assert.match(recorded.stderr, /src\/leave-guard\.ts: router-blocker 1 exceeds baseline 0/);
+      assert.match(recorded.stderr, /needs a reason of 1 to 500 characters/);
       assert.ok(existsSync(join(root, registerName)));
       writeFileSync(join(root, registerName), JSON.stringify(absentRegister()));
       const failing = cli();

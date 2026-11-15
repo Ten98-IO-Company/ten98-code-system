@@ -61,7 +61,7 @@ Each framework entry point takes its libraries as exact optional peers, so the a
 - Take `@ten98/ui` 0.40.0 or later first; with an older release the check fails closed.
 - Record the register once with `node node_modules/@ten98/runtime/check.mjs --record-shared-flows .`.
 - Write every reason and review trigger, and change each feature the app doesn't have to `absent`.
-- Name the leave-guard adapter in `leaveGuardAdapter`.
+- Name the app's leave-guard adapter in `leaveGuardAdapter`, if it has one. Without it, every `useBlocker` import counts toward `router-blocker`.
 - Re-record the baseline once with `--update-presentation-baseline`, and review the diff of both files.
 - The details are under [Shared-flow register](#shared-flow-register).
 
@@ -116,12 +116,12 @@ Apps whose profile has a `presentation` policy keep a committed `presentation-ba
 
 Five more rules have a target of zero. `t98-selector` counts the `.css` files under the roots; the other four count every script file there (`.js`, `.jsx`, `.ts`, `.tsx` and their `.mjs`, `.cjs`, `.mts` and `.cts` forms, not `.d.ts`):
 - **`native-dialog`:** calls to `confirm`, `alert` and `prompt` as members of `window`, `globalThis` or `self`, including optional calls (`window.confirm?.(…)`, `window?.confirm(…)`), literal bracket keys (`window['confirm']`) and tagged templates. A bare call counts too, unless the file declares a binding of that name anywhere. Use `useConfirmDialog` from `@ten98/ui`.
-- **`router-blocker`:** a named import of `useBlocker` from `@tanstack/react-router`, `react-router` or `react-router-dom`, aliased or not, in any file except the register's `leaveGuardAdapter`. A type-only import doesn't count. Use `useLeaveGuard`, passing the adapter as its `useBlocker`.
+- **`router-blocker`:** a named import of `useBlocker` from `@tanstack/react-router`, `react-router` or `react-router-dom`, aliased or not, in any file except the register's `leaveGuardAdapter`, when it names one. A type-only import doesn't count. Use `useLeaveGuard`, passing the adapter as its `useBlocker`.
 - **`t98-selector`:** selectors in the app's stylesheets that name a `t98-` class (`.t98-…`), or hold `t98-` inside an attribute selector (`[class*="t98-"]`, `[data-t98-part]`). Each selector in a list counts once. The scanner skips comments, keeps strings whole, and reads the selectors inside `@media`, `@supports`, `@layer` and nested rules too.
 - **`t98-class`:** each string literal and template part containing `t98-` inside a `className` attribute.
 - **`t98-dom`:** calls to `querySelector`, `querySelectorAll`, `closest`, `matches` and `getElementsByClassName`, and to `classList.add`, `.remove` and `.toggle`, whose first argument is a string or template containing `t98-` or `data-t98`.
 
-Every run prints the remaining total of each of these five rules across all files, whether it passes or fails. The baseline records the rules it was recorded for under `"$rules"`. A baseline from before these rules has no `"$rules"`, so `--update-presentation-baseline` records the five rules once from current counts, alongside lowering the older ones. From then on it only lowers them. The update refuses while the shared-flow register has errors, so the adapter is named before `router-blocker` is recorded.
+Every run prints the remaining total of each of these five rules across all files, whether it passes or fails. The baseline records the rules it was recorded for under `"$rules"`. A baseline from before these rules has no `"$rules"`, so `--update-presentation-baseline` records the five rules once from current counts, alongside lowering the older ones. From then on it only lowers them. The update refuses while the shared-flow register has errors. Name the adapter, if the app has one, before recording, or the adapter's own `useBlocker` import is recorded under `router-blocker`.
 
 The rules read a real syntax tree, so a comment or a string that mentions `window.confirm` doesn't count. They are signals, not proof; the cross-app acceptance form is still how layout and wording differences are caught in the running apps. They don't see:
 - a dialog function taken into a variable (`const ask = window.confirm`), reached through a computed key (`window[name]`), or called inside a dependency;
@@ -160,9 +160,11 @@ The check refuses:
 - `exception` without a reason, or without a review trigger. The trigger is `{ "ui": "<x.y.z>" }` (preferred) or `{ "issue": "<https URL>" }`;
 - a `ui` trigger once the installed `@ten98/ui` is at or above that version. Review the entry then, and either move it to `uses` or write a new reason and trigger;
 - a reason that is empty or longer than 500 characters, and a status other than `uses`, `absent` or `exception`;
-- a `leaveGuardAdapter` that is missing, or that doesn't name a script file under the presentation roots. The adapter is the function the app passes to `useLeaveGuard` as its `useBlocker` (`@ten98/ui`'s `LeaveGuardBlocker` type), and the one file whose import of a router's `useBlocker` the `router-blocker` rule doesn't count.
+- a `leaveGuardAdapter` that is given but doesn't name a script file under the presentation roots.
 
-`node node_modules/@ten98/runtime/check.mjs --record-shared-flows .` writes the first register. It marks `uses` wherever every export is already used, writes every other feature as an `exception` with an empty reason and no trigger, and leaves `leaveGuardAdapter` empty. Those entries fail until someone writes them, as the first raw-statement allowlist does. It refuses to replace an existing register.
+`leaveGuardAdapter` is optional. The adapter is the function the app passes to `useLeaveGuard` as its `useBlocker` (`@ten98/ui`'s `LeaveGuardBlocker` type). The file it names is the one file whose import of a router's `useBlocker` the `router-blocker` rule doesn't count. When it is left out, no file is exempt, and every `useBlocker` import counts.
+
+`node node_modules/@ten98/runtime/check.mjs --record-shared-flows .` writes the first register. It marks `uses` wherever every export is already used, writes every other feature as an `exception` with an empty reason and no trigger, and leaves `leaveGuardAdapter` out. Those exceptions fail until someone writes them, as the first raw-statement allowlist does. It refuses to replace an existing register.
 
 The register is a written record that the check holds to a few facts. It can't see:
 - whether an `issue` trigger has been resolved. The check can't read issues, so the reviewer checks it;

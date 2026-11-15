@@ -656,7 +656,7 @@ function readSharedFlowRegister(directory: string, policy: SharedFlowsPolicy): {
   let parsed: unknown;
   try { parsed = JSON.parse(readFileSync(file, 'utf8')); }
   catch (error) { return { errors: [`${policy.register} cannot be parsed: ${messageOf(error)}`] }; }
-  if (!isRecord(parsed) || !isRecord(parsed.features)) return { errors: [`${policy.register} must hold { "leaveGuardAdapter": "<file>", "features": { "<id>": { "status": … } } }.`] };
+  if (!isRecord(parsed) || !isRecord(parsed.features)) return { errors: [`${policy.register} must hold { "features": { "<id>": { "status": … } } }, and optionally "leaveGuardAdapter": "<file>".`] };
   return { register: { leaveGuardAdapter: parsed.leaveGuardAdapter, features: parsed.features }, errors: [] };
 }
 
@@ -664,7 +664,10 @@ function readSharedFlowRegister(directory: string, policy: SharedFlowsPolicy): {
 // "absent" a reason and no import of the export, "exception" a reason and a review trigger that has not yet come due.
 function inspectSharedFlowRegister(policy: PresentationPolicy & { sharedFlows: SharedFlowsPolicy }, list: SharedFlowList, version: string, register: SharedFlowRegister, scan: PresentationScan, adapter: string | undefined): string[] {
   const file = policy.sharedFlows.register, roots = policy.roots.join(', '), errors: string[] = [], installed = versionParts(version);
-  if (adapter === undefined || !scan.files.has(adapter)) errors.push(`${file}: leaveGuardAdapter must name the app's leave-guard adapter, a script file under ${roots}.`);
+  // The adapter is optional: without one no file is exempt from router-blocker. When given, it must be a real file.
+  if (register.leaveGuardAdapter !== undefined && (adapter === undefined || !scan.files.has(adapter))) {
+    errors.push(`${file}: leaveGuardAdapter, when given, must name the app's leave-guard adapter, a script file under ${roots}.`);
+  }
   for (const id of Object.keys(list)) if (!Object.hasOwn(register.features, id)) errors.push(`${file}: ${id} is missing; declare it "uses", "absent" or "exception".`);
   for (const [id, value] of Object.entries(register.features)) {
     if (!Object.hasOwn(list, id)) { errors.push(`${file}: ${id} is not a shared flow in ${policy.owner} ${version}; remove it.`); continue; }
@@ -766,7 +769,8 @@ export function updatePresentationBaseline(directory: string, name: string, opti
 
 // Writes the app's first register: "uses" where every export of a feature is already imported and referred to, and
 // otherwise an exception with an empty reason and no trigger, which fails until someone writes the reason and trigger
-// or changes it to "absent". leaveGuardAdapter is left empty for the same reason. An existing register is never replaced.
+// or changes it to "absent". leaveGuardAdapter is left out until someone names the adapter. An existing register is
+// never replaced.
 export function recordSharedFlows(directory: string, name: string, options: PresentationOptions = {}): string[] {
   const policy = resolveProfile(name)?.profile.presentation, sharedFlows = policy?.sharedFlows;
   if (!policy || !sharedFlows) return [`${name} declares no shared-flow register.`];
@@ -781,7 +785,7 @@ export function recordSharedFlows(directory: string, name: string, options: Pres
   if (scan.errors.length) return scan.errors;
   const features = Object.fromEntries(Object.entries(list).map(([id, exports]) => [id,
     exports.every(({ name: exported, entry }) => scan.used.has(exportKey(entry, exported))) ? { status: 'uses' } : { status: 'exception', reason: '' }]));
-  writeFileSync(file, `${JSON.stringify({ leaveGuardAdapter: '', features }, null, 2)}\n`);
+  writeFileSync(file, `${JSON.stringify({ features }, null, 2)}\n`);
   return checkPresentation(directory, name, { ...options, parseAst });
 }
 
