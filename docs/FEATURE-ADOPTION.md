@@ -166,3 +166,7 @@ The adoption checklist is under [Entry-point checklists](#entry-point-checklists
 ## Logging
 
 The runtime has no shared logger yet; apps keep their own. The planned `./log` entry ([#142](https://github.com/Ten98-IO-Company/ten98-code-system/issues/142)) wraps pino with path-based redaction: values at listed paths are hidden, a secret under a name nobody listed is written, and values are never scanned, so a password inside a database URL or a token inside a message is written as given. Whichever logger an app uses, log the fields you mean to log, never whole configuration objects, request bodies, request headers or errors that carry configuration.
+
+## Public addresses and hostnames
+
+`publicNetworkAddress` admits IPv4 outside the IANA special-purpose ranges and IPv6 only inside global unicast 2000::/3, decided from the first 16-bit group of the canonical form, outside the reserved ranges within it. It refuses zone ids, IPv4-mapped, IPv4-compatible and translated IPv6, and every IPv4 spelling other than dotted decimal. Cloud metadata endpoints sit inside the refused ranges; Azure's platform address 168.63.129.16 is in public space and is refused by name. The browser-audit egress proxy admits literal and resolved targets with the same function.
