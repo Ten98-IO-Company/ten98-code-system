@@ -47,7 +47,8 @@ export declare function createTenancy<TTable extends string>({ setting, column, 
      * one transaction whose row-level security admits that workspace only. `read` makes that transaction READ ONLY once
      * the membership is checked (its share lock cannot be taken in a read-only transaction). `outer` joins a transaction
      * the caller already holds (workspace creation inserts the workspace first), and `db` may itself be a transaction (a
-     * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards.
+     * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards. Nested in
+     * a READ ONLY transaction it admits only a membership a helper share-locked earlier in that transaction.
      */
     withWorkspace<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceId: string, mode: WorkspaceMode, run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess) => Promise<T>, outer?: ScopedTransaction<TDatabase>): Promise<T>;
     /**
