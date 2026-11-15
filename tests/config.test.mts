@@ -22,8 +22,10 @@ test('readEnvironment returns NAME, or the trimmed contents of NAME_FILE, and un
   assert.equal(readEnvironment('API_KEY', { API_KEY: 'direct' }), 'direct');
   assert.equal(readEnvironment('API_KEY', { API_KEY_FILE: file('api-key', '  from-file\n') }), 'from-file');
   assert.equal(readEnvironment('API_KEY', {}), undefined);
-  // Compose's `X: ${X:-}` passes an empty string; that is unset, not a value and not a conflict.
-  assert.equal(readEnvironment('API_KEY', { API_KEY: '' }), undefined);
+  // As in discover and books, an empty plain value comes back as '' (callers' `??` defaults do not apply), but it
+  // never conflicts with a file, and an empty NAME_FILE is unset.
+  assert.equal(readEnvironment('API_KEY', { API_KEY: '' }), '');
+  assert.equal(readEnvironment('API_KEY', { API_KEY_FILE: '' }), undefined);
   assert.equal(readEnvironment('API_KEY', { API_KEY: '', API_KEY_FILE: file('api-key-2', 'file-wins') }), 'file-wins');
   assert.equal(readEnvironment('API_KEY', { API_KEY: 'direct', API_KEY_FILE: '' }), 'direct');
 });
@@ -56,6 +58,7 @@ test('readEnvironment reports a missing file by key and error code, without the 
 test('readSecret refuses an unset or short secret without echoing it, and honours minimumLength', () => {
   assert.equal(readSecret('AUTH_SECRET', { env: { AUTH_SECRET: secret } }), secret);
   assert.throws(() => readSecret('AUTH_SECRET', { env: {} }), invalid(['AUTH_SECRET'], /^AUTH_SECRET must contain at least 32 characters$/));
+  assert.throws(() => readSecret('AUTH_SECRET', { env: { AUTH_SECRET: '' } }), invalid(['AUTH_SECRET'], /^AUTH_SECRET must contain at least 32 characters$/));
   assert.throws(() => readSecret('AUTH_SECRET', { env: { AUTH_SECRET: 'short-secret-value' } }), (error: unknown) => {
     invalid(['AUTH_SECRET'], /at least 32 characters/)(error);
     assert.doesNotMatch((error as Error).message, /short-secret-value/);
@@ -94,6 +97,8 @@ test('loadConfig reads each schema key through readEnvironment, files included, 
   const typed: number = config.PORT;
   assert.equal(typed, 3000);
   assert.equal(loadConfig(schema, { DATABASE_URL: 'postgres://app@db/app', AUTH_SECRET: secret, PORT: '8080', MODE: 'worker' }).PORT, 8080);
+  // An empty value is left out of the input, so the default applies rather than coercing '' to 0.
+  assert.equal(loadConfig(schema, { DATABASE_URL: 'postgres://app@db/app', AUTH_SECRET: secret, PORT: '' }).PORT, 3000);
 });
 
 test('loadConfig names every failing key in one error and never includes a value', () => {

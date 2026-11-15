@@ -6,6 +6,8 @@ export type ConfigError = Error & {
 };
 /**
  * The value of `name`, or the trimmed contents of the file `${name}_FILE` names; undefined when neither is set.
+ * As in discover and books, the checks are truthy: an empty `${name}_FILE` is unset and an empty `name` never
+ * conflicts with a file, but with no file `name` is returned unchanged, untrimmed and `''` included.
  * Setting both, or naming a file that cannot be read, throws a ConfigError with `code: 'CONFIG_INVALID'`.
  */
 export declare function readEnvironment(name: string, env?: Environment): string | undefined;
@@ -15,8 +17,8 @@ export declare function readSecret(name: string, { minimumLength, env }?: {
     env?: Environment;
 }): string;
 /**
- * Reads every key of `schema` through readEnvironment (unset keys are omitted, so `.default()` applies) and parses
- * the strings with zod; use `z.coerce` or `z.stringbool()` for non-string settings. Every problem is reported in one
+ * Reads every key of `schema` through readEnvironment and parses the strings with zod. Unset and empty keys are
+ * omitted, so `.default()` applies to `X=''` (Compose's `X: ${X:-}` passes empty strings through); use `z.coerce` or `z.stringbool()` for non-string settings. Every problem is reported in one
  * ConfigError whose `keys` lists the failing keys. Any configured value of four or more characters is removed from
  * the message, including from an app's own refine messages; the ZodError is not attached.
  */

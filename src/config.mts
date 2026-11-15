@@ -9,18 +9,17 @@ export type ConfigError = Error & { code: 'CONFIG_INVALID'; keys: string[] };
 
 // Messages name keys and never carry a configured value or a file path, so they are safe to log at start-up.
 const configError = (message: string, keys: string[]): ConfigError => Object.assign(new Error(message), { code: 'CONFIG_INVALID' as const, keys });
-// An empty variable counts as unset: Compose interpolation such as `X: ${X:-}` passes empty strings through.
-const present = (value: string | undefined): value is string => value !== undefined && value !== '';
-
 /**
  * The value of `name`, or the trimmed contents of the file `${name}_FILE` names; undefined when neither is set.
+ * As in discover and books, the checks are truthy: an empty `${name}_FILE` is unset and an empty `name` never
+ * conflicts with a file, but with no file `name` is returned unchanged, untrimmed and `''` included.
  * Setting both, or naming a file that cannot be read, throws a ConfigError with `code: 'CONFIG_INVALID'`.
  */
 export function readEnvironment(name: string, env: Environment = process.env): string | undefined {
   const direct = env[name];
   const file = env[`${name}_FILE`];
-  if (present(direct) && present(file)) throw configError(`Set only ${name} or ${name}_FILE`, [name]);
-  if (!present(file)) return present(direct) ? direct : undefined;
+  if (direct && file) throw configError(`Set only ${name} or ${name}_FILE`, [name]);
+  if (!file) return direct;
   try {
     return readFileSync(file, 'utf8').trim();
   } catch (error) {
@@ -33,13 +32,13 @@ export function readEnvironment(name: string, env: Environment = process.env): s
 export function readSecret(name: string, { minimumLength = 32, env = process.env }: { minimumLength?: number; env?: Environment } = {}): string {
   if (!Number.isSafeInteger(minimumLength) || minimumLength < 1) throw new RangeError('readSecret needs a positive integer minimumLength.');
   const value = readEnvironment(name, env);
-  if (value === undefined || value.length < minimumLength) throw configError(`${name} must contain at least ${minimumLength} characters`, [name]);
+  if (!value || value.length < minimumLength) throw configError(`${name} must contain at least ${minimumLength} characters`, [name]);
   return value;
 }
 
 /**
- * Reads every key of `schema` through readEnvironment (unset keys are omitted, so `.default()` applies) and parses
- * the strings with zod; use `z.coerce` or `z.stringbool()` for non-string settings. Every problem is reported in one
+ * Reads every key of `schema` through readEnvironment and parses the strings with zod. Unset and empty keys are
+ * omitted, so `.default()` applies to `X=''` (Compose's `X: ${X:-}` passes empty strings through); use `z.coerce` or `z.stringbool()` for non-string settings. Every problem is reported in one
  * ConfigError whose `keys` lists the failing keys. Any configured value of four or more characters is removed from
  * the message, including from an app's own refine messages; the ZodError is not attached.
  */
@@ -49,7 +48,7 @@ export function loadConfig<Schema extends z.ZodObject>(schema: Schema, env: Envi
   for (const key of Object.keys(schema.shape)) {
     try {
       const value = readEnvironment(key, env);
-      if (value !== undefined) input[key] = value;
+      if (value) input[key] = value;
     } catch (error) {
       problems.push({ key, message: (error as Error).message });
     }
