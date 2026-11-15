@@ -209,6 +209,20 @@ test('the server logs each error once with the reference the browser shows, or h
   assert.ok(!servers.reporter!.stderr.includes(reported), 'the reporter replaces the default log line');
 });
 
+test('a PublicError subclass with its own name and fields crosses as its message only, and is never logged', () => {
+  class PlanExpired extends PublicError { override name = 'PlanExpired'; code = 'hidden'; }
+  const reported: unknown[] = [];
+  const [adapter] = ten98StartOptions({ reporter: error => { reported.push(error); } }).serializationAdapters;
+  const wire = adapter.toSerializable(new PlanExpired(PUBLIC_MESSAGE, { cause: new Error('hidden') }));
+  assert.deepEqual(wire, { public: PUBLIC_MESSAGE });
+  assert.deepEqual(reported, []);
+  const rebuilt = adapter.fromSerializable(wire);
+  assert.ok(rebuilt instanceof PublicError);
+  assert.equal(rebuilt.name, 'PublicError');
+  assert.equal(rebuilt.message, PUBLIC_MESSAGE);
+  assert.equal(publicErrorMessage(new PlanExpired(PUBLIC_MESSAGE)), PUBLIC_MESSAGE);
+});
+
 // Runs `run` and fails if any promise rejection was left unhandled by the time the event loop turns.
 const withoutUnhandledRejections = async (run: () => void | Promise<void>): Promise<void> => {
   const unhandled: unknown[] = [], spy = (reason: unknown) => { unhandled.push(reason); };
