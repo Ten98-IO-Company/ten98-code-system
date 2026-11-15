@@ -28,18 +28,23 @@ function referenceFor(error, reporter) {
         return reference;
     reference = crypto.randomUUID();
     references.set(error, reference);
-    try {
-        if (reporter)
-            reporter(error, { reference });
-        else
-            console.error(`Error reference ${reference}:`, error);
-    }
-    catch {
-        // A failing reporter must not break the response; the error still reaches the server log.
+    const log = () => {
         try {
             console.error(`Error reference ${reference}:`, error);
         }
         catch { /* nothing left to log with */ }
+    };
+    if (!reporter)
+        log();
+    else {
+        // A failing reporter, synchronous or async, must not break the response or leave an unhandled rejection; the
+        // error then reaches the server log instead.
+        try {
+            Promise.resolve(reporter(error, { reference })).catch(log);
+        }
+        catch {
+            log();
+        }
     }
     return reference;
 }
@@ -87,10 +92,12 @@ export function ten98RootErrorOptions({ reporter, development = process.env.NODE
     const handle = (kind) => (error, info) => {
         if (development)
             console.error(`React ${kind} error:`, error, info?.componentStack ?? '');
-        try {
-            reporter?.(error, { kind, componentStack: info?.componentStack });
-        }
-        catch { /* a failing reporter stays silent */ }
+        // A failing reporter, synchronous or async, stays silent: no console line in production, no unhandled rejection.
+        if (reporter)
+            try {
+                Promise.resolve(reporter(error, { kind, componentStack: info?.componentStack })).catch(() => { });
+            }
+            catch { /* silent */ }
     };
     return { onCaughtError: handle('caught'), onUncaughtError: handle('uncaught'), onRecoverableError: handle('recoverable') };
 }

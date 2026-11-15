@@ -16,8 +16,11 @@ export class PublicError extends Error {
   override name = 'PublicError';
 }
 
-/** Receives each server error that is replaced for the browser, with the reference the browser shows. */
-export type ServerErrorReporter = (error: Error, details: { reference: string }) => void;
+/**
+ * Receives each server error that is replaced for the browser, with the reference the browser shows. It may be async;
+ * when it throws or its promise rejects, the error goes to the default server log line instead.
+ */
+export type ServerErrorReporter = (error: Error, details: { reference: string }) => void | PromiseLike<void>;
 
 export interface Ten98StartOptions<TMiddleware extends readonly AnyRequestMiddleware[]> {
   /** Replaces the default server log line, `console.error('Error reference <id>:', error)`. */
@@ -42,12 +45,14 @@ function referenceFor(error: Error, reporter: ServerErrorReporter | undefined): 
   if (reference) return reference;
   reference = crypto.randomUUID();
   references.set(error, reference);
-  try {
-    if (reporter) reporter(error, { reference });
-    else console.error(`Error reference ${reference}:`, error);
-  } catch {
-    // A failing reporter must not break the response; the error still reaches the server log.
+  const log = (): void => {
     try { console.error(`Error reference ${reference}:`, error); } catch { /* nothing left to log with */ }
+  };
+  if (!reporter) log();
+  else {
+    // A failing reporter, synchronous or async, must not break the response or leave an unhandled rejection; the
+    // error then reaches the server log instead.
+    try { Promise.resolve(reporter(error, { reference })).catch(log); } catch { log(); }
   }
   return reference;
 }
@@ -92,8 +97,8 @@ export function ten98StartOptions<const TMiddleware extends readonly AnyRequestM
   };
 }
 
-/** Receives each error React reports in the browser, in production as well as development. */
-export type ClientErrorReporter = (error: unknown, details: { kind: 'caught' | 'uncaught' | 'recoverable'; componentStack?: string }) => void;
+/** Receives each error React reports in the browser, in production as well as development. It may be async. */
+export type ClientErrorReporter = (error: unknown, details: { kind: 'caught' | 'uncaught' | 'recoverable'; componentStack?: string }) => void | PromiseLike<void>;
 
 type RootErrorOptions = Required<Pick<HydrationOptions, 'onCaughtError' | 'onUncaughtError' | 'onRecoverableError'>>;
 
@@ -106,7 +111,8 @@ export function ten98RootErrorOptions(
 ): RootErrorOptions {
   const handle = (kind: 'caught' | 'uncaught' | 'recoverable') => (error: unknown, info?: { componentStack?: string }): void => {
     if (development) console.error(`React ${kind} error:`, error, info?.componentStack ?? '');
-    try { reporter?.(error, { kind, componentStack: info?.componentStack }); } catch { /* a failing reporter stays silent */ }
+    // A failing reporter, synchronous or async, stays silent: no console line in production, no unhandled rejection.
+    if (reporter) try { Promise.resolve(reporter(error, { kind, componentStack: info?.componentStack })).catch(() => {}); } catch { /* silent */ }
   };
   return { onCaughtError: handle('caught'), onUncaughtError: handle('uncaught'), onRecoverableError: handle('recoverable') };
 }

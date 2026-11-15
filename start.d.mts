@@ -7,10 +7,13 @@ import { type AnyRequestMiddleware } from '@tanstack/react-start';
 export declare class PublicError extends Error {
     name: string;
 }
-/** Receives each server error that is replaced for the browser, with the reference the browser shows. */
+/**
+ * Receives each server error that is replaced for the browser, with the reference the browser shows. It may be async;
+ * when it throws or its promise rejects, the error goes to the default server log line instead.
+ */
 export type ServerErrorReporter = (error: Error, details: {
     reference: string;
-}) => void;
+}) => void | PromiseLike<void>;
 export interface Ten98StartOptions<TMiddleware extends readonly AnyRequestMiddleware[]> {
     /** Replaces the default server log line, `console.error('Error reference <id>:', error)`. */
     reporter?: ServerErrorReporter;
@@ -38,11 +41,11 @@ export declare function ten98StartOptions<const TMiddleware extends readonly Any
     serializationAdapters: readonly [import("@tanstack/react-router").SerializationAdapter<Error, ErrorWire, never>];
     requestMiddleware: readonly [typeof csrfMiddleware, ...TMiddleware];
 };
-/** Receives each error React reports in the browser, in production as well as development. */
+/** Receives each error React reports in the browser, in production as well as development. It may be async. */
 export type ClientErrorReporter = (error: unknown, details: {
     kind: 'caught' | 'uncaught' | 'recoverable';
     componentStack?: string;
-}) => void;
+}) => void | PromiseLike<void>;
 type RootErrorOptions = Required<Pick<HydrationOptions, 'onCaughtError' | 'onUncaughtError' | 'onRecoverableError'>>;
 /**
  * React's root error callbacks. In development they log the error and its component stack; in production they write

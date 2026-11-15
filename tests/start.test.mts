@@ -197,7 +197,19 @@ test('the server logs each error once with the reference the browser shows, or h
   assert.ok(!servers.reporter!.stderr.includes(reported), 'the reporter replaces the default log line');
 });
 
-test('the adapter rebuilds a PublicError and a referenced Error, and logs one line per error object', () => {
+// Runs `run` and fails if any promise rejection was left unhandled by the time the event loop turns.
+const withoutUnhandledRejections = async (run: () => void | Promise<void>): Promise<void> => {
+  const unhandled: unknown[] = [], spy = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', spy);
+  try {
+    await run();
+    await new Promise(resolve => setImmediate(resolve));
+  } finally { process.off('unhandledRejection', spy); }
+  assert.deepEqual(unhandled, [], 'a failing reporter left an unhandled rejection');
+};
+const failingReporters = { throwing: () => { throw new Error('reporter down'); }, rejecting: async () => { throw new Error('reporter down'); } };
+
+test('the adapter rebuilds a PublicError and a referenced Error, and logs one line per error object', async () => {
   const [adapter] = ten98StartOptions().serializationAdapters;
   const publicError = adapter.fromSerializable(adapter.toSerializable(new PublicError(PUBLIC_MESSAGE, { cause: new Error('hidden') })));
   assert.ok(publicError instanceof PublicError);
@@ -217,10 +229,16 @@ test('the adapter rebuilds a PublicError and a referenced Error, and logs one li
     assert.match(rebuilt.reference, new RegExp(`^${UUID}$`, 'u'));
     assert.equal(logged.length, 1);
     assert.equal(logged[0]![1], original);
-    // A failing reporter still leaves the error in the server log.
-    const [reporting] = ten98StartOptions({ reporter: () => { throw new Error('reporter down'); } }).serializationAdapters;
-    reporting.toSerializable(new Error('second'));
-    assert.equal(logged.length, 2);
+    // A reporter that throws or rejects still leaves the error, with the reference the browser shows, in the server log.
+    for (const [name, reporter] of Object.entries(failingReporters)) {
+      await withoutUnhandledRejections(async () => {
+        const [reporting] = ten98StartOptions({ reporter }).serializationAdapters, failed = new Error(name);
+        const { reference } = reporting.toSerializable(failed) as { reference: string };
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(logged.at(-1), [`Error reference ${reference}:`, failed], name);
+      });
+    }
+    assert.equal(logged.length, 3);
     // A malformed reference is never shown as given.
     assert.match(adapter.fromSerializable({ reference: '<img src=x>' }).message, /Reference unavailable\./u);
   } finally { console.error = error; }
@@ -234,7 +252,7 @@ test('the CSRF middleware always comes first, ahead of the app middleware', () =
   assert.equal(ten98StartOptions().requestMiddleware.length, 1);
 });
 
-test('React root errors are silent in production apart from the reporter, and logged with the component stack in development', () => {
+test('React root errors are silent in production apart from the reporter, and logged with the component stack in development', async () => {
   const logged: unknown[][] = [], reported: unknown[][] = [], { error } = console, environment = process.env.NODE_ENV;
   console.error = (...args: unknown[]) => { logged.push(args); };
   const thrown = new Error('render failed'), info = { componentStack: '\n    at Widget' };
@@ -247,9 +265,12 @@ test('React root errors are silent in production apart from the reporter, and lo
     ten98RootErrorOptions().onUncaughtError(thrown, info);
     assert.deepEqual(logged, []);
     assert.deepEqual(reported.map(([, details]) => details), ['caught', 'uncaught', 'recoverable'].map(kind => ({ kind, componentStack: info.componentStack })));
+    // A reporter that throws or rejects adds nothing: no console line in production and no unhandled rejection.
+    for (const reporter of Object.values(failingReporters)) await withoutUnhandledRejections(() => ten98RootErrorOptions({ reporter }).onCaughtError(thrown, info));
+    assert.deepEqual(logged, []);
     process.env.NODE_ENV = 'development';
-    ten98RootErrorOptions({ reporter: () => { throw new Error('reporter down'); } }).onCaughtError(thrown, info);
-    assert.deepEqual(logged, [['React caught error:', thrown, info.componentStack]]);
+    for (const reporter of Object.values(failingReporters)) await withoutUnhandledRejections(() => ten98RootErrorOptions({ reporter }).onCaughtError(thrown, info));
+    assert.deepEqual(logged, [['React caught error:', thrown, info.componentStack], ['React caught error:', thrown, info.componentStack]]);
   } finally {
     console.error = error;
     if (environment === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = environment;
