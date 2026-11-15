@@ -319,6 +319,30 @@
       "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/123",
       "boundary": "One plain-text transactional message over SES, Cloudflare or SMTP in one bounded attempt, with a required suppression decision and a uniform 503 failure. nodemailer is needed for SMTP only. Apps keep message text, the suppression list and its feedback webhook, rate limits and what the user is told."
     },
+    "log": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/log",
+      "entrypoints": [
+        "log.mjs",
+        "log.d.mts"
+      ],
+      "peerDependencies": {
+        "pino": "10.4.0"
+      },
+      "exports": [
+        "createLogger",
+        "requestId",
+        "DEFAULT_REDACT_PATHS",
+        "safeDatabaseError",
+        "SafeDatabaseError"
+      ],
+      "tests": [
+        "tests/log.test.mts"
+      ],
+      "version": "v0.30.0",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/142",
+      "boundary": "pino JSON lines with path-based redaction of a default secret-name list, bounded input, safe database errors and a request id. Fails open for unlisted names, secrets inside values and whole objects. Apps keep their level, which fields they log and where standard output goes."
+    },
     "presentation": {
       "package": "@ten98/ui",
       "entrypoints": [
