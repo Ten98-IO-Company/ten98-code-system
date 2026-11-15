@@ -163,6 +163,12 @@ export interface Ten98AuthOptions {
         domain?: string;
     }[];
     /**
+     * better-auth routes to serve beyond `ten98AuthRoutes`, by their path as better-auth declares it (`/update-user`,
+     * `/reset-password/:token`). Every other route of the instance, including one a future better-auth or plugin adds, is
+     * off: the handler answers 404 and its server call throws.
+     */
+    allowRoutes?: readonly string[];
+    /**
      * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
      * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
      * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
@@ -383,6 +389,13 @@ export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'wit
  * as keyed hashes; the cookie cache stays off and no secondary storage is used, so no token is kept anywhere else.
  */
 export declare function createTen98Auth(options: Ten98AuthOptions): Ten98Auth;
+/**
+ * The better-auth routes the instance an app holds serves by default: what the guide documents apps routing (session,
+ * sign-out, password reset and change, session listing and revocation, every two-factor route, which the app sends
+ * through verifyTwoFactor) and those the preset calls itself (`/sign-in/email`, behind signInWithPassword). Everything
+ * else is off unless the app names it in `allowRoutes`.
+ */
+export declare const ten98AuthRoutes: readonly string[];
 /** Factor actions are locked after too many refused proofs; `retryAfterSeconds` says for how long. */
 export declare class FactorActionsLockedError extends Error {
     readonly code: 'FACTOR_ACTIONS_LOCKED';

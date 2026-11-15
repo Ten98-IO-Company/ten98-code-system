@@ -387,6 +387,12 @@ export interface Ten98AuthOptions {
    */
   legacyCookieScopes?: readonly { path?: string; domain?: string }[];
   /**
+   * better-auth routes to serve beyond `ten98AuthRoutes`, by their path as better-auth declares it (`/update-user`,
+   * `/reset-password/:token`). Every other route of the instance, including one a future better-auth or plugin adds, is
+   * off: the handler answers 404 and its server call throws.
+   */
+  allowRoutes?: readonly string[];
+  /**
    * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
    * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
    * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
@@ -974,6 +980,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     return found !== null && await usable({ id: found.id, email: found.email, closedAt: found.closedAt ?? null }) !== true;
   };
 
+  const disabledPaths: string[] = [];
   const auth = betterAuth({
     database: protectTokens(database as AdapterFactory, keys) as unknown as BetterAuthOptions['database'], baseURL: origin, secret, appName, trustedOrigins: [origin],
     // better-auth skips these checks when NODE_ENV=test or TEST is set unless they are pinned.
@@ -997,7 +1004,8 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     // better-auth nor returned by it.
     user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false, defaultValue: () => null } } },
     // Identities are linked and unlinked only through linkOidcIdentity and unlinkOidcIdentity, under the user's lock.
-    disabledPaths: [...Object.keys(disabledRoutes)],
+    // Filled once the instance exists, with every route it has that is not allowed; better-auth reads it per request.
+    disabledPaths,
     databaseHooks,
     plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
     emailAndPassword: {
@@ -1068,12 +1076,30 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   const resetBody = (auth.api as unknown as { requestPasswordReset: { options: { body: { safeParse(input: unknown): { success: boolean } } } } }).requestPasswordReset.options.body;
   // disabledPaths turns a route off in the router only: its server call (auth.api.*) would still run. Each one throws
   // instead, naming what to use, on this instance and on every bound one.
-  for (const [name, endpoint] of Object.entries(auth.api as unknown as Record<string, { path?: unknown }>)) {
-    const path = typeof endpoint?.path === 'string' ? endpoint.path : undefined;
-    if (path === undefined || !Object.hasOwn(disabledRoutes, path)) continue;
-    const message = `auth.api.${name} (${path}) is off in the preset: ${disabledRoutes[path]}.`;
-    Object.assign(auth.api, { [name]() { throw new TypeError(message); } });
+  // The routes this instance serves: the documented ones and the app's additions. Every other route the instance has is
+  // off, in the router (better-auth's disabledPaths, and the handler's own check, which also covers parameterised paths)
+  // and as a server call, which throws naming what to use instead.
+  const endpoints = Object.entries(auth.api as unknown as Record<string, { path?: unknown }>)
+    .flatMap(([name, endpoint]) => typeof endpoint?.path === 'string' ? [[name, endpoint.path] as const] : []);
+  const allowed = new Set<string>([...ten98AuthRoutes, ...(options.allowRoutes ?? []).map(route => {
+    if (typeof route !== 'string' || !endpoints.some(([, path]) => path === route)) throw new TypeError(`allowRoutes: ${String(route)} is not a route of this instance.`);
+    if (Object.hasOwn(disabledRoutes, route)) throw new TypeError(`allowRoutes: ${route} stays off: ${disabledRoutes[route]}.`);
+    return route;
+  })]);
+  const servedRoutes = endpoints.map(([, path]) => path).filter(path => allowed.has(path)).map(routePattern);
+  disabledPaths.push(...new Set(endpoints.map(([, path]) => path).filter(path => !allowed.has(path))));
+  for (const [name, path] of endpoints) {
+    if (allowed.has(path)) continue;
+    const message = `auth.api.${name} (${path}) is off in the preset: ${disabledRoutes[path] ?? 'add it to allowRoutes to serve it'}.`;
+    // The stub keeps the route's path, so the instance's routes can still be listed.
+    Object.assign(auth.api, { [name]: Object.assign(() => { throw new TypeError(message); }, { path }) });
   }
+  /** Whether a request's path is one of the routes this instance serves (under better-auth's base path). */
+  const served = (pathname: string) => {
+    if (!pathname.toLowerCase().startsWith(`${basePath}/`)) return false;
+    const route = pathname.slice(basePath.length).replace(/\/+$/, '').toLowerCase();
+    return servedRoutes.some(pattern => pattern.test(route));
+  };
   /** The challenge a request's single, signed two_factor cookie names: a live '2fa-' challenge row of an existing account. */
   const readChallenge = async (instance: object, headers: HeadersInit | undefined) => {
     const cookie = singleCookie(headers, cookieName('two_factor'));
@@ -1090,6 +1116,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   {
     const route = auth.handler.bind(auth);
     const guarded = async (request: Request) => {
+      if (!served(new URL(request.url).pathname)) return refusal(404, 'NOT_FOUND', 'Not found.');
       const headers = withoutDuplicateSession(request.headers);
       return withExpired(await route(headers === request.headers ? request : new Request(request, { headers })), request.headers, new URL(request.url).pathname);
     };
@@ -1502,7 +1529,19 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
 let dummyModernHash: Promise<string> | undefined;
 const modernDummy = () => (dummyModernHash ??= hashPassword('ten98-timing-equaliser'));
 const lockedContext = new AsyncLocalStorage<true>();
-/** The better-auth routes the preset turns off, router and server call alike, and what to use instead. */
+/**
+ * The better-auth routes the instance an app holds serves by default: what the guide documents apps routing (session,
+ * sign-out, password reset and change, session listing and revocation, every two-factor route, which the app sends
+ * through verifyTwoFactor) and those the preset calls itself (`/sign-in/email`, behind signInWithPassword). Everything
+ * else is off unless the app names it in `allowRoutes`.
+ */
+export const ten98AuthRoutes: readonly string[] = Object.freeze(['/get-session', '/sign-out', '/sign-in/email', '/request-password-reset', '/reset-password',
+  '/reset-password/:token', '/change-password', '/verify-password', '/list-sessions', '/revoke-session', '/revoke-sessions', '/revoke-other-sessions', '/ok',
+  '/error', '/two-factor/enable', '/two-factor/disable', '/two-factor/get-totp-uri', '/two-factor/verify-totp', '/two-factor/verify-backup-code',
+  '/two-factor/generate-backup-codes', '/two-factor/send-otp', '/two-factor/verify-otp']);
+/** A route's path as a case-insensitive pattern; a :parameter is one path segment. */
+const routePattern = (path: string) => new RegExp(`^${path.toLowerCase().split('/').map(part => part.startsWith(':') ? '[^/]+' : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('/')}$`);
+/** The better-auth routes the preset always turns off, even if allowed, and what to use instead. */
 const disabledRoutes: Readonly<Record<string, string>> = Object.freeze({
   '/unlink-account': 'use unlinkOidcIdentity inside withLockedAuth',
   '/list-accounts': 'read the user\'s identities from the account table',

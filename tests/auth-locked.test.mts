@@ -9,7 +9,7 @@ import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { boolean, integer, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
 import pg from 'pg';
-import { AmbiguousAccountError, createTen98Auth, FactorActionsLockedError, ten98AuthPolicy, signInOidcUser, linkOidcIdentity, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError,
+import { AmbiguousAccountError, createTen98Auth, FactorActionsLockedError, ten98AuthPolicy, ten98AuthRoutes, signInOidcUser, linkOidcIdentity, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError,
   normaliseOidcIssuer, normaliseOidcIssuerSql, OidcIdentityError, oidcProviderId, revokeProviderSessions, SchemaMismatchError, tokenStorageUpgradeStatements, unlinkOidcIdentity, verifyCodeForAction } from '../auth.mjs';
 import type { PasswordAttempt, Ten98Auth, Ten98AuthOptions } from '../auth.mjs';
 import { session, transaction, TransactionRolledBackError, user } from '../db.mjs';
@@ -1829,7 +1829,10 @@ test('better-auth\'s own account routes are off: /unlink-account and /list-accou
 test('no request can bind, rebind or unbind a session: /update-session refuses oidcProvider', { skip }, async () => {
   const id = await account_(address('pinned'));
   const cookie = cookieOf(await providerSignIn(id, 'pinned'));
-  for (const value of [null, 'other', '']) assert.equal((await auth.handler(post('/update-session', cookie, { oidcProvider: value }))).status, 400, String(value));
+  // The route is off by default; served, it still refuses the field, which no request may set.
+  assert.equal((await auth.handler(post('/update-session', cookie, { oidcProvider: null }))).status, 404);
+  const widened = authOver(db, { allowRoutes: ['/update-session'] });
+  for (const value of [null, 'other', '']) assert.equal((await widened.handler(post('/update-session', cookie, { oidcProvider: value }))).status, 400, String(value));
   assert.equal((await auth.api.getSession({ headers: { cookie } }))!.session.oidcProvider, 'pinned');
 });
 
@@ -2846,4 +2849,50 @@ test('revoking a provider also removes the trusted devices its sign-ins set; a p
   assert.deepEqual([await trusted(viaProvider.id), await tied(), await trusted(viaPassword.id)], [1, 1, 1]);
   assert.equal(await revokeProviderSessions(db, 'p-trust'), 1);
   assert.deepEqual([await trusted(viaProvider.id), await tied(), await trusted(viaPassword.id)], [0, 0, 1]);
+});
+
+// ---- Routes off by default ----
+// better-auth 1.7.7's routes on this instance that the preset turns off: a better-auth upgrade that adds a route fails the
+// enumeration test below until the route is classified here or in ten98AuthRoutes.
+const routesOff = ['/sign-in/social', '/callback/:id', '/sign-up/email', '/verify-email', '/send-verification-email', '/change-email', '/update-session',
+  '/update-user', '/delete-user', '/delete-user/callback', '/link-social', '/list-accounts', '/unlink-account', '/refresh-token', '/get-access-token', '/account-info'];
+const routeRequest = (path: string, cookie = '') => new Request(`${ORIGIN}/api/auth${path.replace(/:[^/]+/g, 'x')}`, {
+  method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN, ...(cookie ? { cookie } : {}) }, body: '{}',
+});
+
+test('every route of the instance is either served or off: an off route answers 404 and its server call throws', { skip }, async () => {
+  const endpoints = Object.entries(auth.api as unknown as Record<string, { path?: unknown }>)
+    .flatMap(([name, endpoint]) => typeof endpoint?.path === 'string' ? [[name, endpoint.path] as const] : []);
+  const unclassified = endpoints.map(([, path]) => path).filter(path => !ten98AuthRoutes.includes(path) && !routesOff.includes(path));
+  assert.deepEqual(unclassified, [], 'a route neither served nor turned off');
+  const email = address('routes-off');
+  await account_(email);
+  const session = cookieOf(await signIn(email));
+  for (const [name, path] of endpoints.filter(([, path]) => routesOff.includes(path))) {
+    for (const method of ['GET', 'POST']) {
+      const response = await auth.handler(new Request(`${ORIGIN}/api/auth${path.replace(/:[^/]+/g, 'x')}`, { method, headers: { origin: ORIGIN, cookie: session, ...(method === 'POST' ? { 'content-type': 'application/json' } : {}) }, ...(method === 'POST' ? { body: '{}' } : {}) }));
+      assert.equal(response.status, 404, `${method} ${path}`);
+    }
+    assert.throws(() => (auth.api as unknown as Record<string, (input: unknown) => unknown>)[name]!({ body: {}, headers: { cookie: session } }), TypeError, name);
+  }
+  // In another case, or with a trailing slash, an off route is still off.
+  for (const path of ['/Update-User', '/update-user/', '/DELETE-USER']) assert.equal((await auth.handler(routeRequest(path, session))).status, 404, path);
+  // A served route still answers.
+  const current = await auth.handler(new Request(`${ORIGIN}/api/auth/get-session`, { headers: { cookie: session } }));
+  assert.equal(((await current.json()) as { user: { email: string } }).user.email, email);
+});
+
+test('an app adds a route with allowRoutes; one the instance does not have, or one that stays off, is refused', { skip }, async () => {
+  const widened = authOver(db, { allowRoutes: ['/update-user'] });
+  const email = address('routes-allowed');
+  const id = await account_(email);
+  const session = cookieOf(await widened.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
+  const updated = await widened.handler(new Request(`${ORIGIN}/api/auth/update-user`, {
+    method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN, cookie: session }, body: JSON.stringify({ name: 'Renamed' }),
+  }));
+  assert.equal(updated.status, 200);
+  assert.equal((await pool!.query<{ name: string }>('SELECT name FROM "user" WHERE id=$1', [id])).rows[0]!.name, 'Renamed');
+  assert.equal((await auth.handler(routeRequest('/update-user', session))).status, 404);
+  assert.throws(() => authOver(db, { allowRoutes: ['/no-such-route'] }), /not a route of this instance/);
+  assert.throws(() => authOver(db, { allowRoutes: ['/unlink-account'] }), /stays off/);
 });
