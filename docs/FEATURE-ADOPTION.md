@@ -46,6 +46,10 @@ Application queries are typed Drizzle queries. The architecture check counts raw
 
 Apps whose profile has a `presentation` policy keep a committed `presentation-baseline.json`. The architecture check parses each file under the policy's roots and refuses any file whose count rises for a rule: `element` (host tags), `styling` (`className` and `style`), `inner-html`, `create-element` and `stylesheet`. `node node_modules/@ten98/runtime/check.mjs --update-presentation-baseline .` lowers the baseline as screens move onto `@ten98/ui`, and refuses to record a rise. Known limit: `element` counts lowercase host tags, namespaced tags and member tags whose root is not a `@ten98/ui` import. It never counts a capitalised component, whether it comes from `@ten98/ui` or from the app, so it measures host tags and styling, not whether a component comes from the design system. Raw HTML moved into an app-local component is still counted in that component's own file.
 
+## Browser test library
+
+From runtime 0.27.1 the `ten98-discover` profile requires `"playwright": "1.64.1"` in `devDependencies`, the version its CI image `mcr.microsoft.com/playwright:v1.64.1-noble` runs. The entry is required, not just allowed: declare it, with its lockfile entry, in the same change that moves discover to 0.27.1, or the architecture check fails. A different version, a range, or `@playwright/test` in its place is refused.
+
 ## Isolated browser audit
 
 Runtime 0.23.0 adds the server-only `@ten98/runtime/browser-audit` entry with `createBrowserAuditControl`, `BrowserControlOptions`, `NativeBrowserResource`, `ObserverTransport`, `BrowserRequestDenial`, `BrowserControlTrace`, `createPublicEgressProxy` and `PublicEgressOptions`. The facade has no capsule startup or third-party dependencies. Use the existing `normalizeLighthouseReport` for supplied reports. Never import these Node mechanisms from browser UI.
