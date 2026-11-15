@@ -1,5 +1,5 @@
 import { type NodePgDatabase } from 'drizzle-orm/node-postgres';
-import { type PgDatabase, type PgQueryResultHKT, type PgTransaction, type PgTransactionConfig } from 'drizzle-orm/pg-core';
+import { PgTransaction, type PgDatabase, type PgQueryResultHKT, type PgTransactionConfig } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 /**
  * PostgreSQL int8 (BIGINT, money in minor units) reads as `bigint`, never as a lossy number or a string. DATE is a
@@ -40,10 +40,16 @@ export type ScopedTransaction<TDatabase extends AnyDatabase> = TDatabase extends
 /**
  * `db.transaction` without drizzle-orm 0.45.2's connection leak. Its node-postgres transaction sends BEGIN before its
  * `try`, so a failed BEGIN never releases the pooled connection, and a failed ROLLBACK replaces the error that caused
- * it. Over a pool this checks the connection out itself, as Books' tenancy did: it always releases it, discards it when
- * BEGIN, COMMIT or ROLLBACK failed (its state is then unknown), and rethrows the callback's own error. Given a
- * transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. `config` is
- * Drizzle's, such as `{ accessMode: 'read only' }`; a savepoint ignores it.
+ * it. Over a pool this checks the connection out and runs BEGIN, COMMIT and ROLLBACK itself. It always releases the
+ * connection, and discards it when BEGIN, COMMIT or ROLLBACK failed or the server ended it (its state is then
+ * unknown; a COMMIT refused for a constraint or serialisation failure also discards a usable connection, which costs
+ * only a reconnect). It throws the callback's own error, or a failed COMMIT's. While the connection is checked out it has an
+ * `error` listener, so a backend the server terminates fails the transaction instead of crashing the process.
+ *
+ * Given a transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. Any other
+ * database is refused with a TypeError rather than silently taking the leaking path: a second copy of drizzle-orm or
+ * pg, or a driver other than node-postgres. `config` is Drizzle's, such as `{ accessMode: 'read only' }`; a
+ * savepoint ignores it.
  */
 export declare function transaction<TDatabase extends AnyDatabase, T>(db: TDatabase, run: (tx: ScopedTransaction<TDatabase>) => Promise<T>, config?: PgTransactionConfig): Promise<T>;
 export declare const user: import("drizzle-orm/pg-core").PgTableWithColumns<{

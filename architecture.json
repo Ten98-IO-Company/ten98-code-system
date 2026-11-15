@@ -11,7 +11,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.27.0.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.27.1.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -292,7 +292,8 @@
         "ua-parser-js": "1.0.41"
       },
       "devDependencies": {
-        "@types/ua-parser-js": "0.7.39"
+        "@types/ua-parser-js": "0.7.39",
+        "playwright": "1.64.1"
       },
       "sourceLanguage": {
         "default": "typescript",
@@ -718,7 +719,9 @@
           "db.mjs": "Generated PostgreSQL pool and Drizzle entry from src/db.mts, exported as ./db only; needs the optional drizzle-orm and pg peers.",
           "db.d.mts": "Generated declarations from src/db.mts.",
           "tenancy.mjs": "Generated row-level security tenancy entry from src/tenancy.mts, exported as ./tenancy only; needs the optional drizzle-orm and pg peers.",
-          "tenancy.d.mts": "Generated declarations from src/tenancy.mts."
+          "tenancy.d.mts": "Generated declarations from src/tenancy.mts.",
+          "tenancy-testing.mjs": "Generated test-only scope setter from src/tenancy-testing.mts, exported as ./tenancy/testing only, never from ./tenancy or the root.",
+          "tenancy-testing.d.mts": "Generated declarations from src/tenancy-testing.mts."
         },
         "compilerProjects": [
           "tsconfig.json",

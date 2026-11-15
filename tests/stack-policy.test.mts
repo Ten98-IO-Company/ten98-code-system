@@ -13,13 +13,13 @@ type AppManifest = PackageManifest & { dependencies: StringMap; devDependencies:
 // Independent fixtures: expected values are written here, not read from architecture.json.
 const books = (): AppManifest => ({
   name: 'ten98-books', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.0.tgz', '@ten98/ui': 'file:vendor/ten98-ui-0.36.5.tgz', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', zod: '4.6.6' },
+  dependencies: { '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', '@ten98/ui': 'file:vendor/ten98-ui-0.36.5.tgz', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', zod: '4.6.6' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', '@vitejs/plugin-react': '6.1.1', nitro: '3.0.260903-beta', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'pnpm check:architecture && node --test', build: 'pnpm check:architecture && vite build' },
 });
 const campaign = (): AppManifest => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.0.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
@@ -135,7 +135,8 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
 
     // Typed Drizzle, a prepared statement, a builder's `.execute()` and names that only start like `query` are not raw.
     writeFileSync(source, ["import { db } from './db.ts';", 'export const rows = await db.select().from(ledger).where(eq(ledger.companyId, id));',
-      'await db.select().from(ledger).execute();', 'await prepared.execute({ id });', 'await db.execute(sqlFromBuilder);', 'client.queryKey(id);', ''].join('\n'));
+      'await db.select().from(ledger).execute();', 'await prepared.execute({ id });', 'await db.execute(sqlFromBuilder);', 'await db.execute((statement));',
+      'await db.execute(join(parts));', 'client.queryKey(id);', ''].join('\n'));
     assert.equal(run().status, 0, run().stderr);
     for (const statement of ["await pool.query('SELECT 1')", 'await client.query<{ id: string }>(`SELECT id FROM t`)', 'await db.execute(sql`SELECT 1`)', "sql.raw('now()')",
       'await db.execute<{ id: string }>(sql`SELECT 1`)', 'await db.execute(sql<number>`SELECT 1`)', "await tx.execute<{ pid: number }>('SELECT pg_backend_pid()')",
@@ -143,12 +144,34 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
       // Object types with several fields carry `;`, which the first pattern stopped at (issue found at b5c9d57).
       "await pool.query<{ id: string; name: string }>('SELECT id, name FROM t', [])", 'await db.execute<{ a: number; b: number }>(sql`SELECT 1 AS a, 2 AS b`)',
       'await client.query<{\n  rolsuper: boolean;\n  owned: string[];\n}>(\n  `SELECT 1`, [])', 'await db.execute(sql<{ a: number; b: string }>`SELECT 1`)',
-      "const run = pool.query.bind(pool); await run('SELECT 1')", "import { sql as q } from 'drizzle-orm';\nawait db.execute(q`SELECT 1`)", "import { eq, sql as q } from 'drizzle-orm';\nq.raw('now()')"]) {
+      "const run = pool.query.bind(pool); await run('SELECT 1')", "import { sql as q } from 'drizzle-orm';\nawait db.execute(q`SELECT 1`)", "import { eq, sql as q } from 'drizzle-orm';\nq.raw('now()')",
+      // Forms the check of c2a9a90 found uncounted (#115).
+      "await pool.query?.('SELECT 1')", "await pool.query!('SELECT 1')", "await pool.query?.call(pool, 'SELECT 1')", 'await db.execute(sql.join([sql`SELECT 1`]))',
+      'await db.execute((sql`SELECT 1`))', 'await db.execute(/* report */ sql`SELECT 1`)', 'await db.execute(\n  // report\n  sql`SELECT 1`)',
+      "import * as d from 'drizzle-orm';\nawait db.execute(d.sql`SELECT 1`)", "import * as d from 'drizzle-orm';\nd.sql.raw('now()')",
+      // And those the check of 78f80fa found.
+      "await pool.query?.<{ id: string }>('SELECT 1')", "await pool.query!<{ id: string }>('SELECT 1')", "await pool.query /* report */ ('SELECT 1')",
+      "await pool.query // report\n  ('SELECT 1')", "import d, * as ns from 'drizzle-orm';\nawait db.execute(ns.sql`SELECT 1`)",
+      // And the check of 08bb83e: a comment before the type argument.
+      "await pool.query/* report */<{ id: string }>('SELECT 1')"]) {
       writeFileSync(source, `${statement};\n`);
       const refused = run();
       assert.equal(refused.status, 1, statement);
       assert.match(refused.stderr, /src\/server\/report\.ts: raw statement count 1 exceeds the allowlist \(0 in raw-statements\.json\)/, statement);
     }
+    // Production code never imports the test-only scope setter, in any import form; a test outside the data roots may.
+    const testing = '@ten98/runtime/tenancy/testing';
+    for (const statement of [`import { setScopeForTesting } from '${testing}'`, `import * as scope from "${testing}"`, `import '${testing}'`,
+      `const scope = await import('${testing}')`, `const scope = require('${testing}')`]) {
+      writeFileSync(source, `${statement};\n`);
+      const refused = run();
+      assert.equal(refused.status, 1, statement);
+      assert.match(refused.stderr, /src\/server\/report\.ts: imports the test-only @ten98\/runtime\/tenancy\/testing/, statement);
+    }
+    writeFileSync(source, "import { createTenancy } from '@ten98/runtime/tenancy';\n");
+    mkdirSync(join(app, 'tests'), { recursive: true });
+    writeFileSync(join(app, 'tests/guards.test.ts'), `import { setScopeForTesting } from '${testing}';\n`);
+    assert.equal(run().status, 0, run().stderr);
     const allowlist = join(app, 'raw-statements.json'), recorded = () => JSON.parse(readFileSync(allowlist, 'utf8'));
     // Each entry needs a count and a reason; a bare count or an empty reason is refused.
     for (const [entry, expected] of [

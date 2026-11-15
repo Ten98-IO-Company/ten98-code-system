@@ -22,7 +22,20 @@ export class DatabaseRoleError extends Error {
         this.name = 'DatabaseRoleError';
     }
 }
+/**
+ * A scoped call nested in a READ ONLY transaction named a membership that this transaction does not hold share-locked,
+ * so a removal could commit while its callback still read the workspace. Thrown instead of reading it unlocked.
+ */
+export class UnlockedScopeError extends Error {
+    code = 'TENANCY_SCOPE_UNLOCKED';
+    constructor() {
+        super('A scoped call nested in a READ ONLY transaction may admit only memberships the transaction\'s own helper call share-locked. Open the outer call for the same user over those workspaces (withWorkspaces), or make it a write call.');
+        this.name = 'UnlockedScopeError';
+    }
+}
 const writers = ['owner', 'admin', 'editor'];
+const held = new WeakMap();
+const pair = (userId, workspaceId) => `${userId}\u0000${workspaceId}`;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Lowercase names only: they go into SQL text unquoted, and PostgreSQL's stored policy then matches them verbatim.
 const identifier = /^[a-z_][a-z0-9_]*$/;
@@ -42,29 +55,31 @@ export function createTenancy({ setting, column, tables }) {
     const storedScope = `${column}=ANYstring_to_arraycurrent_setting'${setting}',true,','`;
     // Parameterised `sql` statements by necessity: Drizzle has no builder for set_config or current_setting.
     const setScope = (tx, value) => tx.execute(sql `SELECT set_config(${setting}, ${value}, true)`);
-    const readScope = async (tx) => (await tx.execute(sql `SELECT current_setting(${setting}, true) AS scope`)).rows[0]?.scope ?? '';
+    // What a nested call must respect: the caller's scope, to put back, and whether its transaction is READ ONLY.
+    const readCaller = async (tx) => {
+        const { rows } = (await tx.execute(sql `SELECT current_setting(${setting}, true) AS scope, current_setting('transaction_read_only') AS read_only`));
+        return { scope: rows[0]?.scope ?? '', readOnly: rows[0]?.read_only === 'on' };
+    };
     /**
      * Runs `run` with row-level security admitting `workspaceIds`. In a transaction of its own the scope lasts to its end.
-     * `nested` (a caller's transaction or a savepoint, which may already hold a scope) puts the caller's scope back when
-     * `run` settles, so the caller never goes on in the inner workspace. After an error the transaction may be aborted
-     * and refuse the restore; the caller's ROLLBACK, or the savepoint's, then undoes the inner scope instead.
+     * A nested call (`caller`: a caller's transaction or a savepoint, which may already hold a scope) puts the caller's
+     * scope back when `run` settles, so the caller never goes on in the inner workspace. After an error the transaction
+     * may be aborted and refuse the restore; the caller's ROLLBACK, or the savepoint's, then undoes the inner scope.
+     * Nested calls on one transaction must be awaited in turn: run at once, their scopes and restores interleave.
      */
-    async function inScope(tx, workspaceIds, nested, run) {
-        if (!nested) {
-            await setScope(tx, workspaceIds.join(','));
-            return run();
-        }
-        const previous = await readScope(tx);
+    async function inScope(tx, workspaceIds, caller, run) {
         await setScope(tx, workspaceIds.join(','));
+        if (!caller)
+            return run();
         let result;
         try {
             result = await run();
         }
         catch (error) {
-            await setScope(tx, previous).catch(() => undefined);
+            await setScope(tx, caller.scope).catch(() => undefined);
             throw error;
         }
-        await setScope(tx, previous);
+        await setScope(tx, caller.scope);
         return result;
     }
     /**
@@ -72,16 +87,53 @@ export function createTenancy({ setting, column, tables }) {
      * until commit (the team controller's caller-membership convention), so a removal or demotion waits for an in-flight
      * workspace transaction and cannot commit between this check and its writes. The workspace row is not locked: team
      * changes lock it first, and tenant transactions must not queue behind them or hold them up.
+     *
+     * A READ ONLY transaction refuses the lock, so there the check fails closed: it admits only this user's memberships
+     * that the transaction's own top-level helper call share-locked (`held`), which a removal must still wait for. Any
+     * other membership, another user's, or any in a READ ONLY transaction the caller opened itself, throws
+     * UnlockedScopeError rather than being read unlocked, where a removal could commit while the callback still reads.
      */
-    async function memberships(tx, userId, workspaceIds) {
+    async function memberships(tx, userId, workspaceIds, caller, record, locked) {
         const ids = workspaceIds.filter(id => typeof id === 'string' && uuid.test(id)).map(id => id.toLowerCase());
         if (!ids.length || typeof userId !== 'string')
             return [];
-        return tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role })
+        const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role, started: sql `transaction_timestamp()::text` })
             .from(membership).innerJoin(workspace, eq(workspace.id, membership.workspaceId))
             .where(and(eq(membership.userId, userId), inArray(membership.workspaceId, ids)))
-            .orderBy(workspace.createdAt, workspace.id)
-            .for('share', { of: membership });
+            .orderBy(workspace.createdAt, workspace.id);
+        const rows = caller?.readOnly ? await query : await query.for('share', { of: membership });
+        if (!caller?.readOnly) {
+            if (record) {
+                record.started = rows[0]?.started;
+                for (const item of rows)
+                    record.pairs.add(pair(userId, item.workspaceId));
+            }
+        }
+        else if (rows.length && (!locked?.open || rows[0].started !== locked.started || rows.some(item => !locked.pairs.has(pair(userId, item.workspaceId))))) {
+            throw new UnlockedScopeError();
+        }
+        return rows.map(({ workspaceId, name, role }) => ({ workspaceId, name, role }));
+    }
+    /**
+     * Runs `body` in the transaction a helper call uses. A transaction of its own starts a fresh record of the
+     * memberships its top-level check locks (`record`). A nested call (the caller's `outer`, or a savepoint when `db` is a
+     * transaction) gets the caller's state and only reads the record; a savepoint a helper opens shares it.
+     */
+    async function scopedTransaction(db, outer, body) {
+        if (outer)
+            return body(outer, await readCaller(outer), undefined, held.get(outer));
+        if (!(db instanceof PgTransaction)) {
+            const record = { pairs: new Set(), started: undefined, open: true };
+            try {
+                return await transaction(db, tx => { held.set(tx, record); return body(tx, undefined, record, record); });
+            }
+            finally {
+                record.open = false;
+            }
+        }
+        const locked = held.get(db);
+        return transaction(db, async (tx) => { if (locked)
+            held.set(tx, locked); return body(tx, await readCaller(tx), undefined, locked); });
     }
     return {
         setting, column, tables,
@@ -101,19 +153,18 @@ export function createTenancy({ setting, column, tables }) {
          * one transaction whose row-level security admits that workspace only. `read` makes that transaction READ ONLY once
          * the membership is checked (its share lock cannot be taken in a read-only transaction). `outer` joins a transaction
          * the caller already holds (workspace creation inserts the workspace first), and `db` may itself be a transaction (a
-         * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards.
+         * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards. Nested in
+         * a READ ONLY transaction it admits only this user's memberships that the transaction's top-level helper call locked.
          */
         async withWorkspace(db, userId, workspaceId, mode, run, outer) {
-            const nested = outer !== undefined || db instanceof PgTransaction;
-            const scoped = async (tx) => {
-                const [access] = await memberships(tx, userId, [workspaceId]);
+            return scopedTransaction(db, outer, async (tx, caller, record, locked) => {
+                const [access] = await memberships(tx, userId, [workspaceId], caller, record, locked);
                 if (!access || (mode !== 'read' && !writers.includes(access.role)))
                     throw new WorkspaceAccessError();
-                if (mode === 'read' && !nested)
+                if (mode === 'read' && !caller)
                     await tx.setTransaction({ accessMode: 'read only' });
-                return inScope(tx, [access.workspaceId], nested, () => run(tx, access));
-            };
-            return outer ? scoped(outer) : transaction(db, scoped);
+                return inScope(tx, [access.workspaceId], caller, () => run(tx, access));
+            });
         },
         /**
          * For reads: runs `run` in one READ ONLY transaction scoped to those of `workspaceIds` the user is a member of. Ids
@@ -121,12 +172,11 @@ export function createTenancy({ setting, column, tables }) {
          * a savepoint, as `withWorkspace` does, and restores the caller's scope.
          */
         withWorkspaces(db, userId, workspaceIds, run) {
-            const nested = db instanceof PgTransaction;
-            return transaction(db, async (tx) => {
-                const access = await memberships(tx, userId, workspaceIds);
-                if (!nested)
+            return scopedTransaction(db, undefined, async (tx, caller, record, locked) => {
+                const access = await memberships(tx, userId, workspaceIds, caller, record, locked);
+                if (!caller)
                     await tx.setTransaction({ accessMode: 'read only' });
-                return inScope(tx, access.map(item => item.workspaceId), nested, () => run(tx, access));
+                return inScope(tx, access.map(item => item.workspaceId), caller, () => run(tx, access));
             });
         },
         /**
