@@ -20,6 +20,9 @@ importers:
       drizzle-orm:
         specifier: 0.45.2
         version: 0.45.2(@types/pg@8.15.6)(kysely@0.29.7)(pg@8.23.0)
+      nodemailer:
+        specifier: 10.1.4
+        version: 10.1.4
       pg:
         specifier: 8.23.0
         version: 8.23.0
@@ -425,6 +428,10 @@ packages:
     resolution: {integrity: sha512-FixtE239Gl6Gz0ZGCK0WzvNwObNCIwVT+L7zQcf1QgcA6AzBxblzqe9OT88qiucNkhsjSOqiogSaF5jVbJiqSA==}
     engines: {node: ^20.0.0 || >=22.0.0}
 
+  nodemailer@10.1.4:
+    resolution: {integrity: sha512-EsMnOR2oRv4LGnWvHgcVYkkQ4O2j8KO4WTw6l+PHR4sOXo8SAgIraxtEnGDmotjbhv0hDsu3IuDIFZm8iXwO4A==}
+    engines: {node: '>=20.0.0'}
+
   pg-cloudflare@1.4.1:
     resolution: {integrity: sha512-6PQbsFWZcp9EmJEwy5cGQ2La+AMWpP46lgbb8X+U/XsHIUweYDNCpeuKck5RxL2MdVFi7krbbEi5nX4Zh7JhrQ==}
 
@@ -687,6 +694,8 @@ snapshots:
   kysely@0.29.7: {}
 
   nanostores@1.5.5: {}
+
+  nodemailer@10.1.4: {}
 
   pg-cloudflare@1.4.1:
     optional: true
