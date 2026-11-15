@@ -13,13 +13,13 @@ type AppManifest = PackageManifest & { dependencies: StringMap; devDependencies:
 // Independent fixtures: expected values are written here, not read from architecture.json.
 const books = (): AppManifest => ({
   name: 'ten98-books', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.0.tgz', '@ten98/ui': 'file:vendor/ten98-ui-0.36.5.tgz', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', zod: '4.6.6' },
+  dependencies: { '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', '@ten98/ui': 'file:vendor/ten98-ui-0.36.5.tgz', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', zod: '4.6.6' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', '@vitejs/plugin-react': '6.1.1', nitro: '3.0.260903-beta', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'pnpm check:architecture && node --test', build: 'pnpm check:architecture && vite build' },
 });
 const campaign = (): AppManifest => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.0.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
