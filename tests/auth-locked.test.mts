@@ -9,9 +9,9 @@ import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { boolean, integer, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
 import pg from 'pg';
-import { createTen98Auth, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, tokenStorageUpgradeStatements } from '../auth.mjs';
-import type { Ten98Auth, Ten98AuthOptions } from '../auth.mjs';
-import { transaction, user } from '../db.mjs';
+import { AmbiguousAccountError, createTen98Auth, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError, tokenStorageUpgradeStatements } from '../auth.mjs';
+import type { PasswordAttempt, Ten98Auth, Ten98AuthOptions } from '../auth.mjs';
+import { transaction, TransactionRolledBackError, user } from '../db.mjs';
 import { createWorkspaceTeam } from '../index.mjs';
 import type { TeamClient } from '../index.mjs';
 import { createTenancy } from '../tenancy.mjs';
@@ -113,9 +113,9 @@ async function account_(email: string, { twoFactor: enabled = false, hash = hash
   return id;
 }
 const address = (label: string) => `${label}-${randomUUID()}@example.com`;
-const signIn = (email: string, password = PASSWORD) => auth.handler(new Request(`${ORIGIN}/api/auth/sign-in/email`, {
-  method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ email, password }),
-}));
+// The supported password sign-in, from one fixed source; the limiter allows everything.
+const SOURCE = 'ip:test-client';
+const signIn = (email: string, password = PASSWORD) => auth.signInWithPassword(db, { source: SOURCE, email, password }, allow);
 const cookieOf = (response: Response) => response.headers.getSetCookie().map(value => value.split(';')[0]!).filter(pair => !pair.endsWith('=')).join('; ');
 const rawToken = (cookie: string) => {
   const pair = cookie.split('; ').find(item => item.split('=')[0]!.endsWith('.session_token'))!;
@@ -202,13 +202,13 @@ test('an old password checked before a CLI reset committed gets 401 under the lo
   });
   await entered.opened;
   // The first check reads the committed (old) hash and passes; the second, under the lock, sees the new one.
-  const oldPassword = auth.signInWithPassword(db, { email, password: PASSWORD }, allow);
+  const oldPassword = auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow);
   assert.equal(await someoneWaits(), true);
   held.open();
   await reset;
-  assert.deepEqual(await answer(await oldPassword), await answer(await auth.signInWithPassword(db, { email: address('unknown'), password: PASSWORD }, allow)));
+  assert.deepEqual(await answer(await oldPassword), await answer(await auth.signInWithPassword(db, { source: SOURCE, email: address('unknown'), password: PASSWORD }, allow)));
   assert.equal(await sessions(id), 0);
-  const signedIn = await auth.signInWithPassword(db, { email, password: NEW_PASSWORD }, allow);
+  const signedIn = await auth.signInWithPassword(db, { source: SOURCE, email, password: NEW_PASSWORD }, allow);
   assert.equal(signedIn.status, 200);
   assert.ok(await auth.api.getSession({ headers: { cookie: cookieOf(signedIn) } }));
 });
@@ -334,7 +334,7 @@ test('withLockedAuth refuses a missing user, a transaction, a missing binding, n
     // A second locked-auth transaction would wait on this one's locks: refused at once, for any user and by email.
     assert.equal(await within(auth.withLockedAuth(db, id, async () => 1).then(() => 'ran', error => refused(error) ? 'refused' : String(error)), 3000), 'refused');
     assert.equal(await within(auth.withLockedAuthByEmail(db, email, async () => 1).then(() => 'ran', error => refused(error) ? 'refused' : String(error)), 3000), 'refused');
-    assert.equal(await within(auth.signInWithPassword(db, { email, password: PASSWORD }, allow).then(() => 'ran', error => refused(error) ? 'refused' : String(error)), 3000), 'refused');
+    assert.equal(await within(auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow).then(() => 'ran', error => refused(error) ? 'refused' : String(error)), 3000), 'refused');
     // Password sign-in here would hash while holding the connection and the lock.
     assert.throws(() => bound.api.signInEmail({ body: { email, password: PASSWORD }, asResponse: true }), /signInWithPassword/);
     for (const path of ['/api/auth/sign-in/email', '/api/auth/sign-in/email/', '/api/auth/Sign-In/Email']) {
@@ -450,7 +450,7 @@ test('first-user setup (installation row, then the email lock) makes a locked-au
   release.open();
   await setup;
   assert.equal(await found, userId);
-  assert.equal((await auth.signInWithPassword(db, { email, password: PASSWORD }, allow)).status, 200);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).status, 200);
 });
 
 test('signInWithPassword: limit first, one uniform failure, and a session only for the right password', { skip }, async () => {
@@ -461,34 +461,34 @@ test('signInWithPassword: limit first, one uniform failure, and a session only f
   // The limit runs before the credential read (and so before any hash); refused, nothing is read.
   const order: string[] = [];
   const watched = new Proxy(db, { get(target, key, receiver) { if (key === 'select') order.push('read'); return Reflect.get(target, key, receiver); } });
-  const limited = await auth.signInWithPassword(watched, { email, password: PASSWORD }, attempt => { order.push(`limit:${attempt.email}`); return false; });
+  const limited = await auth.signInWithPassword(watched, { source: SOURCE, email, password: PASSWORD }, attempt => { order.push(`limit:${attempt.email}`); return false; });
   assert.deepEqual([limited.status, order], [429, [`limit:${email}`]]);
-  assert.equal((await auth.signInWithPassword(watched, { email: ` ${email.toUpperCase()} `, password: 'wrong password guess' }, attempt => { order.push(`limit:${attempt.email}`); return true; })).status, 401);
+  assert.equal((await auth.signInWithPassword(watched, { source: SOURCE, email: ` ${email.toUpperCase()} `, password: 'wrong password guess' }, attempt => { order.push(`limit:${attempt.email}`); return true; })).status, 401);
   assert.deepEqual(order.slice(1), [`limit:${email}`, 'read']);
   // Anything but true refuses: a limiter that forgets to return is not an allowance.
-  assert.equal((await auth.signInWithPassword(db, { email, password: PASSWORD }, (() => undefined) as unknown as () => boolean)).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, (() => undefined) as unknown as () => boolean)).status, 429);
   // Unknown email, wrong password and an account without a password answer identically.
-  const unknown = await answer(await auth.signInWithPassword(db, { email: address('nobody'), password: PASSWORD }, allow));
+  const unknown = await answer(await auth.signInWithPassword(db, { source: SOURCE, email: address('nobody'), password: PASSWORD }, allow));
   assert.equal(unknown.status, 401);
-  assert.deepEqual(await answer(await auth.signInWithPassword(db, { email, password: 'wrong password guess' }, allow)), unknown);
-  assert.deepEqual(await answer(await auth.signInWithPassword(db, { email: passwordless, password: PASSWORD }, allow)), unknown);
+  assert.deepEqual(await answer(await auth.signInWithPassword(db, { source: SOURCE, email, password: 'wrong password guess' }, allow)), unknown);
+  assert.deepEqual(await answer(await auth.signInWithPassword(db, { source: SOURCE, email: passwordless, password: PASSWORD }, allow)), unknown);
   assert.equal(await sessions(id), 0);
-  const signedIn = await auth.signInWithPassword(db, { email, password: PASSWORD, headers: { 'user-agent': 'fixture-agent' } }, allow);
+  const signedIn = await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { 'user-agent': 'fixture-agent' } }, allow);
   assert.equal(signedIn.status, 200);
   assert.equal((await auth.api.getSession({ headers: { cookie: cookieOf(signedIn) } }))?.user.id, id);
   assert.equal((await pool!.query<{ agent: string }>('SELECT "userAgent" AS agent FROM session WHERE "userId"=$1', [id])).rows[0]!.agent, 'fixture-agent');
-  assert.equal((await auth.signInWithPassword(db, { email, password: 1 as unknown as string }, allow)).status, 400);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: 1 as unknown as string }, allow)).status, 400);
   // A cross-site browser request is refused before the limit counts it; the app's own origin goes ahead.
   let counted = 0;
   const counting = () => { counted++; return true; };
-  for (const headers of [{ origin: 'https://evil.example' }, { 'sec-fetch-site': 'cross-site' }, { origin: ORIGIN, 'sec-fetch-site': 'same-site' }] as Record<string, string>[]) {
-    assert.equal((await auth.signInWithPassword(db, { email, password: PASSWORD, headers }, counting)).status, 403, JSON.stringify(headers));
+  for (const headers of [{ origin: 'https://evil.example' }, { 'sec-fetch-site': 'cross-site' }, { 'sec-fetch-site': 'CROSS-SITE' }, { origin: ORIGIN, 'sec-fetch-site': 'Same-Site' }] as Record<string, string>[]) {
+    assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers }, counting)).status, 403, JSON.stringify(headers));
   }
   assert.equal(counted, 0);
-  assert.equal((await auth.signInWithPassword(db, { email, password: PASSWORD, headers: { origin: ORIGIN, 'sec-fetch-site': 'same-origin' } }, counting)).status, 200);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { origin: ORIGIN, 'sec-fetch-site': 'same-origin' } }, counting)).status, 200);
   // A password over the policy's maximum is wrong for every account: the same 401, without a derivation.
   const started = performance.now();
-  assert.deepEqual(await answer(await auth.signInWithPassword(db, { email, password: 'x'.repeat(129) }, allow)), unknown);
+  assert.deepEqual(await answer(await auth.signInWithPassword(db, { source: SOURCE, email, password: 'x'.repeat(129) }, allow)), unknown);
   assert.ok(performance.now() - started < 100);
 });
 
@@ -503,7 +503,7 @@ test('signInWithPassword costs the same for unknown, current, legacy and passwor
     const times: number[] = [], work: number[] = [];
     for (let attempt = 0; attempt < 7; attempt++) {
       const started = performance.now(), cpu = process.cpuUsage();
-      assert.equal((await auth.signInWithPassword(db, { email, password: 'wrong password guess' }, allow)).status, 401);
+      assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: 'wrong password guess' }, allow)).status, 401);
       const used = process.cpuUsage(cpu);
       times.push(performance.now() - started);
       work.push((used.user + used.system) / 1000);
@@ -521,12 +521,12 @@ test('signInWithPassword costs the same for unknown, current, legacy and passwor
 test('signInWithPassword answers 503 when the verification bound is reached, never waiting past it', { skip }, async () => {
   const email = address('bound');
   await account_(email);
-  const guess = (target: Ten98Auth) => target.signInWithPassword(db, { email, password: 'wrong password guess' }, allow).then(response => response.status);
+  const guess = (target: Ten98Auth) => target.signInWithPassword(db, { source: SOURCE, email, password: 'wrong password guess' }, allow).then(response => response.status);
   const single = authOver(db, { passwordVerification: { concurrency: 1, queue: 0 } });
   assert.deepEqual((await Promise.all([guess(single), guess(single)])).sort(), [401, 503]);
   const brief = authOver(db, { passwordVerification: { concurrency: 1, queue: 1, waitMs: 1 } });
   assert.deepEqual((await Promise.all([guess(brief), guess(brief), guess(brief)])).sort(), [401, 503, 503]);
-  const busy = await single.signInWithPassword(db, { email, password: 'x' }, allow);
+  const busy = await single.signInWithPassword(db, { source: SOURCE, email, password: 'x' }, allow);
   assert.equal(busy.status, 401);
 });
 
@@ -534,7 +534,7 @@ test('signInWithPassword replaces a legacy hash once, under the lock, however ma
   const email = address('legacy');
   const id = await account_(email, { hash: hashes.legacy });
   const legacyAuth = authOver(db, { legacyPasswords: true });
-  const outcomes = await Promise.all(Array.from({ length: 3 }, () => legacyAuth.signInWithPassword(db, { email, password: PASSWORD }, allow).then(response => response.status)));
+  const outcomes = await Promise.all(Array.from({ length: 3 }, () => legacyAuth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow).then(response => response.status)));
   assert.deepEqual(outcomes, [200, 200, 200]);
   assert.equal((await pool!.query('SELECT 1 FROM password_writes WHERE user_id=$1', [id])).rowCount, 1);
   assert.equal((await storedPassword(id)).startsWith('scrypt$'), false);
@@ -542,7 +542,7 @@ test('signInWithPassword replaces a legacy hash once, under the lock, however ma
   // Without the option a legacy hash never verifies, on either check.
   const strictEmail = address('strict');
   await account_(strictEmail, { hash: hashes.legacy });
-  assert.equal((await auth.signInWithPassword(db, { email: strictEmail, password: PASSWORD }, allow)).status, 401);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: strictEmail, password: PASSWORD }, allow)).status, 401);
 });
 
 test('60 parallel wrong passwords at one account on a pool of 10: 50 × 401, 10 × 429, no connect timeout, the pool stays usable', { skip }, async () => {
@@ -555,7 +555,7 @@ test('60 parallel wrong passwords at one account on a pool of 10: 50 × 401, 10 
     // Campaign's limiter shape: one conditional upsert per attempt, 50 per account.
     const limit = async ({ email: account }: { email: string }) => (await flood.query(
       'INSERT INTO login_limits VALUES ($1, 1) ON CONFLICT (key) DO UPDATE SET count = login_limits.count + 1 WHERE login_limits.count < 50', [`email:${account}`])).rowCount === 1;
-    const attempts = Array.from({ length: 60 }, () => floodAuth.signInWithPassword(floodDb, { email, password: 'wrong password guess' }, limit)
+    const attempts = Array.from({ length: 60 }, () => floodAuth.signInWithPassword(floodDb, { source: SOURCE, email, password: 'wrong password guess' }, limit)
       .then(response => String(response.status), (error: Error) => `error: ${error.message}`));
     await delay(300);
     const started = performance.now();
@@ -579,4 +579,157 @@ test('the published upgrade statements end plain sessions and better-auth verifi
   assert.deepEqual(left, ['other-row', 'totp-used:user:digest']);
   // The adoption guide publishes exactly these statements.
   assert.ok(readFileSync(new URL('../docs/FEATURE-ADOPTION.md', import.meta.url), 'utf8').includes(tokenStorageUpgradeStatements));
+});
+
+test('an account whose email moved away before the lock was granted is not signed in, nor the account that took the email', { skip }, async () => {
+  const email = address('moved');
+  const first = await account_(email);
+  const second = randomUUID();
+  // Counts better-auth's own user lookups by email under the lock: with no account locked, its sign-in never runs.
+  let lookups = 0;
+  type Query = { model: string; where?: { field: string }[] };
+  const counting = (client: unknown) => ((options: never) => {
+    const real = (adapterOver(client) as unknown as (input: never) => Record<string, (query: Query) => Promise<unknown>>)(options);
+    const count = (query: Query) => { if (query.model === 'user' && query.where?.some(item => item.field === 'email')) lookups++; return query; };
+    return { ...real, findOne: (query: Query) => real.findOne!(count(query)), findMany: (query: Query) => real.findMany!(count(query)) };
+  }) as unknown as ReturnType<typeof adapterOver>;
+  const watched = createTen98Auth({ database: adapterOver(db), transactionDatabase: counting, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test' });
+  const mover = await pool!.connect();
+  try {
+    // Uncommitted: the first account's email moves away and a second account takes it, with the same password.
+    await mover.query('BEGIN');
+    await mover.query('UPDATE "user" SET email = $1 WHERE id = $2', [address('elsewhere'), first]);
+    await mover.query('INSERT INTO "user"(id,name,email) VALUES($1,$2,$3)', [second, 'Second', email]);
+    await mover.query('INSERT INTO account(id,"accountId","providerId","userId",password) VALUES($1,$2,\'credential\',$2,$3)', [randomUUID(), second, hashes.old]);
+    // The check before the lock reads the committed first account and passes; the locked lookup waits on its row and,
+    // once the move commits, finds no account at that email.
+    const attempt = watched.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow);
+    assert.equal(await someoneWaits(), true);
+    await mover.query('COMMIT');
+    assert.deepEqual(await answer(await attempt), await answer(await signIn(address('nobody'))));
+    assert.deepEqual([await sessions(first), await sessions(second)], [0, 0]);
+    assert.equal(lookups, 0);
+  } finally { mover.release(); }
+  // Negative control: with nothing in flight the second account signs in.
+  assert.equal((await signIn(email)).status, 200);
+});
+
+test('a session better-auth creates for any other account than the locked one is rolled back and refused', { skip }, async () => {
+  const email = address('locked'), other = address('decoy');
+  const id = await account_(email);
+  const decoy = await account_(other);
+  // An app adapter whose user lookup by email resolves to another account (a mapping fault, say).
+  type Query = { model: string; where?: { field: string; value: unknown }[] };
+  const redirecting = (client: unknown) => ((options: never) => {
+    const real = (adapterOver(client) as unknown as (input: never) => Record<string, (query: Query) => Promise<unknown>>)(options);
+    const redirect = (query: Query): Query => query.model === 'user' && query.where?.some(item => item.field === 'email') ? { ...query, where: [{ field: 'id', value: decoy }] } : query;
+    return { ...real, findOne: (query: Query) => real.findOne!(redirect(query)), findMany: (query: Query) => real.findMany!(redirect(query)) };
+  }) as unknown as ReturnType<typeof adapterOver>;
+  const faulty = createTen98Auth({ database: adapterOver(db), transactionDatabase: redirecting, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test' });
+  const unknown = await answer(await signIn(address('nobody')));
+  assert.deepEqual(await answer(await faulty.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)), unknown);
+  assert.deepEqual([await sessions(id), await sessions(decoy)], [0, 0]);
+  // Negative control: the same app with a faithful adapter signs the locked account in.
+  assert.equal((await signIn(email)).status, 200);
+});
+
+test('locked auth refuses to run without the unique index on lower(email), and refuses two matching accounts', { skip }, async () => {
+  assert.equal(await auth.assertEmailIndex(db), undefined);
+  // A schema without the index, holding case-variant twins.
+  await pool!.query(`CREATE SCHEMA bare; CREATE TABLE bare."user" (LIKE public."user" INCLUDING DEFAULTS); CREATE TABLE bare.account (LIKE public.account INCLUDING DEFAULTS);
+    CREATE SCHEMA dropped; CREATE TABLE dropped."user" (LIKE public."user" INCLUDING ALL); CREATE TABLE dropped.account (LIKE public.account INCLUDING ALL);`);
+  const twins = async (schemaName: string) => {
+    const base = `twin-${randomUUID()}@example.com`;
+    for (const variant of [base, base.replace('twin', 'Twin')]) {
+      const twin = randomUUID();
+      await pool!.query(`INSERT INTO ${schemaName}."user"(id,name,email) VALUES($1,'Twin',$2)`, [twin, variant]);
+      await pool!.query(`INSERT INTO ${schemaName}.account(id,"accountId","providerId","userId",password,"createdAt","updatedAt") VALUES($1,$2,'credential',$2,$3,now(),now())`, [randomUUID(), twin, hashes.old]);
+    }
+    return base;
+  };
+  const pools = ['bare', 'dropped'].map(name => new pg.Pool({ connectionString: url, max: 2, options: `-c search_path=${name}` }));
+  try {
+    const [bareDb, droppedDb] = pools.map(item => drizzle(item, { schema }));
+    const bareAuth = authOver(bareDb!), droppedAuth = authOver(droppedDb!);
+    const bareTwin = await twins('bare');
+    await assert.rejects(bareAuth.assertEmailIndex(bareDb!), MissingEmailIndexError);
+    await assert.rejects(bareAuth.signInWithPassword(bareDb!, { source: SOURCE, email: bareTwin, password: PASSWORD }, allow), MissingEmailIndexError);
+    await assert.rejects(bareAuth.withLockedAuthByEmail(bareDb!, bareTwin, async () => 1), MissingEmailIndexError);
+    // The index was there at start-up and dropped later: the locked lookup finds two accounts and refuses both.
+    assert.equal(await droppedAuth.withLockedAuthByEmail(droppedDb!, address('none'), async (_bound, _tx, userId) => userId), undefined);
+    const { rows } = await pool!.query<{ name: string }>("SELECT indexname AS name FROM pg_indexes WHERE schemaname = 'dropped' AND tablename = 'user' AND indexdef LIKE '%lower(email)%'");
+    await pool!.query(`DROP INDEX dropped."${rows[0]!.name}"`);
+    const droppedTwin = await twins('dropped');
+    await assert.rejects(droppedAuth.withLockedAuthByEmail(droppedDb!, droppedTwin, async () => 1), AmbiguousAccountError);
+    assert.deepEqual(await answer(await droppedAuth.signInWithPassword(droppedDb!, { source: SOURCE, email: droppedTwin, password: PASSWORD }, allow)), await answer(await signIn(address('nobody'))));
+  } finally { await Promise.all(pools.map(item => item.end())); }
+});
+
+test('a rolled-back locked transaction is never reported as success; a failed legacy upgrade leaves the sign-in standing', { skip }, async () => {
+  const id = await account_(address('rollback'));
+  // The callback swallows a failed statement: PostgreSQL answers COMMIT with ROLLBACK, and that is an error.
+  await assert.rejects(auth.withLockedAuth(db, id, async (_bound, tx) => { await tx.execute(sql`SELECT 1/0`).catch(() => undefined); return 'reported'; }), TransactionRolledBackError);
+  assert.equal(await auth.withLockedAuth(db, id, async () => 'committed'), 'committed');
+  const email = address('legacy-fail');
+  const legacyId = await account_(email, { hash: hashes.legacy });
+  await pool!.query(`CREATE FUNCTION refuse_password() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$;
+    CREATE TRIGGER refuse_password BEFORE UPDATE OF password ON account FOR EACH ROW WHEN (NEW."userId" = '${legacyId}') EXECUTE FUNCTION refuse_password();`);
+  try {
+    const legacyAuth = authOver(db, { legacyPasswords: true });
+    const response = await legacyAuth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow);
+    assert.equal(response.status, 200);
+    assert.ok(await legacyAuth.api.getSession({ headers: { cookie: cookieOf(response) } }));
+    assert.equal(await sessions(legacyId), 1);
+    assert.equal(await storedPassword(legacyId), hashes.legacy);
+  } finally { await pool!.query('DROP TRIGGER refuse_password ON account; DROP FUNCTION refuse_password();'); }
+});
+
+test('a closed account, or one the app\'s isAccountUsable refuses, gets the uniform 401 and no session', { skip }, async () => {
+  const unknown = await answer(await signIn(address('nobody')));
+  const email = address('closed');
+  const id = await account_(email);
+  await pool!.query('UPDATE "user" SET closed_at = now() WHERE id = $1', [id]);
+  assert.deepEqual(await answer(await signIn(email)), unknown);
+  assert.equal(await sessions(id), 0);
+  const refusedEmail = address('refused');
+  const refusedId = await account_(refusedEmail);
+  const picky = authOver(db, { isAccountUsable: account => account.id !== refusedId });
+  assert.deepEqual(await answer(await picky.signInWithPassword(db, { source: SOURCE, email: refusedEmail, password: PASSWORD }, allow)), unknown);
+  assert.equal(await sessions(refusedId), 0);
+  // Negative control: the hook decides, so allowing every account lets the closed one in.
+  const lenient = authOver(db, { isAccountUsable: () => true });
+  assert.equal((await lenient.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).status, 200);
+});
+
+test('a flood of distinct emails from one source is cut by its per-source limit before the queue, so a real user still signs in', { skip }, async () => {
+  const email = address('real');
+  await account_(email);
+  const counts = new Map<string, number>();
+  const perSource = ({ source }: PasswordAttempt) => { const seen = (counts.get(source) ?? 0) + 1; counts.set(source, seen); return seen <= 10; };
+  const flood = Array.from({ length: 60 }, (_, at) => auth.signInWithPassword(db, { source: 'ip:flood', email: address(`flood${at}`), password: 'wrong password guess' }, perSource).then(response => response.status));
+  await delay(50);
+  const started = performance.now();
+  const real = await auth.signInWithPassword(db, { source: 'ip:real', email, password: PASSWORD }, perSource);
+  const waited = performance.now() - started;
+  assert.equal(real.status, 200);
+  assert.ok(waited < 5000, `the real user waited ${waited.toFixed(0)} ms`);
+  const statuses = await Promise.all(flood);
+  assert.deepEqual([statuses.filter(status => status === 401).length, statuses.filter(status => status === 429).length], [10, 50]);
+  await assert.rejects(auth.signInWithPassword(db, { email, password: PASSWORD } as never, allow), /source/);
+});
+
+test('the instance an app holds refuses password sign-in on its route and api; the bound one refuses it too', { skip }, async () => {
+  const email = address('route');
+  const id = await account_(email);
+  for (const path of ['/sign-in/email', '/sign-in/email/', '/Sign-In/EMAIL']) {
+    const response = await auth.handler(new Request(`${ORIGIN}/api/auth${path}`, { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ email, password: PASSWORD }) }));
+    assert.equal(response.status, 404, path);
+  }
+  assert.throws(() => auth.api.signInEmail({ body: { email, password: PASSWORD }, asResponse: true }), /signInWithPassword/);
+  await auth.withLockedAuth(db, id, async bound => {
+    assert.throws(() => bound.api.signInEmail({ body: { email, password: PASSWORD }, asResponse: true }), /signInWithPassword/);
+    assert.throws(() => bound.handler(new Request(`${ORIGIN}/api/auth/sign-in/email/`, { method: 'POST' })), /signInWithPassword/);
+    assert.throws(() => (bound as unknown as { fetch(request: Request): unknown }).fetch(new Request(`${ORIGIN}/api/auth/sign-in/email`, { method: 'POST' })), /signInWithPassword/);
+  });
+  assert.equal(await sessions(id), 0);
 });

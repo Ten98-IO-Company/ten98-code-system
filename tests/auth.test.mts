@@ -9,6 +9,8 @@ import { createTen98Auth, sessionTokenKey, storedVerificationIdentifier, ten98Au
 import type { Ten98AuthOptions } from '../auth.mjs';
 
 // better-auth on its in-memory adapter: no database, no network. Origin and cookies go through the real handler.
+// These tests drive better-auth's own password sign-in, so setup() turns allowRawPasswordSignIn on; a test below shows
+// it is off by default.
 const ORIGIN = 'http://localhost:3000';
 const SECRET = 'test-secret-that-is-long-enough-0123456789';
 const PASSWORD = 'correct horse battery';
@@ -26,7 +28,7 @@ function setup(options: Partial<Ten98AuthOptions> = {}, wrap?: (adapter: Adapter
   const db: Record<string, Row[]> = { user: [], session: [], account: [], verification: [], twoFactor: [] };
   const resets: string[] = [];
   const adapter = memoryAdapter(db);
-  const auth = createTen98Auth({ database: wrap ? wrap(adapter) : adapter, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test', sendResetPassword: ({ token }) => { resets.push(token); }, ...options });
+  const auth = createTen98Auth({ database: wrap ? wrap(adapter) : adapter, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test', sendResetPassword: ({ token }) => { resets.push(token); }, allowRawPasswordSignIn: true, ...options });
   const context = (auth as unknown as { $context: Promise<Context> }).$context;
   const post = (path: string, body: unknown, cookie = '', origin = ORIGIN) => auth.handler(new Request(`${ORIGIN}/api/auth${path}`, {
     method: 'POST', headers: { 'content-type': 'application/json', origin, ...(cookie ? { cookie } : {}) }, body: JSON.stringify(body),
@@ -128,7 +130,7 @@ test('cross-origin requests are refused, also when the environment looks like a 
     import { memoryAdapter } from 'better-auth/adapters/memory';
     import { hashPassword } from 'better-auth/crypto';
     import { createTen98Auth } from ${JSON.stringify(new URL('../auth.mjs', import.meta.url).href)};
-    const auth = createTen98Auth({ database: memoryAdapter({ user: [], session: [], account: [], verification: [], twoFactor: [] }), appUrl: '${ORIGIN}', secret: '${SECRET}', appName: 'T' });
+    const auth = createTen98Auth({ database: memoryAdapter({ user: [], session: [], account: [], verification: [], twoFactor: [] }), appUrl: '${ORIGIN}', secret: '${SECRET}', appName: 'T', allowRawPasswordSignIn: true });
     const ctx = await auth.$context;
     const user = await ctx.internalAdapter.createUser({ email: 'a@example.com', name: 'A', emailVerified: true });
     await ctx.internalAdapter.linkAccount({ userId: user.id, providerId: 'credential', accountId: user.id, password: await hashPassword('${PASSWORD}') });
@@ -291,6 +293,25 @@ test('createTen98Auth refuses an invalid URL, a short secret, no app name or a b
   for (const options of [{ appUrl: 'ftp://example.com' }, { appUrl: 'http://example.com' }, { secret: 'short' }, { appName: ' ' }, { cookiePrefix: 'a;b' }, { cookiePrefix: '' }]) {
     assert.throws(() => createTen98Auth({ database, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test', ...options }), TypeError, JSON.stringify(options));
   }
+});
+
+test('the instance an app holds refuses better-auth\'s own password sign-in unless allowRawPasswordSignIn is set', async () => {
+  const strict = setup({ allowRawPasswordSignIn: false });
+  await strict.user('owner@example.com', await hashPassword(PASSWORD));
+  for (const path of ['/sign-in/email', '/sign-in/email/', '/sign-in/email//', '/Sign-In/Email', '/SIGN-IN/EMAIL/']) {
+    const response = await strict.post(path, { email: 'owner@example.com', password: PASSWORD });
+    assert.equal(response.status, 404, path);
+    assert.equal(response.headers.getSetCookie().length, 0, path);
+  }
+  assert.equal((await strict.auth.handler(new Request(`${ORIGIN}/api/auth/sign-in/email`, { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: '{}' }))).status, 404);
+  assert.throws(() => strict.auth.api.signInEmail({ body: { email: 'owner@example.com', password: PASSWORD }, asResponse: true }), /signInWithPassword/);
+  assert.equal(strict.db.session!.length, 0);
+  // Every other route still works.
+  assert.equal((await strict.post('/request-password-reset', { email: 'owner@example.com', redirectTo: '/' })).status, 200);
+  // The explicit option turns it back on.
+  const raw = setup({ allowRawPasswordSignIn: true });
+  await raw.user('owner@example.com', await hashPassword(PASSWORD));
+  assert.equal((await raw.signIn()).status, 200);
 });
 
 // Tokens at rest (#131). The expected values are computed here from the published labels and rule, independently of

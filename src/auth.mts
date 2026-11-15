@@ -9,7 +9,7 @@
 // interleave.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, createHmac, hkdfSync, scrypt, timingSafeEqual } from 'node:crypto';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, getTableName, sql } from 'drizzle-orm';
 import { NodePgSession, NodePgTransaction } from 'drizzle-orm/node-postgres';
 import { PgTransaction } from 'drizzle-orm/pg-core';
 import type pg from 'pg';
@@ -18,7 +18,7 @@ import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, 
 import { setSessionCookie } from 'better-auth/cookies';
 import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import { twoFactor } from 'better-auth/plugins/two-factor';
-import { account as accountTable, transaction, user as userTable, type AnyDatabase, type ScopedTransaction } from './db.mjs';
+import { account as accountTable, transaction, TransactionRolledBackError, user as userTable, type AnyDatabase, type ScopedTransaction } from './db.mjs';
 import { appOrigin } from './index.mjs';
 import { LockedAuthTransactionError, markLockedAuth, refuseLockedAuth } from './locked-auth.mjs';
 
@@ -268,6 +268,16 @@ export interface Ten98AuthOptions {
   allowPasswordless?: boolean;
   /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
   cookiePrefix?: string;
+  /**
+   * Whether an account may sign in with its password, asked under the account's lock in `signInWithPassword`; anything
+   * but `true` gets the uniform 401. Defaults to refusing a closed account (`closedAt` set).
+   */
+  isAccountUsable?(account: { id: string; email: string; closedAt: Date | null }): boolean | Promise<boolean>;
+  /**
+   * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) on the instance the
+   * app holds. It has no rate limit, no lock and no constant-cost check: do not use it outside tests and migrations.
+   */
+  allowRawPasswordSignIn?: boolean;
 }
 
 export interface Ten98AuthSession {
@@ -326,17 +336,28 @@ export interface Ten98Auth {
    * password changed in between, the answer is the same 401 and no session is created. The response carries the
    * session cookie, or the two-factor challenge, as `/sign-in/email` does.
    */
-  signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: { email: string }) => boolean | Promise<boolean>): Promise<Response>;
+  signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: PasswordAttempt) => boolean | Promise<boolean>): Promise<Response>;
+  /**
+   * Resolves when the user table has the unique index on `lower(email)` that the locked lookups rely on, and rejects
+   * otherwise. Call it at start-up; every locked call also checks it once per database and refuses to run without it.
+   */
+  assertEmailIndex(db: AnyDatabase): Promise<void>;
 }
 
 /** `signInWithPassword`'s input; `headers` are the request's, for the session's user agent and address. */
-export type PasswordSignIn = { email: string; password: string; rememberMe?: boolean; headers?: HeadersInit };
+export type PasswordSignIn = { email: string; password: string; source: string; rememberMe?: boolean; headers?: HeadersInit };
+/**
+ * What `signInWithPassword` gives the app's limiter, before any hash and before the verification queue: the normalised
+ * email, and `source`, the client address the app derived for the request (`clientLimitKey` of its trusted address), so
+ * it counts per source as well as per account.
+ */
+export type PasswordAttempt = { email: string; source: string };
 
 /**
  * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
  * in with a password (use `signInWithPassword`), and throws LockedAuthClosedError once the callback has returned.
  */
-export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword'> {
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword' | 'assertEmailIndex'> {
   /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
   readonly userId: string | undefined;
   /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
@@ -360,7 +381,7 @@ export function createTen98Auth(options: Ten98AuthOptions): Ten98Auth {
   return build(options, deriveKeys(checkedSecret(options.secret)), true) as Ten98Auth;
 }
 
-function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Ten98Auth | LockedTen98Auth {
+function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, internal: { signedIn?(userId: string): void } = {}): Ten98Auth | LockedTen98Auth {
   const { database, appUrl, secret, appName, sendResetPassword, legacyPasswords = false, allowPasswordless = false, cookiePrefix, transactionDatabase, emailLockKey = 109_859 } = options;
   const origin = appOrigin(appUrl);
   checkedSecret(secret);
@@ -477,10 +498,15 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
       ...(legacyPassword ? { password: legacyPassword } : {}),
     },
     rateLimit: { enabled: false },
-    ...(legacyPasswords ? { hooks: { after: createAuthMiddleware(async context => {
-      // After a successful password sign-in (with or without a pending two-factor challenge), replace a legacy hash.
-      // Best effort: a failure leaves the legacy hash for the next sign-in and never blocks this one.
+    hooks: { after: createAuthMiddleware(async context => {
       if (context.path !== '/sign-in/email' || isAPIError(context.context.returned)) return;
+      // The account this sign-in created a session (or a two-factor challenge) for, read before the two-factor plugin's
+      // hook clears it, so signInWithPassword can check it is the account it locked.
+      const signedIn = context.context.newSession?.user.id;
+      if (internal.signedIn && signedIn) internal.signedIn(signedIn);
+      // signInWithPassword replaces a legacy hash itself, in a savepoint of its locked transaction. Here (raw sign-in,
+      // allowRawPasswordSignIn) it is best effort: a failure leaves the legacy hash for the next sign-in.
+      if (!legacyPasswords || internal.signedIn) return;
       const { email, password: candidate } = (context.body ?? {}) as { email?: unknown; password?: unknown };
       if (typeof email !== 'string' || typeof candidate !== 'string') return;
       try {
@@ -488,13 +514,21 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
         const credential = found?.accounts.find(account => account.providerId === 'credential');
         if (found && credential?.password && isLegacyHash(credential.password)) await context.context.internalAdapter.updatePassword(found.user.id, await hashPassword(candidate));
       } catch { /* retried on the next successful sign-in */ }
-    }) } } : {}),
+    }) },
   });
   const helpers = {
     storedVerificationIdentifier: (identifier: string) => storedIdentifier(keys, raw(identifier)),
     sessionTokenKey: (token: string) => tokenHandle(keys, raw(token)),
   };
   if (!locking) return Object.assign(auth, helpers) as unknown as LockedTen98Auth;
+  // On the instance the app holds, better-auth's own password sign-in has no limit, no lock and no constant-cost check,
+  // so it is off: the route (any case, any trailing slash) answers 404 and api.signInEmail throws.
+  if (options.allowRawPasswordSignIn !== true) {
+    const route = auth.handler.bind(auth);
+    const routed = (request: Request) => passwordRoute.test(new URL(request.url).pathname) ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
+    Object.assign(auth, { handler: routed, fetch: routed });
+    Object.assign(auth.api, { signInEmail() { throw new TypeError('Password sign-in is only supported through signInWithPassword.'); } });
+  }
   const { lockTimeoutMs = 5000 } = options;
   if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000) throw new TypeError('lockTimeoutMs must be an integer from 1 to 600000.');
   const slots = boundedSlots(options.passwordVerification);
@@ -522,7 +556,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
       },
     });
     const callbackTx = new NodePgTransaction(dialect, new NodePgSession(guarded, dialect, inner.schema, inner.options), inner.schema) as unknown as ScopedTransaction<TDatabase>;
-    const bound = build({ ...options, database: transactionDatabase!(callbackTx as ScopedTransaction<AnyDatabase>) }, keys, false) as LockedTen98Auth;
+    // For signInWithPassword: the account better-auth's sign-in created a session for, to compare with the locked one.
+    let signedIn: string | undefined;
+    const bound = build({ ...options, database: transactionDatabase!(callbackTx as ScopedTransaction<AnyDatabase>) }, keys, false,
+      passwordSignIn ? { signedIn(userId) { signedIn = userId; } } : {}) as LockedTen98Auth;
+    Object.defineProperty(bound, signedInUser, { value: () => signedIn });
     // signInEmail holds this transaction's connection and lock while it hashes; only signInWithPassword, after its own
     // check outside any transaction, may call it here.
     const stalls = 'Password sign-in inside a locked-auth transaction holds a pool connection while it hashes; use signInWithPassword.';
@@ -538,7 +576,9 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
         const value = target[key];
         return typeof value === 'function' ? (...args: unknown[]) => { check(key === 'signInEmail'); return (value as (...input: unknown[]) => unknown).apply(target, args); } : value;
       } }),
-      handler(request: Request) { check(/\/sign-in\/email\/*$/i.test(new URL(request.url).pathname)); return handler(request); },
+      handler(request: Request) { check(passwordRoute.test(new URL(request.url).pathname)); return handler(request); },
+      // better-auth's fetch is the same handler; it gets the same checks.
+      fetch(request: Request) { check(passwordRoute.test(new URL(request.url).pathname)); return handler(request); },
       async revokeAllSessions() { check(false); if (hold.userId !== undefined) await (await storeOf(bound)).internalAdapter.deleteUserSessions(hold.userId); },
     });
     const unmark = markLockedAuth({ email: hold.email }, callbackTx, connection);
@@ -556,6 +596,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
     refuseLockedAuth(db, 'withLockedAuth');
     const outside = {};
     if (await getCurrentAdapter(outside as never) !== outside) throw new TypeError('withLockedAuth cannot run inside a better-auth request or hook.');
+    await emailIndex(db as AnyDatabase);
   };
   // Parameterised raw statements by necessity: Drizzle has no builder for set_config or advisory locks. The timeout comes
   // first, so the lock statements that follow cannot wait forever.
@@ -564,11 +605,13 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
     transaction(db, async tx => {
       await limitLockWaits(tx);
       await tx.execute(sql`SELECT pg_advisory_xact_lock(${emailLockKey}, hashtext(${address}))`);
-      // lower() on both sides, as user_email_normalized_idx is defined, whatever JavaScript's lowercasing did.
-      const [row] = await tx.select({ id: userTable.id }).from(userTable).where(sql`lower(${userTable.email}) = lower(${address})`).for('no key update');
-      return bind(tx, { userId: row?.id, email: address }, (auth, bound) => run(auth, bound, row?.id), passwordSignIn);
+      // lower() on both sides, as user_email_normalized_idx is defined, whatever JavaScript's lowercasing did. That index
+      // makes the match unique; were it dropped after the start-up check, two matches are refused, never one picked.
+      const rows = await tx.select({ id: userTable.id }).from(userTable).where(sql`lower(${userTable.email}) = lower(${address})`).for('no key update');
+      if (rows.length > 1) throw new AmbiguousAccountError();
+      return bind(tx, { userId: rows[0]?.id, email: address }, (auth, bound) => run(auth, bound, rows[0]?.id), passwordSignIn);
     });
-  const locked: Pick<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword'> = {
+  const locked: Pick<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword' | 'assertEmailIndex'> = {
     async withLockedAuth(db, userId, run) {
       await ready(db, run);
       if (typeof userId !== 'string' || !userId) throw new TypeError('withLockedAuth needs a user id.');
@@ -588,14 +631,16 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
     async signInWithPassword(db, input, limit) {
       if (typeof limit !== 'function') throw new TypeError('signInWithPassword needs the app\'s rate limit.');
       await ready(db, limit);
-      const { email, password, rememberMe, headers } = (input ?? {}) as Partial<PasswordSignIn>;
+      const { email, password, source, rememberMe, headers } = (input ?? {}) as Partial<PasswordSignIn>;
+      if (typeof source !== 'string' || !source) throw new TypeError('signInWithPassword needs the request\'s source (the client address the app derived).');
       if (typeof email !== 'string' || typeof password !== 'string' || (rememberMe !== undefined && typeof rememberMe !== 'boolean')) return refusal(400, 'INVALID_INPUT', 'Enter an email and a password.');
       // better-auth checks the origin only for a request it routes itself, not for this server call, so the browser's
       // Origin and Sec-Fetch-Site are checked here: a cross-site form cannot sign a victim in to another account.
       if (crossSite(headers, origin)) return refusal(403, 'CROSS_SITE_SIGN_IN', 'Sign in from this site.');
       const address = email.trim().toLowerCase();
-      // 1. The app's limits, counted before any read or hash: a flood of guesses costs a counter, not a derivation.
-      if (await limit({ email: address }) !== true) return refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+      // 1. The app's limits, per source and per account, counted before any read, hash or queue: a flood of guesses costs
+      // a counter, and one source cannot fill the verification queue.
+      if (await limit({ email: address, source }) !== true) return refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
       // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
       if (password.length > ten98AuthPolicy.password.maxLength) return refused();
       // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads.
@@ -610,10 +655,55 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
         verified = await verifyStoredPassword(stored?.password, password, legacyPasswords);
       } finally { release(); }
       if (!verified) return refused();
-      // 4. Only a correct password takes the lock; better-auth verifies again there and creates the session.
-      const response = await byEmail(db, address, auth => auth.api.signInEmail({ body: { email: address, password, ...(rememberMe === undefined ? {} : { rememberMe }) }, ...(headers === undefined ? {} : { headers }), asResponse: true }), true);
+      // 4. Only a correct password takes the lock; better-auth verifies again there and creates the session, for the
+      // locked account only.
+      let response: Response;
+      try {
+        response = await byEmail(db, address, async (bound, tx, userId) => {
+          // No account under the lock (its email moved before the lock was granted), or one that may not sign in: the
+          // uniform 401, after the derivation the sign-in would have cost.
+          const [account] = userId === undefined ? [] : await tx.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt }).from(userTable).where(eq(userTable.id, userId));
+          if (!account || await usable(account) !== true) {
+            await lockedCost(password);
+            return refused();
+          }
+          const signedIn = await bound.api.signInEmail({ body: { email: address, password, ...(rememberMe === undefined ? {} : { rememberMe }) }, ...(headers === undefined ? {} : { headers }), asResponse: true });
+          if (signedIn.ok) {
+            // A session (or challenge) for any other account than the locked one rolls the transaction back.
+            if ((bound as unknown as Record<symbol, () => string | undefined>)[signedInUser]!() !== account.id) throw new LockedAccountMismatch();
+            if (legacyPasswords) await replaceLegacyHash(tx, account.id, password);
+          }
+          return signedIn;
+        }, true);
+      } catch (error) {
+        if (error instanceof LockedAccountMismatch || error instanceof AmbiguousAccountError) return refused();
+        // COMMIT reported a rollback: nothing the callback did persists, so no cookie may be returned for it.
+        if (error instanceof TransactionRolledBackError) return refusal(500, 'SIGN_IN_FAILED', 'Sign-in failed. Try again.');
+        throw error;
+      }
       return response.status === 401 ? refused() : response;
     },
+    assertEmailIndex: db => emailIndex(db),
+  };
+  /** The isAccountUsable hook, refusing a closed account by default. */
+  const usable = (account: { id: string; email: string; closedAt: Date | null }) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
+  /** What better-auth's own check under the lock costs: both verifiers with legacy hashes accepted, else the current one. */
+  const lockedCost = async (candidate: string) => {
+    if (legacyPasswords) await verifyStoredPassword(undefined, candidate, true);
+    else await verifyPassword({ hash: await modernDummy(), password: candidate }).catch(() => false);
+  };
+  /**
+   * Replaces a legacy hash once, under the lock, in a savepoint: a failure (a trigger, a constraint) rolls back the
+   * savepoint only, so the sign-in stands and the next one retries.
+   */
+  const replaceLegacyHash = async (tx: AnyDatabase, userId: string, candidate: string) => {
+    const credential = and(eq(accountTable.userId, userId), eq(accountTable.providerId, 'credential'));
+    try {
+      await tx.transaction(async savepoint => {
+        const [stored] = await savepoint.select({ password: accountTable.password }).from(accountTable).where(credential);
+        if (stored?.password && isLegacyHash(stored.password)) await savepoint.update(accountTable).set({ password: await hashPassword(candidate), updatedAt: new Date() }).where(credential);
+      });
+    } catch (error) { if (error instanceof LockedAuthClosedError) throw error; }
   };
   return Object.assign(auth, helpers, locked) as unknown as Ten98Auth;
 }
@@ -623,6 +713,38 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
 let dummyModernHash: Promise<string> | undefined;
 const modernDummy = () => (dummyModernHash ??= hashPassword('ten98-timing-equaliser'));
 const lockedContext = new AsyncLocalStorage<true>();
+/** better-auth's password route, in any case and with any trailing slash. */
+const passwordRoute = /\/sign-in\/email\/*$/i;
+/** Where a bound instance keeps the account its password sign-in created a session for. */
+const signedInUser = Symbol('ten98.auth.signedInUser');
+/** better-auth signed in another account than the one signInWithPassword locked; thrown so the transaction rolls back. */
+class LockedAccountMismatch extends Error {}
+
+/** More than one account matches an email: the unique index on lower(email) is missing. Nothing is picked. */
+export class AmbiguousAccountError extends Error {
+  readonly code = 'AMBIGUOUS_ACCOUNT' as const;
+  constructor() { super('More than one account matches this email; the user table needs its unique index on lower(email).'); this.name = 'AmbiguousAccountError'; }
+}
+/** The user table has no valid unique index on lower(email), which the locked lookups need to find one account. */
+export class MissingEmailIndexError extends Error {
+  readonly code = 'MISSING_EMAIL_INDEX' as const;
+  constructor() { super('The user table needs a unique index on lower(email) (user_email_normalized_idx in workspace-team.sql) before locked auth can run.'); this.name = 'MissingEmailIndexError'; }
+}
+// One check per database object. A missing index is remembered, so every later call is refused too; a failed query is
+// not, so a transient error is retried.
+const emailIndexChecks = new WeakMap<object, Promise<void>>();
+function emailIndex(db: AnyDatabase): Promise<void> {
+  let check = emailIndexChecks.get(db);
+  if (!check) {
+    // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
+    check = db.execute(sql`SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${`"${getTableName(userTable)}"`})
+        AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indnatts = 1 AND pg_get_expr(i.indexprs, i.indrelid) = 'lower(email)') AS indexed`)
+      .then(result => { if ((result as unknown as { rows: { indexed: boolean }[] }).rows[0]?.indexed !== true) throw new MissingEmailIndexError(); });
+    check.catch(error => { if (!(error instanceof MissingEmailIndexError)) emailIndexChecks.delete(db); });
+    emailIndexChecks.set(db, check);
+  }
+  return check;
+}
 
 /** Both verifiers on every attempt, one of them against a dummy; true only for a stored hash the password matches. */
 async function verifyStoredPassword(hash: string | null | undefined, candidate: string, legacyAccepted: boolean): Promise<boolean> {
@@ -637,7 +759,7 @@ async function verifyStoredPassword(hash: string | null | undefined, candidate: 
 /** A browser request from another site: an Origin other than the app's, or Sec-Fetch-Site cross-site or same-site. */
 function crossSite(headers: HeadersInit | undefined, origin: string): boolean {
   if (headers === undefined) return false;
-  const given = new Headers(headers), from = given.get('origin'), site = given.get('sec-fetch-site');
+  const given = new Headers(headers), from = given.get('origin'), site = given.get('sec-fetch-site')?.toLowerCase();
   return (from !== null && from !== origin) || site === 'cross-site' || site === 'same-site';
 }
 

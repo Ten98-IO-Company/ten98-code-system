@@ -62,7 +62,7 @@ class ScriptedPool {
         const failure = this.fail[text as 'begin' | 'rollback' | 'commit'];
         if (failure) throw failure;
         // The membership query, in Drizzle's array row mode: workspace id, name, role.
-        return { rows: text.startsWith('select "workspace"') ? [[fakeWorkspace, 'W', 'owner']] : [], fields: [], command: 'SELECT', rowCount: 0 };
+        return { rows: text.startsWith('select "workspace"') ? [[fakeWorkspace, 'W', 'owner']] : [], fields: [], command: text === 'commit' ? 'COMMIT' : 'SELECT', rowCount: 0 };
       },
       release: (destroy?: unknown) => { this.released.push(destroy); },
     });
