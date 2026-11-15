@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { PublicError, ten98RootErrorOptions, ten98StartOptions } from '@ten98/runtime/start';
+import { PublicError, publicErrorMessage, ten98RootErrorOptions, ten98StartOptions } from '@ten98/runtime/start';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 // The markers tests/fixtures/start-app/src/secrets.ts throws with; none may reach a response.
@@ -52,14 +52,23 @@ after(async () => {
   if (app) rmSync(app, { recursive: true, force: true, maxRetries: 5 });
 });
 
+// The fixture server closes a keep-alive socket after five idle seconds, so a request sent on one just closed is sent
+// once more; every request here is safe to repeat.
+const send = async (url: string, init: RequestInit): Promise<Response> => {
+  try { return await fetch(url, init); }
+  catch (error) {
+    if ((error as { cause?: { code?: string } }).cause?.code !== 'ECONNRESET') throw error;
+    return fetch(url, init);
+  }
+};
 const page = async (mode: string, path: string) => {
-  const response = await fetch(servers[mode]!.origin + path, { redirect: 'manual' });
+  const response = await send(servers[mode]!.origin + path, { redirect: 'manual' });
   return { status: response.status, location: response.headers.get('location'), body: await response.text() };
 };
 // The server function URLs the fixture renders, by button id.
 const functionUrls = async (mode: string): Promise<Record<string, string>> => Object.fromEntries([...(await page(mode, '/server-fn')).body.matchAll(/id="(\w+)" data-url="([^"]+)"/gu)].map(match => [match[1], match[2]]));
 const callFunction = async (mode: string, name: string, headers: Record<string, string>) => {
-  const response = await fetch(servers[mode]!.origin + (await functionUrls(mode))[name], { method: 'POST', headers: { 'x-tsr-serverFn': 'true', ...headers }, redirect: 'manual' });
+  const response = await send(servers[mode]!.origin + (await functionUrls(mode))[name], { method: 'POST', headers: { 'x-tsr-serverFn': 'true', ...headers }, redirect: 'manual' });
   return { status: response.status, headers: response.headers, body: await response.text() };
 };
 const sameOrigin = (mode: string) => ({ Origin: servers[mode]!.origin });
@@ -107,6 +116,54 @@ test('a PublicError crosses as its message only, from a loader and from a server
   const call = await callFunction('default', 'public', sameOrigin('default'));
   assertHidden(call.body, 'the PublicError payload');
   assert.match(call.body, /\{"k":\["public"\],"v":\[\{"t":1,"s":"Your plan has expired\."\}\]\}/u);
+});
+
+test('an errorComponent showing publicErrorMessage never renders the original message, on the server or after hydration', async () => {
+  for (const [path, id] of [['/error-component', 'error-component'], ['/server-loader', 'server-loader']]) {
+    const { body } = await page('default', path!);
+    assertHidden(body, path!);
+    assert.match(body, new RegExp(`<p id="${id}">Something went wrong\\.</p>`, 'u'), path);
+  }
+  // What the same component shows in the browser, given what the adapter rebuilds there.
+  const [adapter] = ten98StartOptions({ reporter: () => {} }).serializationAdapters;
+  const original = Object.assign(new TypeError('hidden message'), { reference: 'hidden reference' });
+  const rebuilt = adapter.fromSerializable(adapter.toSerializable(original)) as Error & { reference: string };
+  assert.equal(publicErrorMessage(rebuilt), `Something went wrong. Reference ${rebuilt.reference}.`);
+  assert.equal(publicErrorMessage(original), 'Something went wrong.');
+  assert.equal(publicErrorMessage(adapter.fromSerializable(adapter.toSerializable(new PublicError(PUBLIC_MESSAGE)))), PUBLIC_MESSAGE);
+  for (const other of [undefined, null, 'hidden', { message: 'hidden', reference: rebuilt.reference }, new Error('hidden')]) assert.equal(publicErrorMessage(other), 'Something went wrong.');
+});
+
+test('hydrateTen98Start hydrates the document with StrictMode and StartClient inside startTransition, with the root callbacks', () => {
+  // A child process, so node:test's module mocks replace hydrateRoot and wrap startTransition for start.mjs alone.
+  const probe = `
+    import { mock } from 'node:test';
+    const react = await import('react');
+    const calls = [], logged = [], reported = [];
+    let inTransition = false;
+    mock.module('react', { defaultExport: react.default, namedExports: { ...react, startTransition: run => { inTransition = true; try { run(); } finally { inTransition = false; } } } });
+    mock.module('react-dom/client', { namedExports: { hydrateRoot: (container, children, options) => { calls.push({ container, children, options, inTransition }); } } });
+    globalThis.document = { nodeType: 9 };
+    console.error = (...args) => { logged.push(args.length); };
+    const { StartClient } = await import('@tanstack/react-start/client');
+    const { hydrateTen98Start } = await import('@ten98/runtime/start');
+    hydrateTen98Start({ reporter: (error, details) => { reported.push(details.kind); } });
+    const [call] = calls, root = call?.children, inner = root?.props?.children;
+    for (const name of ['onCaughtError', 'onUncaughtError', 'onRecoverableError']) call?.options?.[name]?.(new Error('render'), { componentStack: 'at Widget' });
+    process.stdout.write(JSON.stringify({
+      calls: calls.length, document: call?.container === globalThis.document, inTransition: call?.inTransition,
+      strictMode: root?.type === react.StrictMode, startClient: inner?.type === StartClient, innerProps: inner && Object.keys(inner.props),
+      callbacks: Object.keys(call?.options ?? {}).sort(), logged: logged.length, reported,
+    }));`;
+  for (const mode of ['production', 'development']) {
+    const run = spawnSync(process.execPath, ['--experimental-test-module-mocks', '--no-warnings', '--input-type=module', '-e', probe], { cwd: root, encoding: 'utf8', timeout: 60_000, windowsHide: true, env: { ...process.env, NODE_ENV: mode } });
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual(JSON.parse(run.stdout), {
+      calls: 1, document: true, inTransition: true, strictMode: true, startClient: true, innerProps: [],
+      callbacks: ['onCaughtError', 'onRecoverableError', 'onUncaughtError'],
+      logged: mode === 'production' ? 0 : 3, reported: ['caught', 'uncaught', 'recoverable'],
+    }, mode);
+  }
 });
 
 test('redirect() and notFound() still work from routes and server functions', async () => {

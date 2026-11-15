@@ -335,6 +335,7 @@
       "exports": [
         "ten98StartOptions",
         "PublicError",
+        "publicErrorMessage",
         "hydrateTen98Start",
         "ten98RootErrorOptions"
       ],
@@ -343,7 +344,7 @@
         "tests/start-check.test.mts"
       ],
       "version": "v0.30.0",
-      "boundary": "The error serialisation, server error log and CSRF middleware every TanStack Start app takes through createStart(() => ten98StartOptions()) in src/start.ts, and the client entry hydrateTen98Start() in src/client.tsx; the architecture check refuses a Start app without both. Only a PublicError message reaches the browser. Apps keep their routes, error components, middleware and what the user is told."
+      "boundary": "The error serialisation, server error log and CSRF middleware every TanStack Start app takes through createStart(() => ten98StartOptions()) in src/start.ts, and the client entry hydrateTen98Start() in src/client.tsx; the architecture check refuses a Start app without both. Only a PublicError message reaches the browser, and error components show publicErrorMessage(error). Apps keep their routes, error components, middleware and what the user is told."
     },
     "presentation": {
       "package": "@ten98/ui",

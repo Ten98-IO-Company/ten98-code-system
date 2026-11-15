@@ -49,6 +49,17 @@ function referencedError(reference) {
     return Object.assign(new Error(`Something went wrong. Reference ${shown}.`), { name: 'Error', reference: shown });
 }
 /**
+ * The text an error component may show. An errorComponent also renders on the server with the original error, so it
+ * shows this, never `error.message`: a PublicError's message, the fixed sentence with the reference for an error the
+ * browser received as a reference, and the fixed sentence alone for anything else, the server's originals included.
+ */
+export function publicErrorMessage(error) {
+    if (error instanceof PublicError)
+        return error.message;
+    const reference = error instanceof Error ? error.reference : undefined;
+    return typeof reference === 'string' && REFERENCE.test(reference) ? `Something went wrong. Reference ${reference}.` : 'Something went wrong.';
+}
+/**
  * The options for `createStart(() => ten98StartOptions(...))` in src/start.ts. Every Error that crosses to the
  * browser, from a beforeLoad, a loader or a server function, crosses as a reference only and is logged in full on the
  * server; a PublicError crosses as its message only. Server functions keep Start's CSRF check.
