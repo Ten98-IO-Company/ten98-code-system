@@ -892,16 +892,6 @@
       "owner": "ten98-campaign",
       "doneWhen": "Every Dockerfile stage in Campaign uses node:24.22.1-slim."
     },
-    "ui-pnpm": {
-      "rule": "packageManager",
-      "profile": "@ten98/ui",
-      "items": [
-        "unset"
-      ],
-      "reason": "The design system installs with npm from package-lock.json.",
-      "owner": "@ten98/ui",
-      "doneWhen": "@ten98/ui declares pnpm@11.19.0 and commits pnpm-lock.yaml in place of package-lock.json."
-    },
     "io-pnpm": {
       "rule": "packageManager",
       "profile": "ten98-io",

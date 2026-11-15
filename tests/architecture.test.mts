@@ -242,12 +242,15 @@ test('architecture rejects unreviewed toolchains and dependency resolution subst
 test('approved profile-specific development tools keep their reviewed declaration', () => {
   const { '@types/node': _campaignNode, '@types/pg': _campaignPg, ...sharedDevDependencies } = campaign().devDependencies;
   const manifest: ManifestFixture = {
-    name: '@ten98/ui', type: 'module', engines: { node: '>=24.22.1 <25' },
+    name: '@ten98/ui', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
     devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };
   assert.deepEqual(checkManifest(manifest), []);
+  // The ui-pnpm transition is closed (UI v0.39.0 is on pnpm): an npm-era manifest without packageManager is refused.
+  const { packageManager: _pnpm, ...npmEra } = manifest;
+  assert.match(checkManifest(npmEra).join('\n'), /packageManager: expected pnpm@11\.19\.0, found \(missing\)/);
   manifest.devDependencies['@playwright/test'] = '*';
   assert.match(checkManifest(manifest).join('\n'), /devDependencies.@playwright\/test/);
   delete manifest.devDependencies['@playwright/test'];
