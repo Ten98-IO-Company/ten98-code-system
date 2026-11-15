@@ -101,7 +101,7 @@ function storedIdentifier(keys, identifier) {
 // limiter to spare it the account-wide bucket. Each is a verification row `known-device:<deviceId>` (value: the user id,
 // expiresAt: its 90 days) with one `known-device-attempt:<deviceId>` row per attempt it was trusted for since its last
 // success; at 5 it is no longer trusted. Both prefixes are kept in storage, so a user's rows go with one prefix filter.
-const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts: 5, entries: 5, cookieLength: 1024 };
+const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts: 5, entries: 5, devices: 5, cookieLength: 1024 };
 const devicePrefix = 'known-device', deviceRow = (deviceId) => `known-device:${deviceId}`, attemptRow = (deviceId) => `known-device-attempt:${deviceId}`;
 const deviceEntryPattern = /^([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/;
 /** The tag binding a device id to one account: HMAC over userId ‖ deviceId (NUL-separated; neither contains NUL). */
@@ -361,6 +361,9 @@ function build(options, keys, locking, internal = {}) {
         }
         const deviceId = randomBytes(24).toString('base64url');
         await context.context.internalAdapter.createVerificationValue({ identifier: deviceRow(deviceId), value: userId, expiresAt: new Date(Date.now() + device.lifetimeSeconds * 1000) });
+        const live = await adapter.findMany({ model: 'verification', where: [{ field: 'value', value: userId }, { field: 'identifier', operator: 'starts_with', value: 'known-device:' }], sortBy: { field: 'createdAt', direction: 'desc' } });
+        for (const stale of live.slice(device.devices))
+            await adapter.delete({ model: 'verification', where: [{ field: 'id', value: stale.id }] });
         const kept = entries.filter(entry => entry !== previous).map(entry => entry.text);
         context.setCookie(cookie.name, [`${deviceId}.${deviceTag(keys, userId, deviceId)}`, ...kept].slice(0, device.entries).join('~'), cookie.attributes);
     };
@@ -443,13 +446,16 @@ function build(options, keys, locking, internal = {}) {
         },
         rateLimit: { enabled: false },
         hooks: { after: createAuthMiddleware(async (context) => {
-                if (context.path !== '/sign-in/email' || isAPIError(context.context.returned))
+                const path = context.path ?? '';
+                if ((path !== '/sign-in/email' && !twoFactorPaths.has(path)) || isAPIError(context.context.returned))
                     return;
-                // The account this sign-in created a session (or a two-factor challenge) for, read before the two-factor plugin's
-                // hook clears it, so signInWithPassword can check it is the account it locked.
+                // The account this sign-in (or completed challenge) created a session (or a two-factor challenge) for, read before
+                // the two-factor plugin's hook clears it, so signInWithPassword and verifyTwoFactor can check it is the one locked.
                 const signedIn = context.context.newSession?.user.id;
                 if (internal.signedIn && signedIn)
                     internal.signedIn(signedIn);
+                if (path !== '/sign-in/email')
+                    return;
                 // signInWithPassword replaces a legacy hash itself, in a savepoint of its locked transaction. Here (raw sign-in,
                 // allowRawPasswordSignIn) it is best effort: a failure leaves the legacy hash for the next sign-in.
                 if (!legacyPasswords || internal.signedIn)
@@ -470,15 +476,31 @@ function build(options, keys, locking, internal = {}) {
         storedVerificationIdentifier: (identifier) => storedIdentifier(keys, raw(identifier)),
         sessionTokenKey: (token) => tokenHandle(keys, raw(token)),
     };
+    // The two-factor challenge cookie's name, as better-auth's createAuthCookie builds it for this instance.
+    const challengeCookie = `${origin.startsWith('https:') ? '__Secure-' : ''}${prefix}.two_factor`;
+    /** Which locked sign-in a route needs: a password sign-in, the completion of a challenge, or neither. */
+    const signInKind = (path, headers) => passwordRoute.test(path) ? 'password' : challengeRoute.test(path) && cookieFrom(headers, challengeCookie) !== undefined ? 'twoFactor' : undefined;
     if (!locking)
         return Object.assign(auth, helpers);
     // On the instance the app holds, better-auth's own password sign-in has no limit, no lock and no constant-cost check,
     // so it is off: the route (any case, any trailing slash) answers 404 and api.signInEmail throws.
+    // A sign-in's two-factor challenge is completed only through verifyTwoFactor, under the account's lock, for the same
+    // reason; verification with a session (enabling two-factor) carries no challenge cookie and still goes through.
     if (options.allowRawPasswordSignIn !== true) {
         const route = auth.handler.bind(auth);
-        const routed = (request) => passwordRoute.test(new URL(request.url).pathname) ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
+        const routed = (request) => signInKind(new URL(request.url).pathname, request.headers) ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
         Object.assign(auth, { handler: routed, fetch: routed });
-        Object.assign(auth.api, { signInEmail() { throw new TypeError('Password sign-in is only supported through signInWithPassword.'); } });
+        const api = auth.api;
+        Object.assign(api, { signInEmail() { throw new TypeError('Password sign-in is only supported through signInWithPassword.'); } });
+        for (const name of twoFactorEndpoints) {
+            const original = api[name];
+            if (typeof original === 'function')
+                api[name] = input => {
+                    if (cookieFrom(input?.headers, challengeCookie) !== undefined)
+                        throw new TypeError('A two-factor sign-in challenge is only completed through verifyTwoFactor.');
+                    return original(input);
+                };
+        }
     }
     const { lockTimeoutMs = 5000 } = options;
     if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000)
@@ -491,7 +513,7 @@ function build(options, keys, locking, internal = {}) {
      * held). When `run` settles, before COMMIT, the view and the instance close: a later or un-awaited call throws
      * LockedAuthClosedError instead of running outside the lock on a connection back in the pool.
      */
-    const bind = async (tx, hold, run, passwordSignIn = false) => {
+    const bind = async (tx, hold, run, allowed) => {
         // drizzle-orm internals, as transaction() in ./db reads them; drizzle-orm is pinned exactly for this reason.
         const { dialect, _: { session: inner } } = tx;
         const connection = inner.client;
@@ -508,32 +530,39 @@ function build(options, keys, locking, internal = {}) {
             },
         });
         const callbackTx = new NodePgTransaction(dialect, new NodePgSession(guarded, dialect, inner.schema, inner.options), inner.schema);
-        // For signInWithPassword: the account better-auth's sign-in created a session for, to compare with the locked one.
+        // For signInWithPassword and verifyTwoFactor: the account better-auth's sign-in created a session for, to compare
+        // with the locked one.
         let signedIn;
-        const bound = build({ ...options, database: transactionDatabase(callbackTx) }, keys, false, passwordSignIn ? { signedIn(userId) { signedIn = userId; } } : {});
+        const bound = build({ ...options, database: transactionDatabase(callbackTx) }, keys, false, allowed ? { signedIn(userId) { signedIn = userId; } } : {});
         Object.defineProperty(bound, signedInUser, { value: () => signedIn });
         // signInEmail holds this transaction's connection and lock while it hashes; only signInWithPassword, after its own
-        // check outside any transaction, may call it here.
-        const stalls = 'Password sign-in inside a locked-auth transaction holds a pool connection while it hashes; use signInWithPassword.';
-        const check = (signIn) => {
+        // check outside any transaction, may call it here. A challenge is completed only by verifyTwoFactor, which checks
+        // the account first.
+        const refusals = {
+            password: 'Password sign-in inside a locked-auth transaction holds a pool connection while it hashes; use signInWithPassword.',
+            twoFactor: 'A two-factor sign-in challenge is only completed through verifyTwoFactor.',
+        };
+        const check = (kind) => {
             if (!open)
                 throw closed();
-            if (signIn && !passwordSignIn)
-                throw new TypeError(stalls);
+            if (kind && kind !== allowed)
+                throw new TypeError(refusals[kind]);
         };
+        const apiKind = (key, input) => key === 'signInEmail' ? 'password'
+            : twoFactorEndpoints.includes(key) && cookieFrom(input?.headers, challengeCookie) !== undefined ? 'twoFactor' : undefined;
         const api = bound.api;
         const handler = bound.handler.bind(bound);
         Object.assign(bound, {
             userId: hold.userId,
             api: new Proxy(api, { get(target, key) {
                     const value = target[key];
-                    return typeof value === 'function' ? (...args) => { check(key === 'signInEmail'); return value.apply(target, args); } : value;
+                    return typeof value === 'function' ? (...args) => { check(apiKind(key, args[0])); return value.apply(target, args); } : value;
                 } }),
-            handler(request) { check(passwordRoute.test(new URL(request.url).pathname)); return handler(request); },
+            handler(request) { check(signInKind(new URL(request.url).pathname, request.headers)); return handler(request); },
             // better-auth's fetch is the same handler; it gets the same checks.
-            fetch(request) { check(passwordRoute.test(new URL(request.url).pathname)); return handler(request); },
+            fetch(request) { check(signInKind(new URL(request.url).pathname, request.headers)); return handler(request); },
             async revokeAllSessions() {
-                check(false);
+                check(undefined);
                 if (hold.userId === undefined)
                     return;
                 const store = await storeOf(bound);
@@ -567,12 +596,12 @@ function build(options, keys, locking, internal = {}) {
         const outside = {};
         if (await getCurrentAdapter(outside) !== outside)
             throw new TypeError('withLockedAuth cannot run inside a better-auth request or hook.');
-        await emailIndex(db);
+        await schemaOf(db);
     };
     // Parameterised raw statements by necessity: Drizzle has no builder for set_config or advisory locks. The timeout comes
     // first, so the lock statements that follow cannot wait forever.
     const limitLockWaits = (tx) => tx.execute(sql `SELECT set_config('lock_timeout', ${`${lockTimeoutMs}ms`}, true)`);
-    const byEmail = (db, address, run, passwordSignIn) => transaction(db, async (tx) => {
+    const byEmail = (db, address, run, allowed) => transaction(db, async (tx) => {
         await limitLockWaits(tx);
         await tx.execute(sql `SELECT pg_advisory_xact_lock(${emailLockKey}, hashtext(${address}))`);
         // lower() on both sides, as user_email_normalized_idx is defined, whatever JavaScript's lowercasing did. That index
@@ -580,7 +609,7 @@ function build(options, keys, locking, internal = {}) {
         const rows = await tx.select({ id: userTable.id }).from(userTable).where(sql `lower(${userTable.email}) = lower(${address})`).for('no key update');
         if (rows.length > 1)
             throw new AmbiguousAccountError();
-        return bind(tx, { userId: rows[0]?.id, email: address }, (auth, bound) => run(auth, bound, rows[0]?.id), passwordSignIn);
+        return bind(tx, { userId: rows[0]?.id, email: address }, (auth, bound) => run(auth, bound, rows[0]?.id), allowed);
     });
     /**
      * The id of the attempt row claimed for this browser's known device of the account behind `address`, or undefined.
@@ -610,7 +639,7 @@ function build(options, keys, locking, internal = {}) {
             if (await adapter.count({ model: 'verification', where: [{ field: 'identifier', value: attemptRow(entry.deviceId) }] }) >= device.attempts)
                 return undefined;
             return (await internalAdapter.createVerificationValue({ identifier: attemptRow(entry.deviceId), value: userId, expiresAt })).id;
-        }, false).catch(error => { if (error instanceof AmbiguousAccountError)
+        }).catch(error => { if (error instanceof AmbiguousAccountError)
             return undefined; throw error; });
     };
     const locked = {
@@ -631,7 +660,7 @@ function build(options, keys, locking, internal = {}) {
             if (typeof email !== 'string')
                 throw new TypeError('withLockedAuthByEmail needs an email.');
             // Normalised as the team controller's lockEmail does, so both take the same advisory lock.
-            return byEmail(db, email.trim().toLowerCase(), run, false);
+            return byEmail(db, email.trim().toLowerCase(), run);
         },
         async signInWithPassword(db, input, limit) {
             if (typeof limit !== 'function')
@@ -709,7 +738,7 @@ function build(options, keys, locking, internal = {}) {
                             await replaceLegacyHash(tx, account.id, password);
                     }
                     return signedIn;
-                }, true);
+                }, 'password');
             }
             catch (error) {
                 if (error instanceof LockedAccountMismatch || error instanceof AmbiguousAccountError)
@@ -722,6 +751,45 @@ function build(options, keys, locking, internal = {}) {
             return response.status === 401 ? refused() : response;
         },
         assertEmailIndex: db => emailIndex(db),
+        assertSchema: db => schemaOf(db),
+        async verifyTwoFactor(db, request) {
+            await ready(db, () => undefined);
+            if (!(request instanceof Request) || !challengeRoute.test(new URL(request.url).pathname))
+                throw new TypeError('verifyTwoFactor completes a request to /two-factor/verify-totp, -backup-code or -otp.');
+            // The challenge the signed two_factor cookie names, and the account it was issued for.
+            const identifier = signedValue(cookieFrom(request.headers, challengeCookie), secret);
+            const challenge = identifier === undefined ? null
+                : await (await storeOf(auth)).adapter.findOne({ model: 'verification', where: [{ field: 'identifier', value: identifier }] });
+            if (!challenge || !(new Date(challenge.expiresAt).getTime() > Date.now()))
+                return challengeRefused();
+            let response;
+            try {
+                response = await transaction(db, async (tx) => {
+                    await limitLockWaits(tx);
+                    const [row] = await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, challenge.value)).for('no key update');
+                    if (!row)
+                        return challengeRefused();
+                    return bind(tx, { userId: row.id, email: undefined }, async (bound, boundTx) => {
+                        // An account closed (or otherwise refused) after its challenge was issued does not complete the sign-in.
+                        const [account] = await boundTx.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt }).from(userTable).where(eq(userTable.id, row.id));
+                        if (!account || await usable(account) !== true)
+                            return challengeRefused();
+                        const verified = await bound.handler(request);
+                        if (verified.ok && bound[signedInUser]() !== account.id)
+                            throw new LockedAccountMismatch();
+                        return verified;
+                    }, 'twoFactor');
+                });
+            }
+            catch (error) {
+                if (error instanceof LockedAccountMismatch)
+                    return challengeRefused();
+                if (error instanceof TransactionRolledBackError)
+                    return refusal(500, 'SIGN_IN_FAILED', 'Sign-in failed. Try again.');
+                throw error;
+            }
+            return response.status === 401 ? challengeRefused() : response;
+        },
     };
     /** The isAccountUsable hook, refusing a closed account by default. */
     const usable = (account) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
@@ -759,6 +827,31 @@ const modernDummy = () => (dummyModernHash ??= hashPassword('ten98-timing-equali
 const lockedContext = new AsyncLocalStorage();
 /** better-auth's password route, in any case and with any trailing slash. */
 const passwordRoute = /\/sign-in\/email\/*$/i;
+/** The two-factor routes that complete a sign-in's challenge, in any case and with any trailing slash. */
+const challengeRoute = /\/two-factor\/verify-(?:totp|backup-code|otp)\/*$/i;
+const twoFactorPaths = new Set(['/two-factor/verify-totp', '/two-factor/verify-backup-code', '/two-factor/verify-otp']);
+/** The two-factor plugin's server calls for those routes. */
+const twoFactorEndpoints = ['verifyTOTP', 'verifyBackupCode', 'verifyTwoFactorOTP'];
+/** The value of a cookie better-call signed with `secret`, or undefined when it is missing, malformed or forged. */
+function signedValue(cookie, secret) {
+    if (cookie === undefined || cookie.length > 512)
+        return undefined;
+    let decoded;
+    try {
+        decoded = decodeURIComponent(cookie);
+    }
+    catch {
+        return undefined;
+    }
+    const at = decoded.lastIndexOf('.');
+    if (at < 1)
+        return undefined;
+    const value = decoded.slice(0, at), signature = Buffer.from(decoded.slice(at + 1));
+    const expected = Buffer.from(createHmac('sha256', secret).update(value).digest('base64'));
+    return signature.length === expected.length && timingSafeEqual(signature, expected) ? value : undefined;
+}
+/** One answer for a challenge that is unknown, expired or for an account that may not sign in, and for a wrong code. */
+const challengeRefused = () => refusal(401, 'INVALID_TWO_FACTOR', 'Invalid two-factor code or challenge.');
 /** Where a bound instance keeps the account its password sign-in created a session for. */
 const signedInUser = Symbol('ten98.auth.signedInUser');
 /** better-auth signed in another account than the one signInWithPassword locked; thrown so the transaction rolls back. */
@@ -773,6 +866,57 @@ export class AmbiguousAccountError extends Error {
 export class MissingEmailIndexError extends Error {
     code = 'MISSING_EMAIL_INDEX';
     constructor() { super('The user table needs a unique index on lower(email) (user_email_normalized_idx in workspace-team.sql) before locked auth can run.'); this.name = 'MissingEmailIndexError'; }
+}
+/** The tables and columns locked auth reads or writes directly, as workspace-team.sql and better-auth's schema name them. */
+const schemaTables = {
+    user: [userTable.id.name, userTable.email.name, userTable.closedAt.name],
+    account: [accountTable.userId.name, accountTable.providerId.name, accountTable.password.name, accountTable.updatedAt.name],
+    session: ['id', 'token', 'userId', 'expiresAt'],
+    verification: ['id', 'identifier', 'value', 'expiresAt'],
+};
+/** The schema is not the one locked auth uses: the tables or columns it names are missing. */
+export class SchemaMismatchError extends Error {
+    code = 'AUTH_SCHEMA_MISMATCH';
+    missing;
+    constructor(missing) {
+        const expected = Object.entries(schemaTables).map(([table, columns]) => `${table === 'user' ? '"user"' : table} (${columns.join(', ')})`).join(', ');
+        super(`Locked auth needs the tables ${expected}. Missing: ${missing.join('; ')}. An app whose tables have other names (users, accounts, sessions, verifications) must rename or map them before adopting.`);
+        this.name = 'SchemaMismatchError';
+        this.missing = missing;
+    }
+}
+const schemaChecks = new WeakMap();
+/** The tables and columns, then the email index; cached per database like the index check. */
+function schemaOf(db) {
+    let check = schemaChecks.get(db);
+    if (!check) {
+        // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
+        check = db.execute(sql `SELECT t.name, a.attname AS "column" FROM unnest(string_to_array(${Object.keys(schemaTables).join(',')}, ',')) AS t(name)
+        LEFT JOIN pg_attribute a ON a.attrelid = to_regclass(quote_ident(t.name)) AND a.attnum > 0 AND NOT a.attisdropped`)
+            .then(result => {
+            const found = new Map();
+            for (const { name, column } of result.rows) {
+                const columns = found.get(name) ?? new Set();
+                if (column)
+                    columns.add(column);
+                found.set(name, columns);
+            }
+            const missing = Object.entries(schemaTables).flatMap(([table, columns]) => {
+                const present = found.get(table);
+                const label = table === 'user' ? '"user"' : table;
+                if (!present?.size)
+                    return [`table ${label}`];
+                return columns.filter(column => !present.has(column)).map(column => `${label}.${column}`);
+            });
+            if (missing.length)
+                throw new SchemaMismatchError(missing);
+        })
+            .then(() => emailIndex(db));
+        check.catch(error => { if (!(error instanceof SchemaMismatchError || error instanceof MissingEmailIndexError))
+            schemaChecks.delete(db); });
+        schemaChecks.set(db, check);
+    }
+    return check;
 }
 // One check per database object. A missing index is remembered, so every later call is refused too; a failed query is
 // not, so a transient error is retried.

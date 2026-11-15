@@ -248,6 +248,21 @@ export interface Ten98Auth {
      * otherwise. Call it at start-up; every locked call also checks it once per database and refuses to run without it.
      */
     assertEmailIndex(db: AnyDatabase): Promise<void>;
+    /**
+     * The start-up check: resolves when the tables `"user"`, `account`, `session` and `verification` have the columns the
+     * preset uses and the user table has its unique index on `lower(email)`; otherwise rejects with SchemaMismatchError
+     * (naming the expected and the missing tables and columns) or MissingEmailIndexError. Every locked call runs it once
+     * per database too, so a wrong schema fails loudly, never as a refused sign-in.
+     */
+    assertSchema(db: AnyDatabase): Promise<void>;
+    /**
+     * Completes a sign-in's two-factor challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
+     * `two_factor` cookie) under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge that is
+     * unknown or expired, gets one uniform 401, and a session for any other account rolls back. The instance the app holds
+     * refuses a challenge outside it. Pass the request as received; verification with a session (enabling two-factor) still
+     * goes to `handler`.
+     */
+    verifyTwoFactor(db: AnyDatabase, request: Request): Promise<Response>;
 }
 /** `signInWithPassword`'s input; `headers` are the request's: its origin, its cookies, its user agent and address. */
 export type PasswordSignIn = {
@@ -272,7 +287,7 @@ export type PasswordAttempt = {
  * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
  * in with a password (use `signInWithPassword`), and throws LockedAuthClosedError once the callback has returned.
  */
-export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword' | 'assertEmailIndex'> {
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword' | 'assertEmailIndex' | 'assertSchema' | 'verifyTwoFactor'> {
     /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
     readonly userId: string | undefined;
     /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
@@ -294,4 +309,10 @@ export declare class AmbiguousAccountError extends Error {
 export declare class MissingEmailIndexError extends Error {
     readonly code: 'MISSING_EMAIL_INDEX';
     constructor();
+}
+/** The schema is not the one locked auth uses: the tables or columns it names are missing. */
+export declare class SchemaMismatchError extends Error {
+    readonly code: 'AUTH_SCHEMA_MISMATCH';
+    readonly missing: readonly string[];
+    constructor(missing: readonly string[]);
 }

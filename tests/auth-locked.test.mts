@@ -9,7 +9,7 @@ import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { boolean, integer, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
 import pg from 'pg';
-import { AmbiguousAccountError, createTen98Auth, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError, tokenStorageUpgradeStatements } from '../auth.mjs';
+import { AmbiguousAccountError, createTen98Auth, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError, SchemaMismatchError, tokenStorageUpgradeStatements } from '../auth.mjs';
 import type { PasswordAttempt, Ten98Auth, Ten98AuthOptions } from '../auth.mjs';
 import { transaction, TransactionRolledBackError, user } from '../db.mjs';
 import { createWorkspaceTeam } from '../index.mjs';
@@ -854,8 +854,11 @@ test('a session better-auth creates for any other account than the locked one is
 test('locked auth refuses to run without the unique index on lower(email), and refuses two matching accounts', { skip }, async () => {
   assert.equal(await auth.assertEmailIndex(db), undefined);
   // A schema without the index, holding case-variant twins.
+  // Every other table the schema check asks for is there, so only the index is missing.
   await pool!.query(`CREATE SCHEMA bare; CREATE TABLE bare."user" (LIKE public."user" INCLUDING DEFAULTS); CREATE TABLE bare.account (LIKE public.account INCLUDING DEFAULTS);
-    CREATE SCHEMA dropped; CREATE TABLE dropped."user" (LIKE public."user" INCLUDING ALL); CREATE TABLE dropped.account (LIKE public.account INCLUDING ALL);`);
+    CREATE TABLE bare.session (LIKE public.session INCLUDING ALL); CREATE TABLE bare.verification (LIKE public.verification INCLUDING ALL);
+    CREATE SCHEMA dropped; CREATE TABLE dropped."user" (LIKE public."user" INCLUDING ALL); CREATE TABLE dropped.account (LIKE public.account INCLUDING ALL);
+    CREATE TABLE dropped.session (LIKE public.session INCLUDING ALL); CREATE TABLE dropped.verification (LIKE public.verification INCLUDING ALL);`);
   const twins = async (schemaName: string) => {
     const base = `twin-${randomUUID()}@example.com`;
     for (const variant of [base, base.replace('twin', 'Twin')]) {
@@ -951,4 +954,102 @@ test('the instance an app holds refuses password sign-in on its route and api; t
     assert.throws(() => (bound as unknown as { fetch(request: Request): unknown }).fetch(new Request(`${ORIGIN}/api/auth/sign-in/email`, { method: 'POST' })), /signInWithPassword/);
   });
   assert.equal(await sessions(id), 0);
+});
+
+// RFC 6238 TOTP from an otpauth URI, as an authenticator app computes it.
+function totp(uri: string, offset = 0): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  for (const char of new URL(uri).searchParams.get('secret')!.replace(/=+$/, '')) bits += alphabet.indexOf(char).toString(2).padStart(5, '0');
+  const key = Buffer.from(bits.match(/.{8}/g)!.map(byte => parseInt(byte, 2)));
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30_000) + offset));
+  const digest = createHmac('sha1', key).update(counter).digest();
+  const at = digest[digest.length - 1]! & 15;
+  return String((digest.readUInt32BE(at) & 0x7fffffff) % 1_000_000).padStart(6, '0');
+}
+const post = (path: string, cookie: string, body: unknown) => new Request(`${ORIGIN}/api/auth${path}`, {
+  method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN, ...(cookie ? { cookie } : {}) }, body: JSON.stringify(body),
+});
+// An account with TOTP enrolled through the preset (enabling needs a session, not a challenge), and its pending challenge.
+async function challenged(label: string) {
+  const email = address(label);
+  const id = await account_(email);
+  const session = cookieOf(await signIn(email));
+  const { totpURI } = await (await auth.handler(post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string };
+  assert.equal((await auth.handler(post('/two-factor/verify-totp', session, { code: totp(totpURI) }))).status, 200);
+  const challenge = await signIn(email);
+  assert.equal((await challenge.clone().json() as { twoFactorRedirect?: boolean }).twoFactorRedirect, true);
+  return { email, id, uri: totpURI, challenge: cookieOf(challenge) };
+}
+
+test('an account closed after its two-factor challenge does not complete the sign-in, nor get a known device', { skip }, async () => {
+  const open = await challenged('factor-open');
+  const before = await sessions(open.id);
+  const completed = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', open.challenge, { code: totp(open.uri, 1) }));
+  assert.equal(completed.status, 200);
+  assert.equal(await sessions(open.id), before + 1);
+  assert.ok(issued(completed));
+  const closed = await challenged('factor-closed');
+  const sessionsBefore = await sessions(closed.id);
+  // The sign-in that enrolled the factor (before two-factor was on) issued one; the refused completion adds none.
+  const devicesBefore = (await deviceRows(closed.id)).filter(identifier => identifier.startsWith('known-device:')).length;
+  await pool!.query('UPDATE "user" SET closed_at = now() WHERE id = $1', [closed.id]);
+  const refused = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', closed.challenge, { code: totp(closed.uri, 1) }));
+  // The same answer as a wrong code, no session and no known-device entry.
+  const again = cookieOf(await signIn(open.email));
+  const wrongCode = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', again, { code: '000000' }));
+  assert.deepEqual(await answer(refused), await answer(wrongCode));
+  assert.equal(refused.status, 401);
+  assert.equal(issued(refused), false);
+  assert.equal(await sessions(closed.id), sessionsBefore);
+  assert.equal((await deviceRows(closed.id)).filter(identifier => identifier.startsWith('known-device:')).length, devicesBefore);
+});
+
+test('the instance an app holds refuses a sign-in challenge outside verifyTwoFactor; the bound one too', { skip }, async () => {
+  const pending = await challenged('factor-raw');
+  for (const path of ['/two-factor/verify-totp', '/two-factor/verify-totp/', '/Two-Factor/Verify-Backup-Code']) {
+    assert.equal((await auth.handler(post(path, pending.challenge, { code: totp(pending.uri, 1) }))).status, 404, path);
+  }
+  const api = auth.api as unknown as { verifyTOTP(input: { body: { code: string }; headers: HeadersInit }): unknown };
+  assert.throws(() => api.verifyTOTP({ body: { code: totp(pending.uri, 1) }, headers: { cookie: pending.challenge } }), /verifyTwoFactor/);
+  await auth.withLockedAuth(db, pending.id, async bound => {
+    assert.throws(() => bound.handler(post('/two-factor/verify-totp', pending.challenge, { code: totp(pending.uri, 1) })), /verifyTwoFactor/);
+  });
+  // The challenge is still usable through verifyTwoFactor.
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', pending.challenge, { code: totp(pending.uri, 1) }))).status, 200);
+});
+
+test('assertSchema fails at start-up on campaign-style table names, naming the expected and the missing ones', { skip }, async () => {
+  assert.equal(await auth.assertSchema(db), undefined);
+  await pool!.query(`CREATE SCHEMA campaign;
+    CREATE TABLE campaign.users (id text PRIMARY KEY, email text NOT NULL, closed_at timestamptz);
+    CREATE TABLE campaign.accounts (id text PRIMARY KEY, user_id text, provider_id text, password text, updated_at bigint);
+    CREATE TABLE campaign.sessions (id text PRIMARY KEY, token text, user_id text, expires_at bigint);
+    CREATE TABLE campaign.verifications (id text PRIMARY KEY, identifier text, value text, expires_at bigint);
+    CREATE SCHEMA partial; CREATE TABLE partial."user" (LIKE public."user" INCLUDING ALL); ALTER TABLE partial."user" DROP COLUMN closed_at;
+    CREATE TABLE partial.account (LIKE public.account INCLUDING ALL); CREATE TABLE partial.session (LIKE public.session INCLUDING ALL);
+    CREATE TABLE partial.verification (LIKE public.verification INCLUDING ALL);`);
+  const pools = ['campaign', 'partial'].map(name => new pg.Pool({ connectionString: url, max: 2, options: `-c search_path=${name}` }));
+  try {
+    const [campaignDb, partialDb] = pools.map(item => drizzle(item, { schema }));
+    const campaignAuth = authOver(campaignDb!);
+    const mismatch = (pattern: RegExp) => (error: unknown) => error instanceof SchemaMismatchError && error.code === 'AUTH_SCHEMA_MISMATCH' && pattern.test(error.message);
+    const names = /Locked auth needs the tables "user" \(id, email, closed_at\), account \(userId, providerId, password, updatedAt\), session \(id, token, userId, expiresAt\), verification \(id, identifier, value, expiresAt\)\. Missing: table "user"; table account; table session; table verification\./;
+    await assert.rejects(campaignAuth.assertSchema(campaignDb!), mismatch(names));
+    // Not a refused sign-in at first use: the same loud error.
+    await assert.rejects(campaignAuth.signInWithPassword(campaignDb!, { source: SOURCE, email: address('campaign'), password: PASSWORD }, allow), mismatch(names));
+    await assert.rejects(campaignAuth.withLockedAuth(campaignDb!, randomUUID(), async () => 1), mismatch(names));
+    await assert.rejects(authOver(partialDb!).assertSchema(partialDb!), mismatch(/Missing: "user"\.closed_at\./));
+  } finally { await Promise.all(pools.map(item => item.end())); }
+});
+
+test('an account keeps at most five known devices: a sixth browser evicts the oldest', { skip }, async () => {
+  const email = address('browsers');
+  const id = await account_(email);
+  const browsers: ReturnType<typeof jar>[] = [];
+  for (let at = 0; at < 6; at++) browsers.push(jar().take(await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)));
+  assert.equal((await deviceRows(id)).filter(identifier => identifier.startsWith('known-device:')).length, 5);
+  assert.equal((await knownAs(browsers[0]!, email)).known, false);
+  assert.equal((await knownAs(browsers[5]!, email)).known, true);
 });
