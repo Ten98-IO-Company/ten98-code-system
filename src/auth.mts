@@ -917,27 +917,27 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads.
       const release = await slots();
       if (!release) { await unclaim(); return refusal(503, 'SIGN_IN_BUSY', 'Sign-in is busy. Try again shortly.', { 'retry-after': '1' }); }
-      let verified: boolean;
+      let verified: boolean, stored: { id: string; email: string; closedAt: Date | null; password: string | null } | undefined;
       try {
         // 3. One short pool read; its connection is back in the pool before any hashing starts.
-        const [stored] = await db.select({ password: accountTable.password }).from(userTable)
+        [stored] = await db.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt, password: accountTable.password }).from(userTable)
           .leftJoin(accountTable, and(eq(accountTable.userId, userTable.id), eq(accountTable.providerId, 'credential')))
           .where(sql`lower(${userTable.email}) = lower(${address})`).limit(1);
         verified = await verifyStoredPassword(stored?.password, password, legacyPasswords);
       } finally { release(); }
       if (!verified) return refused();
+      // An account that may not sign in is refused here, at a wrong password's cost, rather than after the lock; the lock
+      // asks again, for an account closed in between.
+      if (await usable({ id: stored!.id, email: stored!.email, closedAt: stored!.closedAt }) !== true) return refused();
       // 4. Only a correct password takes the lock; better-auth verifies again there and creates the session, for the
       // locked account only.
       let response: Response;
       try {
         response = await byEmail(db, address, async (bound, tx, userId) => {
-          // No account under the lock (its email moved before the lock was granted), or one that may not sign in: the
-          // uniform 401, after the derivation the sign-in would have cost.
+          // No account under the lock (its email moved before the lock was granted), or one closed since the check above:
+          // the uniform 401.
           const [account] = userId === undefined ? [] : await tx.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt }).from(userTable).where(eq(userTable.id, userId));
-          if (!account || await usable(account) !== true) {
-            await lockedCost(password);
-            return refused();
-          }
+          if (!account || await usable(account) !== true) return refused();
           const signedIn = await bound.api.signInEmail({ body: { email: address, password, ...(rememberMe === undefined ? {} : { rememberMe }) }, ...(headers === undefined ? {} : { headers }), asResponse: true });
           if (signedIn.ok) {
             // A session (or challenge) for any other account than the locked one rolls the transaction back.
@@ -989,11 +989,6 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   };
   /** The isAccountUsable hook, refusing a closed account by default. */
   const usable = (account: { id: string; email: string; closedAt: Date | null }) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
-  /** What better-auth's own check under the lock costs: both verifiers with legacy hashes accepted, else the current one. */
-  const lockedCost = async (candidate: string) => {
-    if (legacyPasswords) await verifyStoredPassword(undefined, candidate, true);
-    else await verifyPassword({ hash: await modernDummy(), password: candidate }).catch(() => false);
-  };
   /**
    * Replaces a legacy hash once, under the lock, in a savepoint: a failure (a trigger, a constraint) rolls back the
    * savepoint only, so the sign-in stands and the next one retries.
@@ -1092,23 +1087,28 @@ function schemaOf(db: AnyDatabase): Promise<void> {
         if (missing.length) throw new SchemaMismatchError(missing);
       })
       .then(() => emailIndex(db));
-    check.catch(error => { if (!(error instanceof SchemaMismatchError || error instanceof MissingEmailIndexError)) schemaChecks.delete(db); });
+    check.catch(() => schemaChecks.delete(db));
     schemaChecks.set(db, check);
   }
   return check;
 }
 
-// One check per database object. A missing index is remembered, so every later call is refused too; a failed query is
-// not, so a transient error is retried.
+// One check per database object. Only a pass is remembered: a refusal, or a failed query, is checked again on the next
+// call, so fixing the schema needs no restart.
 const emailIndexChecks = new WeakMap<object, Promise<void>>();
 function emailIndex(db: AnyDatabase): Promise<void> {
   let check = emailIndexChecks.get(db);
   if (!check) {
     // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
     check = db.execute(sql`SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${`"${getTableName(userTable)}"`})
-        AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indnatts = 1 AND pg_get_expr(i.indexprs, i.indrelid) = 'lower(email)') AS indexed`)
+        AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indnatts = 1 AND (
+          -- lower(email) on a text column, or lower(email::text) on a varchar one
+          pg_get_expr(i.indexprs, i.indrelid) IN ('lower(email)', 'lower((email)::text)')
+          -- or a plain unique index on a citext email column, which compares case-insensitively itself
+          OR (i.indexprs IS NULL AND EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+            WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[0] AND a.attname = 'email' AND t.typname = 'citext')))) AS indexed`)
       .then(result => { if ((result as unknown as { rows: { indexed: boolean }[] }).rows[0]?.indexed !== true) throw new MissingEmailIndexError(); });
-    check.catch(error => { if (!(error instanceof MissingEmailIndexError)) emailIndexChecks.delete(db); });
+    check.catch(() => emailIndexChecks.delete(db));
     emailIndexChecks.set(db, check);
   }
   return check;

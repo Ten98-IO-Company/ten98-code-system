@@ -496,20 +496,21 @@ test('signInWithPassword costs the same for unknown, current, legacy and passwor
   await account_(none, { hash: null });
   // Wall time and process CPU time (all threads, so both scrypt derivations count): the two run in parallel, so a
   // skipped dummy derivation shows in the work done even where the slower one hides it from the latency.
-  const median = async (email: string) => {
-    const times: number[] = [], work: number[] = [];
-    for (let attempt = 0; attempt < 7; attempt++) {
+  // Interleaved, so load drifting over the run touches the four cases alike; the first two rounds warm up.
+  const cases = [address('nobody'), current, legacy, none];
+  const samples = cases.map(() => ({ times: [] as number[], work: [] as number[] }));
+  for (let round = 0; round < 9; round++) {
+    for (const [at, email] of cases.entries()) {
       const started = performance.now(), cpu = process.cpuUsage();
       assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: 'wrong password guess' }, allow)).status, 401);
       const used = process.cpuUsage(cpu);
-      times.push(performance.now() - started);
-      work.push((used.user + used.system) / 1000);
+      if (round < 2) continue;
+      samples[at]!.times.push(performance.now() - started);
+      samples[at]!.work.push((used.user + used.system) / 1000);
     }
-    return [times.sort((a, b) => a - b)[3]!, work.sort((a, b) => a - b)[3]!] as const;
-  };
-  await median(address('warm'));
-  await median(address('warm'));
-  const medians = [await median(address('nobody')), await median(current), await median(legacy), await median(none)];
+  }
+  const middle = (values: number[]) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)]!;
+  const medians = samples.map(({ times, work }) => [middle(times), middle(work)] as const);
   const spread = (values: number[]) => Math.max(...values) / Math.min(...values);
   const shown = medians.map(([time, cpu]) => `${time.toFixed(0)} ms, ${cpu.toFixed(0)} ms CPU`).join(' / ');
   assert.ok(spread(medians.map(([time]) => time)) < 1.6, shown);
@@ -563,7 +564,8 @@ test('60 parallel wrong passwords at one account on a pool of 10: 50 × 401, 10 
     const outcomes = await Promise.all(attempts);
     const tally = (value: string) => outcomes.filter(outcome => outcome === value).length;
     assert.deepEqual([tally('401'), tally('429'), outcomes.filter(outcome => outcome.startsWith('error')).length], [50, 10, 0], [...new Set(outcomes)].join(', '));
-    assert.ok(probe < 1000, `another request waited ${probe.toFixed(0)} ms for a connection`);
+    // A stalled pool kept other requests waiting about 10 s; under a loaded test run a free one answers within 2.5 s.
+    assert.ok(probe < 2500, `another request waited ${probe.toFixed(0)} ms for a connection`);
   } finally { await flood.end(); }
 });
 
@@ -1307,4 +1309,95 @@ test('a first provider sign-in takes the email lock: it waits for a sign-in by e
   assert.equal(waited, true);
   assert.notEqual(await within(provisioner, 10_000), 'timeout');
   assert.equal(await within(byEmail, 10_000), created);
+});
+
+test('a right password on an unusable account answers at a wrong password\'s cost', { skip }, async () => {
+  for (const target of [auth, authOver(db, { legacyPasswords: true })]) {
+    const known = address('parity'), closed = address('parity');
+    await account_(known);
+    const closedId = await account_(closed);
+    await pool!.query('UPDATE "user" SET closed_at = now() WHERE id = $1', [closedId]);
+    // Interleaved, so load drifting over the run touches the three cases alike.
+    const cases = [[known, 'wrong password guess'], [address('nobody'), PASSWORD], [closed, PASSWORD]] as const;
+    const samples = cases.map(() => ({ times: [] as number[], work: [] as number[] }));
+    for (let round = 0; round < 9; round++) {
+      for (const [at, [email, password]] of cases.entries()) {
+        const started = performance.now(), cpu = process.cpuUsage();
+        assert.equal((await target.signInWithPassword(db, { source: SOURCE, email, password }, allow)).status, 401);
+        const used = process.cpuUsage(cpu);
+        if (round < 2) continue;
+        samples[at]!.times.push(performance.now() - started);
+        samples[at]!.work.push((used.user + used.system) / 1000);
+      }
+    }
+    const middle = (values: number[]) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)]!;
+    const medians = samples.map(({ times, work }) => [middle(times), middle(work)] as const);
+    const spread = (values: number[]) => Math.max(...values) / Math.min(...values);
+    const shown = medians.map(([time, cpu]) => `${time.toFixed(0)} ms, ${cpu.toFixed(0)} ms CPU`).join(' / ');
+    // A further derivation for the unusable account would add a third to a half of the work.
+    assert.ok(spread(medians.map(([, cpu]) => cpu)) < 1.3, shown);
+    assert.ok(spread(medians.map(([time]) => time)) < 1.4, shown);
+  }
+});
+
+test('on a database over a single pg Client, a rolled-back transaction is an error too, and locked auth works', { skip }, async () => {
+  const client = new pg.Client({ connectionString: url });
+  await client.connect();
+  try {
+    const single = drizzle(client, { schema });
+    await assert.rejects(transaction(single, async tx => {
+      await tx.execute(sql`CREATE TABLE swallowed (id int)`);
+      await tx.execute(sql`SELECT 1/0`).catch(() => undefined);
+      return 12;
+    }), TransactionRolledBackError);
+    assert.equal((await client.query("SELECT to_regclass('swallowed') AS found")).rows[0].found, null);
+    assert.equal(await transaction(single, async tx => { await tx.execute(sql`SELECT 1`); return 12; }), 12);
+    const email = address('single');
+    const id = await account_(email);
+    const singleAuth = authOver(single as unknown as Database);
+    await assert.rejects(singleAuth.withLockedAuth(single, id, async (_bound, tx) => { await tx.execute(sql`SELECT 1/0`).catch(() => undefined); return 'reported'; }), TransactionRolledBackError);
+    const signedIn = await singleAuth.signInWithPassword(single, { source: SOURCE, email, password: PASSWORD }, allow);
+    assert.equal(signedIn.status, 200);
+    assert.equal(await sessions(id), 1);
+  } finally { await client.end(); }
+});
+
+test('the limiter runs before the verification queue: a refused attempt gets 429 even while the queue is full', { skip }, async () => {
+  const email = address('order');
+  await account_(email);
+  const full = authOver(db, { passwordVerification: { concurrency: 1, queue: 0 } });
+  const busy = full.signInWithPassword(db, { source: SOURCE, email: address('busy'), password: 'wrong password guess' }, allow);
+  await delay(80);
+  let asked = 0;
+  const response = await full.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, () => { asked++; return false; });
+  assert.deepEqual([response.status, asked], [429, 1]);
+  // Negative control: an allowed attempt in the same moment finds the queue full.
+  assert.equal((await full.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).status, 503);
+  await busy;
+});
+
+test('the email index may be lower(email), lower(email::text) on varchar or a unique citext column; a refusal is checked again', { skip }, async () => {
+  await pool!.query('CREATE EXTENSION IF NOT EXISTS citext');
+  const tables = (name: string, emailType: string, index: string) => `CREATE SCHEMA ${name};
+    CREATE TABLE ${name}."user" (LIKE public."user" INCLUDING DEFAULTS); ALTER TABLE ${name}."user" ALTER COLUMN email TYPE ${emailType};
+    ${index}
+    CREATE TABLE ${name}.account (LIKE public.account INCLUDING ALL); CREATE TABLE ${name}.session (LIKE public.session INCLUDING ALL);
+    CREATE TABLE ${name}.verification (LIKE public.verification INCLUDING ALL);`;
+  await pool!.query(tables('vc', 'varchar(320)', 'CREATE UNIQUE INDEX ON vc."user" (lower(email));'));
+  await pool!.query(tables('ci', 'public.citext', 'CREATE UNIQUE INDEX ON ci."user" (email);'));
+  await pool!.query(tables('late', 'text', ''));
+  const { rows } = await pool!.query<{ definition: string }>("SELECT pg_get_expr(i.indexprs, i.indrelid) AS definition FROM pg_index i WHERE i.indrelid = 'vc.\"user\"'::regclass AND i.indexprs IS NOT NULL");
+  assert.equal(rows[0]!.definition, 'lower((email)::text)');
+  const pools = ['vc', 'ci', 'late'].map(name => new pg.Pool({ connectionString: url, max: 2, options: `-c search_path=${name},public` }));
+  try {
+    const [vcDb, ciDb, lateDb] = pools.map(item => drizzle(item, { schema }));
+    assert.equal(await authOver(vcDb!).assertSchema(vcDb!), undefined);
+    assert.equal(await authOver(ciDb!).assertSchema(ciDb!), undefined);
+    const lateAuth = authOver(lateDb!);
+    await assert.rejects(lateAuth.assertSchema(lateDb!), MissingEmailIndexError);
+    // The index added while the app runs: the next call passes, with no restart.
+    await pool!.query('CREATE UNIQUE INDEX ON late."user" (lower(email))');
+    assert.equal(await lateAuth.assertSchema(lateDb!), undefined);
+    assert.equal(await lateAuth.withLockedAuthByEmail(lateDb!, address('none'), async (_bound, _tx, userId) => userId), undefined);
+  } finally { await Promise.all(pools.map(item => item.end())); }
 });
