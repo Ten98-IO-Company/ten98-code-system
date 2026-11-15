@@ -107,6 +107,15 @@ export declare function checkPresentation(directory: string, name: string, { par
 export declare function updatePresentationBaseline(directory: string, name: string, options?: {
     parseAst?: ParseAst;
 }): string[];
+/**
+ * A TanStack Start app takes its error and CSRF defaults from @ten98/runtime/start: src/start.ts exports
+ * `startInstance = createStart(() => ten98StartOptions(...))`, src/client.tsx calls `hydrateTen98Start(...)` at its
+ * top level, and no other source file uses createStart. It applies when the manifest's dependencies list Start, or the
+ * profile requires it and no open transition waives it. Parser-backed; the adoption guide lists what it does not see.
+ */
+export declare function checkStartEntry(directory: string, manifest: PackageManifest, { parseAst }?: {
+    parseAst?: ParseAst;
+}): string[];
 export declare function checkDeployment(directory: string, packageName: string): string[];
 export declare function checkDataAccess(directory: string, packageName: string): string[];
 export declare function updateRawStatementBaseline(directory: string, packageName: string): string[];

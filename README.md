@@ -7,7 +7,7 @@ Shared server-side building blocks for Ten98 apps, so every app gets the same te
 ## Why Code System
 
 - **Fix once, fixed everywhere.** Workspace roles, safe network reads, database migrations, client addresses behind proxies, Amazon SES email and its bounce and complaint feedback are written, reviewed and tested in one place.
-- **No hidden dependencies.** The root entry has no third-party runtime dependencies. Entry points that wrap a library (`./db`, `./tenancy`, `./config`, `./email`, `./auth`) take it as an exact optional peer, which the app installs itself. Apps install the runtime from an immutable, checksummed release archive.
+- **No hidden dependencies.** The root entry has no third-party runtime dependencies. Entry points that wrap a library (`./db`, `./tenancy`, `./config`, `./email`, `./auth`, `./start`) take it as an exact optional peer, which the app installs itself. Apps install the runtime from an immutable, checksummed release archive.
 - **Consistent stack.** One checker keeps Node, TypeScript, React and dependency versions aligned across apps, and blocks new untyped source.
 - **Reuse before rebuilding.** A [feature catalogue](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/features/catalog.json) points to the maintained implementation of features that already exist in a Ten98 app.
 - Open source under the MIT licence.

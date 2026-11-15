@@ -444,6 +444,127 @@ export function updatePresentationBaseline(directory, name, options = {}) {
     writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1)), null, 2)}\n`);
     return [];
 }
+const START = '@tanstack/react-start', START_ENTRY = '@ten98/runtime/start';
+const START_FILE = 'src/start.ts', CLIENT_FILE = 'src/client.tsx';
+// Local names bound by value imports of `name` from `source`; type-only imports bind nothing at run time.
+function importedAs(body, source, name) {
+    const locals = new Set();
+    for (const node of body) {
+        if (node.type !== 'ImportDeclaration' || node.source.value !== source || node.importKind === 'type')
+            continue;
+        for (const specifier of node.specifiers) {
+            if (specifier.type === 'ImportSpecifier' && specifier.importKind !== 'type' && (specifier.imported.name ?? specifier.imported.value) === name)
+                locals.add(specifier.local.name);
+        }
+    }
+    return locals;
+}
+// The createStart references in one file: value imports and re-exports of that name, and calls to a function or
+// method of that name or of one of `aliases`.
+function createStartUses(program, aliases = new Set()) {
+    const uses = { specifiers: 0, calls: 0 };
+    const visit = (node) => {
+        if (Array.isArray(node))
+            return node.forEach(visit);
+        if (!node || typeof node.type !== 'string' || node.importKind === 'type' || node.exportKind === 'type')
+            return;
+        if (node.type === 'ImportSpecifier' || node.type === 'ExportSpecifier') {
+            const name = node.type === 'ImportSpecifier' ? node.imported : node.local;
+            if ((name?.name ?? name?.value) === 'createStart')
+                uses.specifiers++;
+        }
+        else if (node.type === 'CallExpression') {
+            const callee = node.callee;
+            if (callee.type === 'Identifier' ? callee.name === 'createStart' || aliases.has(callee.name) : callee.type === 'MemberExpression' && (callee.property?.name ?? callee.property?.value) === 'createStart')
+                uses.calls++;
+        }
+        for (const value of Object.values(node))
+            if (value && typeof value === 'object')
+                visit(value);
+    };
+    visit(program);
+    return uses;
+}
+// The app's source files outside artifact folders, as forward-slash paths from the app.
+function appSources(directory, roots, skip) {
+    const files = [];
+    const walk = (folder) => {
+        if (!existsSync(folder))
+            return;
+        for (const entry of readdirSync(folder, { withFileTypes: true })) {
+            const file = resolve(folder, entry.name), name = relative(directory, file).replaceAll('\\', '/');
+            if (skip.has(name) || entry.name === 'node_modules')
+                continue;
+            if (entry.isDirectory())
+                walk(file);
+            else if (entry.isFile() && /\.(?:[cm]?[jt]s|[jt]sx)$/u.test(entry.name) && !/\.d\.[cm]?ts$/u.test(entry.name))
+                files.push(name);
+        }
+    };
+    for (const root of roots)
+        walk(resolve(directory, root));
+    return files;
+}
+/**
+ * A TanStack Start app takes its error and CSRF defaults from @ten98/runtime/start: src/start.ts exports
+ * `startInstance = createStart(() => ten98StartOptions(...))`, src/client.tsx calls `hydrateTen98Start(...)` at its
+ * top level, and no other source file uses createStart. It applies when the manifest's dependencies list Start, or the
+ * profile requires it and no open transition waives it. Parser-backed; the adoption guide lists what it does not see.
+ */
+export function checkStartEntry(directory, manifest, { parseAst = resolveParseAst(directory) } = {}) {
+    const resolved = resolveProfile(String(manifest.name));
+    const waived = resolved !== undefined && transitionsFor(resolved.name, 'appStack').some(entry => entry.items?.includes(START));
+    if (manifest.dependencies?.[START] === undefined && (resolved?.profile.dependencies[START] === undefined || waived))
+        return [];
+    if (typeof parseAst !== 'function')
+        return ['Cannot resolve rolldown/parseAst from the consumer; install the pinned build tooling to check the Start entry.'];
+    directory = resolve(directory);
+    const errors = [];
+    const parse = (name) => {
+        try {
+            return parseAst(readFileSync(resolve(directory, name), 'utf8'), { lang: /\.[jt]sx$/u.test(name) ? name.slice(-3) : /\.[cm]?js$/u.test(name) ? 'js' : 'ts' }).body;
+        }
+        catch (error) {
+            errors.push(`${name}: cannot parse for the Start entry check: ${messageOf(error)}`);
+            return undefined;
+        }
+    };
+    const start = existsSync(resolve(directory, START_FILE)) ? parse(START_FILE) : undefined;
+    if (!existsSync(resolve(directory, START_FILE)))
+        errors.push(`${START_FILE} is missing: a Start app exports startInstance = createStart(() => ten98StartOptions(...)) there, with ten98StartOptions from ${START_ENTRY}.`);
+    else if (start) {
+        const createStart = importedAs(start, START, 'createStart'), options = importedAs(start, START_ENTRY, 'ten98StartOptions');
+        const exported = start.some(node => node.type === 'ExportNamedDeclaration' && node.declaration?.type === 'VariableDeclaration' && node.declaration.kind === 'const'
+            && node.declaration.declarations.some((declarator) => {
+                const init = declarator.init, getOptions = init?.arguments?.[0], body = getOptions?.body;
+                return declarator.id.type === 'Identifier' && declarator.id.name === 'startInstance' && init?.type === 'CallExpression' && init.callee.type === 'Identifier' && createStart.has(init.callee.name)
+                    && init.arguments.length === 1 && getOptions.type === 'ArrowFunctionExpression' && getOptions.expression === true
+                    && body.type === 'CallExpression' && body.callee.type === 'Identifier' && options.has(body.callee.name);
+            }));
+        if (!exported)
+            errors.push(`${START_FILE} must export const startInstance = createStart(() => ten98StartOptions(...)), returning ten98StartOptions from ${START_ENTRY} directly, so the shared error serialisation and CSRF middleware cannot be dropped.`);
+        else if (createStartUses(start, createStart).calls !== 1)
+            errors.push(`${START_FILE} must call createStart only once, for startInstance.`);
+    }
+    const client = existsSync(resolve(directory, CLIENT_FILE)) ? parse(CLIENT_FILE) : undefined;
+    if (!existsSync(resolve(directory, CLIENT_FILE)))
+        errors.push(`${CLIENT_FILE} is missing: a Start app calls hydrateTen98Start() from ${START_ENTRY} there.`);
+    else if (client) {
+        const hydrate = importedAs(client, START_ENTRY, 'hydrateTen98Start');
+        if (!client.some(node => node.type === 'ExpressionStatement' && node.expression.type === 'CallExpression' && node.expression.callee.type === 'Identifier' && hydrate.has(node.expression.callee.name))) {
+            errors.push(`${CLIENT_FILE} must call hydrateTen98Start(...) from ${START_ENTRY} at its top level.`);
+        }
+    }
+    const policy = resolved?.profile.sourceLanguage;
+    for (const name of appSources(directory, policy?.roots ?? ['src'], new Set([START_FILE, ...policy?.artifactDirectories ?? []]))) {
+        // Every form counted contains the name, so files without it need no parse.
+        const program = readFileSync(resolve(directory, name), 'utf8').includes('createStart') ? parse(name) : undefined;
+        const uses = program && createStartUses(program);
+        if (uses && uses.specifiers + uses.calls)
+            errors.push(`${name}: createStart belongs in ${START_FILE} only, as createStart(() => ten98StartOptions(...)).`);
+    }
+    return errors;
+}
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 // Container files at the app root and one folder below it (deploy/, docker/), skipping installed and built output.
 function containerFiles(directory, pattern) {
@@ -794,6 +915,8 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
                 errors.push(...checkSourceLanguage(directory, String(manifest.name)));
             if (!errors.length)
                 errors.push(...(update ? updatePresentationBaseline : checkPresentation)(directory, String(manifest.name)));
+            if (!errors.length)
+                errors.push(...checkStartEntry(directory, manifest));
             for (const error of errors)
                 console.error(`${directory}: ${error}`);
             failures += errors.length;

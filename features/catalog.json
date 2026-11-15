@@ -319,6 +319,32 @@
       "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/123",
       "boundary": "One plain-text transactional message over SES, Cloudflare or SMTP in one bounded attempt, with a required suppression decision and a uniform 503 failure. nodemailer is needed for SMTP only. Apps keep message text, the suppression list and its feedback webhook, rate limits and what the user is told."
     },
+    "start": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/start",
+      "entrypoints": [
+        "start.mjs",
+        "start.d.mts"
+      ],
+      "peerDependencies": {
+        "@tanstack/react-start": "1.168.61",
+        "@tanstack/react-router": "1.170.42",
+        "react": "19.2.8",
+        "react-dom": "19.2.8"
+      },
+      "exports": [
+        "ten98StartOptions",
+        "PublicError",
+        "hydrateTen98Start",
+        "ten98RootErrorOptions"
+      ],
+      "tests": [
+        "tests/start.test.mts",
+        "tests/start-check.test.mts"
+      ],
+      "version": "v0.30.0",
+      "boundary": "The error serialisation, server error log and CSRF middleware every TanStack Start app takes through createStart(() => ten98StartOptions()) in src/start.ts, and the client entry hydrateTen98Start() in src/client.tsx; the architecture check refuses a Start app without both. Only a PublicError message reaches the browser. Apps keep their routes, error components, middleware and what the user is told."
+    },
     "presentation": {
       "package": "@ten98/ui",
       "entrypoints": [

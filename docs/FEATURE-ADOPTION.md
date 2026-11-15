@@ -57,6 +57,13 @@ Each framework entry point takes its libraries as exact optional peers, so the a
 - Map `CONFIG_INVALID` to 503, as for `./config`.
 - Discover's two email test changes: the expected Cloudflare value becomes `'unconfirmed'`, and `isSuppressed` moves from the test seam to the send option.
 
+**`@ten98/runtime/start`** (0.30.0; peers `@tanstack/react-start` 1.168.61, `@tanstack/react-router` 1.170.42, `react` and `react-dom` 19.2.8)
+- Add `src/start.ts` holding one line, `export const startInstance = createStart(() => ten98StartOptions())`, and pass the app's own request middleware as `ten98StartOptions({ requestMiddleware: [...] })`. It runs after the CSRF check, which cannot be removed.
+- Add `src/client.tsx` holding `hydrateTen98Start()`.
+- Throw `PublicError` for a message written for the user. Anywhere else, the browser gets a reference. An `errorComponent` also renders on the server with the original error, so show `error.message` only for `error instanceof PublicError`.
+- Pass `reporter` to send server errors somewhere other than the server log, and `hydrateTen98Start({ reporter })` to collect browser errors.
+- The architecture check refuses a Start app without both files, so add them in the same change that moves the app to 0.30.0.
+
 `@ten98/runtime/auth` gains its checklist with the 0.29.0 release. Until then the shipped preset is described in the catalogue's `auth` entry.
 
 ## Row-level security with Drizzle
@@ -162,6 +169,33 @@ Runtime 0.28.0 adds `@ten98/runtime/email`, extracted from discover's and books'
 Changes from the apps: `sendTransactionalEmail(message, env)` becomes `sendTransactionalEmail(message, { env, isSuppressed })`, suppression applies to every transport rather than SES only, a delivered Cloudflare receipt resolves `'unconfirmed'` instead of discover's `'provider-reported-delivered'`, and `EMAIL_TRANSPORT`, `EMAIL_SMTP_TLS`, `EMAIL_SMTP_PORT`, `EMAIL_SES_REGION` and `EMAIL_SES_CONFIGURATION_SET` now accept `_FILE` too. The application still owns its message text, the suppression list and its feedback webhook, rate limits, and what it tells the user.
 
 The adoption checklist is under [Entry-point checklists](#entry-point-checklists). Package tests use injected transports only.
+
+## TanStack Start errors and CSRF
+
+Runtime 0.30.0 adds `@ten98/runtime/start`, with `ten98StartOptions`, `PublicError`, `hydrateTen98Start` and `ten98RootErrorOptions`. Every TanStack Start app calls `ten98StartOptions` once from `src/start.ts` and `hydrateTen98Start` once from `src/client.tsx`; the checklist is under [Entry-point checklists](#entry-point-checklists).
+
+**What the browser gets.** An `Error` thrown in a `beforeLoad`, a loader or a server function, subclasses, `AggregateError` and cause chains included, reaches the browser as a reference only. There it is `new Error('Something went wrong. Reference <id>.')`, with `name` `'Error'` and `reference` set. Nothing else of the original crosses: no message, name, stack, cause, custom field or `digest`. A `PublicError` crosses as its message only, and arrives as a `PublicError`, so `instanceof` holds. Server functions keep Start's default CSRF check: a cross-origin call answers 403. `redirect()` and `notFound()` work as before. In production React's root error callbacks write nothing to the browser console; in development they log the error and its component stack. The optional reporter receives every error in both.
+
+**What the server log contains.** Each replaced error is logged once, as `console.error('Error reference <id>:', error)`, unless `reporter` is given, which receives it instead. Until `./log` ([#142](https://github.com/Ten98-IO-Company/ten98-code-system/issues/142)) is released this is plain `console.error`: Node prints the message, name, stack with server file paths, the cause chain, an `AggregateError`'s errors and every own field, such as `code` or `digest`, and so any value an app or library copied into an error, a query or a URL with credentials among them. Once `./log` is released the line goes through its redaction. The reference is a fresh UUID per error, because Start gives a request no id. When `./log` lands, its `requestId(request)` replaces it at the one place `start.mjs` makes it, read through a server-only function.
+
+**Not covered.**
+- `head()`, `scripts()` and `headers()` errors. The router catches them and passes them to `console.error` on the server and, after a client navigation, in the browser (router-core 1.171.35 `load-server.js:397`, `load-client.js:616`). There is no hook and no adapter on that path, so keep those functions free of code that can throw, or catch inside them.
+- A thrown value that is not an `Error`, such as a string or a plain object, crosses as it is. Throw `Error`s.
+- Server route handlers (`server.handlers`) return their own responses and do not pass through the adapter.
+
+**The architecture check.** For an app whose manifest lists `@tanstack/react-start` in `dependencies`, or whose profile requires it with no open transition waiving it, the check parses with the same `rolldown/parseAst` as the presentation ratchet and fails closed without it. It refuses:
+- a missing `src/start.ts`, or one that does not `export const startInstance = createStart(() => ten98StartOptions(...))` with `ten98StartOptions` imported from `@ten98/runtime/start`, returned directly with no spread, wrapper or edit, and with no second `createStart` call;
+- a missing `src/client.tsx`, or one without a top-level `hydrateTen98Start(...)` call imported from `@ten98/runtime/start`;
+- `createStart` anywhere else under the profile's source roots: a call, a member call, a value import or a re-export. Type-only imports, such as the router generator's, are allowed.
+
+Its limits: it assumes Start's default `src` folder and entry names, so a `srcDirectory` or entry option in `vite.config.ts` is outside it. A `createStart` reached through a destructured dynamic import or an `export *` is not followed. It does not refuse a second `hydrateRoot` elsewhere in the client.
+
+**Version dependence.** These hold for `@tanstack/react-start` 1.168.61 (start-server-core 1.169.40, start-client-core 1.170.35, router-core 1.171.35) and React 19.2.8. Run `tests/start.test.mts` on every bump of any of them, and check each one:
+- Start-instance serialization adapters run ahead of router-core's `ShallowErrorPlugin`, which would otherwise keep the message (`ssr/ssr-server.js:247-248`, `ssr/serializer/seroval-plugins.ssr.js`).
+- Server functions serialise results and errors through Start's adapters (start-server-core `server-functions-handler.js:39, 89-108`; start-client-core `getDefaultSerovalPlugins.js:5-14`).
+- `hydrateTen98Start` copies Start's default client entry, `startTransition` around `hydrateRoot(document, <StrictMode><StartClient /></StrictMode>)` (react-start `dist/plugin/default-entry/client.tsx:5-11`).
+- With a start instance, Start uses only its `requestMiddleware`, and applies its default CSRF middleware only when there is none (start-server-core `createStartHandler.js:21, 302`). The CSRF test fails if Start stops running the start instance's request middleware in that order.
+- Start reads the start instance from the `startInstance` export of `src/start.ts` (`createStartHandler.js:287`).
 
 ## Logging
 
