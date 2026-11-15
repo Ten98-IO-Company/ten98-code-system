@@ -32,10 +32,6 @@
       "types": "./db.d.mts",
       "import": "./db.mjs"
     },
-    "./log": {
-      "types": "./log.d.mts",
-      "import": "./log.mjs"
-    },
     "./tenancy": {
       "types": "./tenancy.d.mts",
       "import": "./tenancy.mjs"
@@ -146,9 +142,6 @@
     "db.mjs",
     "db.d.mts",
     "src/db.mts",
-    "log.mjs",
-    "log.d.mts",
-    "src/log.mts",
     "tenancy.mjs",
     "tenancy.d.mts",
     "src/tenancy.mts",

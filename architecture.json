@@ -722,8 +722,6 @@
           "browser-audit-capsule.d.mts": "Generated declarations from src/browser-audit-capsule.mts.",
           "db.mjs": "Generated PostgreSQL pool and Drizzle entry from src/db.mts, exported as ./db only; needs the optional drizzle-orm and pg peers.",
           "db.d.mts": "Generated declarations from src/db.mts.",
-          "log.mjs": "Generated structured JSON-line logger from src/log.mts, exported as ./log only; Node standard library only.",
-          "log.d.mts": "Generated declarations from src/log.mts.",
           "tenancy.mjs": "Generated row-level security tenancy entry from src/tenancy.mts, exported as ./tenancy only; needs the optional drizzle-orm and pg peers.",
           "tenancy.d.mts": "Generated declarations from src/tenancy.mts.",
           "tenancy-testing.mjs": "Generated test-only scope setter from src/tenancy-testing.mts, exported as ./tenancy/testing only, never from ./tenancy or the root.",
