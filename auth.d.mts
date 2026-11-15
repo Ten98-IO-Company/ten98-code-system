@@ -217,8 +217,10 @@ export interface Ten98Auth {
     withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
     /**
      * The supported password sign-in. A browser request from another site (an Origin other than `appUrl`'s, or a
-     * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: `limit` (the app's per-source and per-account limits, evaluated and counted
-     * before anything else; anything but `true` answers 429); a slot among the bounded verifications (503 when none is
+     * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: whether the browser's known-device
+     * cookie holds a live device of the account behind `email` (`knownDevice`; see the guide); `limit` (the app's
+     * per-source and per-account limits, evaluated and counted before any hash; anything but `true` answers 429; with
+     * `knownDevice` the app may skip only its account-wide bucket); a slot among the bounded verifications (503 when none is
      * free in time); one short pool read of the credential, its connection released; both the modern and the legacy
      * verifier, one of them against a fixed dummy, outside any transaction. A wrong password, an unknown email and an
      * account without a password all get the same 401. Only a correct password enters `withLockedAuthByEmail`, where
@@ -226,16 +228,23 @@ export interface Ten98Auth {
      * password changed in between, the answer is the same 401 and no session is created. The response carries the
      * session cookie, or the two-factor challenge, as `/sign-in/email` does.
      */
-    signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: {
-        email: string;
-    }) => boolean | Promise<boolean>): Promise<Response>;
+    signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: PasswordAttempt) => boolean | Promise<boolean>): Promise<Response>;
 }
-/** `signInWithPassword`'s input; `headers` are the request's, for the session's user agent and address. */
+/** `signInWithPassword`'s input; `headers` are the request's: its origin, its cookies, its user agent and address. */
 export type PasswordSignIn = {
     email: string;
     password: string;
     rememberMe?: boolean;
     headers?: HeadersInit;
+};
+/**
+ * What `signInWithPassword` tells the app's limiter: the normalised email, and whether this browser is a known device of
+ * that account. A known device may skip only the account-wide bucket; it never skips per-source or per-pair limits, and
+ * it never replaces the password.
+ */
+export type PasswordAttempt = {
+    email: string;
+    knownDevice: boolean;
 };
 /**
  * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one

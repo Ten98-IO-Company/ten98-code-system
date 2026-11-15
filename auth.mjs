@@ -8,7 +8,7 @@
 // better-auth on one transaction that holds the user row, so a password change and a sign-in or revocation cannot
 // interleave.
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash, createHmac, hkdfSync, scrypt, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, hkdfSync, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { and, eq, sql } from 'drizzle-orm';
 import { NodePgSession, NodePgTransaction } from 'drizzle-orm/node-postgres';
 import { PgTransaction } from 'drizzle-orm/pg-core';
@@ -63,7 +63,7 @@ export function verifyLegacyScryptHash(hash, password) {
 // Keys for tokens at rest: HKDF-SHA256 over the secret, one label per use, so neither equals the secret or any other key
 // an app derives from it. Rotating the secret ends every session, reset link and trusted device, and makes enrolled
 // second factors (encrypted with the secret itself) unreadable: it is a re-enrolment event.
-const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1' };
+const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1', knownDevice: 'ten98-auth:known-device:v1' };
 const checkedSecret = (secret) => {
     if (typeof secret !== 'string' || secret.length < 32)
         throw new TypeError('The auth secret must be at least 32 characters.');
@@ -72,6 +72,7 @@ const checkedSecret = (secret) => {
 const deriveKeys = (secret) => ({
     verification: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.verification, 32)),
     session: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.session, 32)),
+    knownDevice: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.knownDevice, 32)),
 });
 const mac = (key, value) => createHmac('sha256', key).update(value).digest('base64url');
 const raw = (value) => {
@@ -86,7 +87,7 @@ const tokenHandle = (keys, token) => handlePrefix + mac(keys.session, token);
 // The kept prefixes, longest first where they overlap. An attempt counter names its challenge, so its tail is stored
 // with this same rule and the stored counter is exactly '2fa-attempts-' || <stored challenge identifier>.
 const attemptsPrefix = '2fa-attempts-';
-const keptPrefixes = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:'];
+const keptPrefixes = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:', 'known-device-attempt:', 'known-device:'];
 function storedIdentifier(keys, identifier) {
     let head = '', rest = identifier;
     while (rest.startsWith(attemptsPrefix)) {
@@ -95,6 +96,46 @@ function storedIdentifier(keys, identifier) {
     }
     const prefix = keptPrefixes.find(candidate => rest.startsWith(candidate));
     return head + (prefix ? prefix + mac(keys.verification, rest.slice(prefix.length)) : handlePrefix + mac(keys.verification, rest));
+}
+// Known devices (#132): a browser that completed a sign-in for an account, so `signInWithPassword` can tell the app's
+// limiter to spare it the account-wide bucket. Each is a verification row `known-device:<deviceId>` (value: the user id,
+// expiresAt: its 90 days) with one `known-device-attempt:<deviceId>` row per attempt it was trusted for since its last
+// success; at 5 it is no longer trusted. Both prefixes are kept in storage, so a user's rows go with one prefix filter.
+const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts: 5, entries: 5, cookieLength: 1024 };
+const devicePrefix = 'known-device', deviceRow = (deviceId) => `known-device:${deviceId}`, attemptRow = (deviceId) => `known-device-attempt:${deviceId}`;
+const deviceEntryPattern = /^([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/;
+/** The tag binding a device id to one account: HMAC over userId ‖ deviceId (NUL-separated; neither contains NUL). */
+const deviceTag = (keys, userId, deviceId) => mac(keys.knownDevice, `${userId}\u0000${deviceId}`);
+/**
+ * The cookie's entries, one per account this browser signed in to, newest first and at most `device.entries`. A missing,
+ * oversized or malformed value, or a malformed entry, is ignored, never an error.
+ */
+function deviceEntries(value) {
+    if (typeof value !== 'string' || value.length > device.cookieLength)
+        return [];
+    return value.split('~').slice(0, device.entries).flatMap(text => {
+        const match = deviceEntryPattern.exec(text);
+        return match ? [{ deviceId: match[1], tag: match[2], text }] : [];
+    });
+}
+/** The entry whose tag verifies for `userId`, compared in constant time; undefined when none does. */
+function deviceFor(keys, userId, entries) {
+    let found;
+    for (const entry of entries) {
+        if (timingSafeEqual(Buffer.from(entry.tag), Buffer.from(deviceTag(keys, userId, entry.deviceId))) && !found)
+            found = entry;
+    }
+    return found;
+}
+/** One cookie from a Cookie header; undefined when absent. */
+function cookieFrom(headers, name) {
+    const header = headers === undefined ? null : new Headers(headers).get('cookie');
+    for (const pair of header?.split(';') ?? []) {
+        const at = pair.indexOf('=');
+        if (at > 0 && pair.slice(0, at).trim() === name)
+            return pair.slice(at + 1).trim();
+    }
+    return undefined;
 }
 /**
  * The `verification.identifier` the preset stores for a raw identifier, for an app that locks or reads the row with its
@@ -217,6 +258,8 @@ export class LockedAuthClosedError extends Error {
     constructor(message = 'This locked-auth transaction has ended; await every call inside its callback.') { super(message); this.name = 'LockedAuthClosedError'; }
 }
 const storeOf = (auth) => auth.$context;
+/** Deletes every known-device and attempt row of a user, so no browser of theirs stays trusted. */
+const forgetDevices = (adapter, userId) => adapter.deleteMany({ model: 'verification', where: [{ field: 'value', value: userId }, { field: 'identifier', operator: 'starts_with', value: devicePrefix }] });
 const INT32 = 2 ** 31;
 /**
  * A better-auth instance with the Ten98 policy. Sign-up stays closed: the first-boot claim creates the owner in the
@@ -301,9 +344,55 @@ function build(options, keys, locking) {
                         { field: 'id', operator: 'ne', value: current.id },
                         { field: 'expiresAt', operator: 'gt', value: new Date() },
                     ] });
+                await forgetDevices(adapter, current.userId);
                 return context.json({ status: true, revoked });
             }),
         },
+    };
+    const issueDevice = async (context, userId) => {
+        const cookie = context.context.createAuthCookie(device.cookie, { maxAge: device.lifetimeSeconds });
+        const entries = deviceEntries(context.getCookie(cookie.name));
+        const previous = deviceFor(keys, userId, entries);
+        const adapter = await getCurrentAdapter(context.context.adapter);
+        if (previous) {
+            for (const identifier of [deviceRow(previous.deviceId), attemptRow(previous.deviceId)]) {
+                await adapter.deleteMany({ model: 'verification', where: [{ field: 'identifier', value: identifier }, { field: 'value', value: userId }] });
+            }
+        }
+        const deviceId = randomBytes(24).toString('base64url');
+        await context.context.internalAdapter.createVerificationValue({ identifier: deviceRow(deviceId), value: userId, expiresAt: new Date(Date.now() + device.lifetimeSeconds * 1000) });
+        const kept = entries.filter(entry => entry !== previous).map(entry => entry.text);
+        context.setCookie(cookie.name, [`${deviceId}.${deviceTag(keys, userId, deviceId)}`, ...kept].slice(0, device.entries).join('~'), cookie.attributes);
+    };
+    // After the two-factor plugin's hook, which clears newSession while a second factor is still pending, so only a
+    // completed sign-in (password, second factor, or the app's OIDC sign-in) issues an entry, and no other response does.
+    const signInPaths = new Set(['/sign-in/email', '/two-factor/verify-totp', '/two-factor/verify-backup-code', '/two-factor/verify-otp']);
+    const revokingPaths = new Set(['/change-password', '/revoke-sessions']);
+    const knownDevices = {
+        id: 'ten98-known-device',
+        hooks: { after: [
+                {
+                    matcher: (context) => signInPaths.has(context.path ?? '') || (context.path === undefined && typeof context.body?.oidcUserId === 'string'),
+                    handler: createAuthMiddleware(async (context) => {
+                        const created = context.context.newSession;
+                        if (!created || isAPIError(context.context.returned))
+                            return;
+                        // Confirming a factor while enabling two-factor is not a sign-in; only a sign-in challenge carries this cookie.
+                        if (context.path?.startsWith('/two-factor/') && !context.getCookie(context.context.createAuthCookie('two_factor').name))
+                            return;
+                        await issueDevice(context, created.user.id);
+                    }),
+                },
+                {
+                    matcher: (context) => revokingPaths.has(context.path ?? ''),
+                    handler: createAuthMiddleware(async (context) => {
+                        const userId = context.context.session?.user.id;
+                        if (!userId || isAPIError(context.context.returned))
+                            return;
+                        await forgetDevices(await getCurrentAdapter(context.context.adapter), userId);
+                    }),
+                },
+            ] },
     };
     // With legacy hashes accepted, every password check runs one legacy derive and one current derive, whichever hash is
     // stored or none, so response time does not reveal which accounts are unmigrated.
@@ -330,7 +419,7 @@ function build(options, keys, locking) {
         onAPIError: { onError(error) { if (isAPIError(error))
                 throw error; throw APIError.fromStatus('INTERNAL_SERVER_ERROR'); } },
         session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false } },
-        plugins: [factors, oidcSessions, sessionRevocation],
+        plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
         emailAndPassword: {
             enabled: true,
             disableSignUp: true,
@@ -339,13 +428,14 @@ function build(options, keys, locking) {
             resetPasswordTokenExpiresIn: reset.expiresInSeconds,
             revokeSessionsOnPasswordReset: reset.revokesSessions,
             ...(sendResetPassword ? { sendResetPassword: async ({ user, token }) => { await sendResetPassword({ userId: user.id, email: user.email, token }); } } : {}),
-            // A reset also ends trusted devices and pending two-factor challenges, so the new password alone never skips the factor.
+            // A reset also ends trusted devices, pending two-factor challenges and known devices, so the new password alone
+            // never skips the factor and no browser stays trusted across it.
             onPasswordReset: async ({ user }) => {
                 // deleteMany has no row cap (findMany defaults to 100). Challenge rows hold the user id; their attempt counters
                 // ('2fa-attempts-…', value '0') expire with the challenge they belonged to.
                 // The prefixes are kept in storage, so these filters match the hashed rows.
                 const { adapter } = await storeOf(auth);
-                for (const prefix of ['trust-device-', '2fa-']) {
+                for (const prefix of ['trust-device-', '2fa-', devicePrefix]) {
                     await adapter.deleteMany({ model: 'verification', where: [{ field: 'value', value: user.id }, { field: 'identifier', operator: 'starts_with', value: prefix }] });
                 }
             },
@@ -422,8 +512,14 @@ function build(options, keys, locking) {
                     return typeof value === 'function' ? (...args) => { check(key === 'signInEmail'); return value.apply(target, args); } : value;
                 } }),
             handler(request) { check(/\/sign-in\/email\/*$/i.test(new URL(request.url).pathname)); return handler(request); },
-            async revokeAllSessions() { check(false); if (hold.userId !== undefined)
-                await (await storeOf(bound)).internalAdapter.deleteUserSessions(hold.userId); },
+            async revokeAllSessions() {
+                check(false);
+                if (hold.userId === undefined)
+                    return;
+                const store = await storeOf(bound);
+                await store.internalAdapter.deleteUserSessions(hold.userId);
+                await forgetDevices(store.adapter, hold.userId);
+            },
         });
         const unmark = markLockedAuth({ email: hold.email }, callbackTx, connection);
         try {
@@ -462,6 +558,35 @@ function build(options, keys, locking) {
         const [row] = await tx.select({ id: userTable.id }).from(userTable).where(sql `lower(${userTable.email}) = lower(${address})`).for('no key update');
         return bind(tx, { userId: row?.id, email: address }, (auth, bound) => run(auth, bound, row?.id), passwordSignIn);
     });
+    /**
+     * The id of the attempt row claimed for this browser's known device of the account behind `address`, or undefined.
+     * True only when an entry's tag verifies for that account, its device row exists, belongs to that user and has not
+     * expired, and fewer than `device.attempts` attempts are claimed since its last success. The tag is checked on a plain
+     * read first, so a forged or foreign cookie takes no lock; the claim itself runs under the account's email and user
+     * locks, so concurrent attempts claim exactly.
+     */
+    const claimDevice = async (db, address, headers) => {
+        const store = await storeOf(auth);
+        const entries = deviceEntries(cookieFrom(headers, store.createAuthCookie(device.cookie).name));
+        if (!entries.length)
+            return undefined;
+        const [account] = await db.select({ id: userTable.id }).from(userTable).where(sql `lower(${userTable.email}) = lower(${address})`).limit(1);
+        const entry = account ? deviceFor(keys, account.id, entries) : undefined;
+        if (!account || !entry)
+            return undefined;
+        return byEmail(db, address, async (bound, _tx, userId) => {
+            if (userId !== account.id)
+                return undefined;
+            const { adapter, internalAdapter } = await storeOf(bound);
+            const row = await adapter.findOne({ model: 'verification', where: [{ field: 'identifier', value: deviceRow(entry.deviceId) }] });
+            const expiresAt = row ? new Date(row.expiresAt) : undefined;
+            if (!row || row.value !== userId || !expiresAt || !(expiresAt.getTime() > Date.now()))
+                return undefined;
+            if (await adapter.count({ model: 'verification', where: [{ field: 'identifier', value: attemptRow(entry.deviceId) }] }) >= device.attempts)
+                return undefined;
+            return (await internalAdapter.createVerificationValue({ identifier: attemptRow(entry.deviceId), value: userId, expiresAt })).id;
+        }, false);
+    };
     const locked = {
         async withLockedAuth(db, userId, run) {
             await ready(db, run);
@@ -494,16 +619,33 @@ function build(options, keys, locking) {
             if (crossSite(headers, origin))
                 return refusal(403, 'CROSS_SITE_SIGN_IN', 'Sign in from this site.');
             const address = email.trim().toLowerCase();
+            // 0. Whether this browser is a known device of the account behind this email: it then claims one of the device's
+            // attempts (released again below unless the password was checked). It never authenticates; it only tells the app.
+            const claim = await claimDevice(db, address, headers);
+            const unclaim = async () => { if (claim)
+                await (await storeOf(auth)).adapter.delete({ model: 'verification', where: [{ field: 'id', value: claim }] }); };
             // 1. The app's limits, counted before any read or hash: a flood of guesses costs a counter, not a derivation.
-            if (await limit({ email: address }) !== true)
+            let allowed;
+            try {
+                allowed = await limit({ email: address, knownDevice: claim !== undefined });
+            }
+            catch (error) {
+                await unclaim();
+                throw error;
+            }
+            if (allowed !== true) {
+                await unclaim();
                 return refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+            }
             // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
             if (password.length > ten98AuthPolicy.password.maxLength)
                 return refused();
             // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads.
             const release = await slots();
-            if (!release)
+            if (!release) {
+                await unclaim();
                 return refusal(503, 'SIGN_IN_BUSY', 'Sign-in is busy. Try again shortly.', { 'retry-after': '1' });
+            }
             let verified;
             try {
                 // 3. One short pool read; its connection is back in the pool before any hashing starts.
