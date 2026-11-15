@@ -294,14 +294,22 @@ export type PasswordAttempt = {
     knownDevice: boolean;
 };
 /**
- * The app's limiter for `signInWithPassword`, asked in two steps; each counts the attempt and answers anything but `true`
- * with 429. `source` comes first, before anything touches the database: the per-source and per-pair (source and email)
- * limits, so a flood the app refuses costs a counter and nothing else. Only an attempt it allows has its known-device
- * cookie checked; `account` then gets `knownDevice` and may skip the account-wide bucket for it, and only that bucket.
+ * One step's answer: `true` allows the attempt; `{ retryAfterSeconds }` (an integer from 1 to 86400) refuses it with that
+ * wait; `false`, or anything else, refuses it with a wait of 60 seconds. Every refusal is a 429 with `Retry-After`.
+ */
+export type PasswordLimitAnswer = boolean | {
+    retryAfterSeconds: number;
+};
+/**
+ * The app's limiter for `signInWithPassword`, asked in two steps. `source` comes first, before anything touches the
+ * database: the per-source and per-pair (source and email) limits, so a flood the app refuses costs a counter and nothing
+ * else. Only an attempt it allows has its known-device cookie checked; `account` then gets `knownDevice` and may skip the
+ * account-wide bucket for it, and only that bucket. Both are asked before the password is checked: count an attempt
+ * against the failure buckets once its response is the 401, never on a 429 or a success.
  */
 export type PasswordSignInLimits = {
-    source(attempt: Omit<PasswordAttempt, 'knownDevice'>): boolean | Promise<boolean>;
-    account(attempt: PasswordAttempt): boolean | Promise<boolean>;
+    source(attempt: Omit<PasswordAttempt, 'knownDevice'>): PasswordLimitAnswer | Promise<PasswordLimitAnswer>;
+    account(attempt: PasswordAttempt): PasswordLimitAnswer | Promise<PasswordLimitAnswer>;
 };
 /**
  * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one

@@ -416,14 +416,20 @@ export type PasswordSignIn = { email: string; password: string; source: string; 
  */
 export type PasswordAttempt = { email: string; source: string; knownDevice: boolean };
 /**
- * The app's limiter for `signInWithPassword`, asked in two steps; each counts the attempt and answers anything but `true`
- * with 429. `source` comes first, before anything touches the database: the per-source and per-pair (source and email)
- * limits, so a flood the app refuses costs a counter and nothing else. Only an attempt it allows has its known-device
- * cookie checked; `account` then gets `knownDevice` and may skip the account-wide bucket for it, and only that bucket.
+ * One step's answer: `true` allows the attempt; `{ retryAfterSeconds }` (an integer from 1 to 86400) refuses it with that
+ * wait; `false`, or anything else, refuses it with a wait of 60 seconds. Every refusal is a 429 with `Retry-After`.
+ */
+export type PasswordLimitAnswer = boolean | { retryAfterSeconds: number };
+/**
+ * The app's limiter for `signInWithPassword`, asked in two steps. `source` comes first, before anything touches the
+ * database: the per-source and per-pair (source and email) limits, so a flood the app refuses costs a counter and nothing
+ * else. Only an attempt it allows has its known-device cookie checked; `account` then gets `knownDevice` and may skip the
+ * account-wide bucket for it, and only that bucket. Both are asked before the password is checked: count an attempt
+ * against the failure buckets once its response is the 401, never on a 429 or a success.
  */
 export type PasswordSignInLimits = {
-  source(attempt: Omit<PasswordAttempt, 'knownDevice'>): boolean | Promise<boolean>;
-  account(attempt: PasswordAttempt): boolean | Promise<boolean>;
+  source(attempt: Omit<PasswordAttempt, 'knownDevice'>): PasswordLimitAnswer | Promise<PasswordLimitAnswer>;
+  account(attempt: PasswordAttempt): PasswordLimitAnswer | Promise<PasswordLimitAnswer>;
 };
 
 /**
@@ -665,7 +671,8 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // An account isAccountUsable refuses (by default a closed one) gets no reset. The request is handed to better-auth's
       // route with an address no account has (a reset token no row has), so it takes the route's own unknown-email (invalid
       // token) path, after the same validation and origin checks: the same answer, no token, nothing sent.
-      const { adapter, internalAdapter } = context.context;
+      const { internalAdapter } = context.context;
+      const adapter = await getCurrentAdapter(context.context.adapter);
       const body = (context.body ?? {}) as { email?: unknown; token?: unknown };
       // A body the route's own schema rejects is left to the route, so its 400 stays the same for every account.
       if (context.path === '/request-password-reset' && sendResetPassword && typeof body.email === 'string' && resetBody.safeParse(body).success) {
@@ -822,7 +829,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   const instanceSchema = async (db: AnyDatabase) => {
     await schemaOf(db);
     adapterChecked = recheckable(adapterChecked, async () => {
-      try { await storedAccount((await storeOf(auth)).adapter, { field: 'id', value: '' }); } catch { throw new SchemaMismatchError(['closedAt (closed_at) in the adapter\'s user model']); }
+      // Drizzle cannot build a select of an unmapped field and throws a TypeError; any other failure is reported as it is.
+      try { await storedAccount((await storeOf(auth)).adapter, { field: 'id', value: '' }); } catch (error) {
+        if (error instanceof TypeError) throw new SchemaMismatchError(['closedAt (closed_at) in the adapter\'s user model']);
+        throw error;
+      }
     });
     return adapterChecked.check;
   };
@@ -899,10 +910,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // Origin and Sec-Fetch-Site are checked here: a cross-site form cannot sign a victim in to another account.
       if (crossSite(headers, origin)) return refusal(403, 'CROSS_SITE_SIGN_IN', 'Sign in from this site.');
       const address = email.trim().toLowerCase();
-      const tooMany = () => refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+      const tooMany = (answer: unknown) => refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.', { 'retry-after': String(retryAfter(answer)) });
       // 1. The app's per-source limits, counted before anything touches the database: a flood the app refuses costs a
       // counter, never a pool connection, and one source cannot fill the verification queue.
-      if (await sourceLimit({ email: address, source }) !== true) return tooMany();
+      const sourceAnswer = await sourceLimit({ email: address, source });
+      if (sourceAnswer !== true) return tooMany(sourceAnswer);
       // 2. Whether this browser is a known device of the account behind this email: it then claims one of the device's
       // attempts (released again below unless the password was checked). It never authenticates; it only tells the app.
       const claim = await claimDevice(db, address, headers);
@@ -910,7 +922,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // 3. The app's account-wide limit, which may spare a known device its bucket, still before any hash or queue.
       let allowed: unknown;
       try { allowed = await accountLimit({ email: address, source, knownDevice: claim !== undefined }); } catch (error) { await unclaim(); throw error; }
-      if (allowed !== true) { await unclaim(); return tooMany(); }
+      if (allowed !== true) { await unclaim(); return tooMany(allowed); }
       // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
       if (password.length > ten98AuthPolicy.password.maxLength) return refused();
       // 4. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
@@ -1141,6 +1153,11 @@ function crossSite(headers: HeadersInit | undefined, origin: string): boolean {
 
 const refusal = (status: number, code: string, message: string, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify({ code, message }), { status, headers: { 'content-type': 'application/json', ...headers } });
+/** The wait a limiter's refusal names: its `retryAfterSeconds` when that is an integer from 1 to 86400, otherwise 60. */
+function retryAfter(answer: unknown): number {
+  const seconds = (answer as { retryAfterSeconds?: unknown } | null)?.retryAfterSeconds;
+  return typeof seconds === 'number' && Number.isInteger(seconds) && seconds >= 1 && seconds <= 86_400 ? seconds : 60;
+}
 /** One answer for an unknown email, a wrong password and an account without a password. */
 const refused = () => refusal(401, 'INVALID_EMAIL_OR_PASSWORD', 'Invalid email or password');
 

@@ -1538,3 +1538,23 @@ test('closedAt can be neither set by a client nor read from a response', { skip 
   assert.equal(update.ok, false);
   assert.equal((await pool!.query<{ closed: Date | null }>('SELECT closed_at AS closed FROM "user" WHERE id = $1', [id])).rows[0]!.closed, null);
 });
+
+test('every limiter refusal answers 429 with Retry-After: the step\'s own wait, or 60 seconds', { skip }, async () => {
+  const email = address('retry-after');
+  await account_(email);
+  const refusedWith = async (limits: Parameters<Ten98Auth['signInWithPassword']>[2]) => {
+    const response = await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, limits);
+    return [response.status, response.headers.get('retry-after')];
+  };
+  assert.deepEqual(await refusedWith({ source: () => ({ retryAfterSeconds: 120 }), account: () => true }), [429, '120']);
+  assert.deepEqual(await refusedWith({ source: () => true, account: () => ({ retryAfterSeconds: 30 }) }), [429, '30']);
+  assert.deepEqual(await refusedWith({ source: async () => ({ retryAfterSeconds: 86_400 }), account: () => true }), [429, '86400']);
+  assert.deepEqual(await refusedWith({ source: () => false, account: () => true }), [429, '60']);
+  assert.deepEqual(await refusedWith({ source: () => true, account: () => false }), [429, '60']);
+  // Out of range, not an integer or not a number: still refused, with the default wait.
+  for (const retryAfterSeconds of [0, 86_401, 1.5, -5, '30', Number.NaN] as unknown as number[]) {
+    assert.deepEqual(await refusedWith({ source: () => ({ retryAfterSeconds }), account: () => true }), [429, '60'], String(retryAfterSeconds));
+    assert.deepEqual(await refusedWith({ source: () => true, account: () => ({ retryAfterSeconds }) }), [429, '60'], String(retryAfterSeconds));
+  }
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).status, 200);
+});
