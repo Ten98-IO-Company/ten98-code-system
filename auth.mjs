@@ -332,8 +332,6 @@ function build(options, keys, locking, internal = {}) {
         const original = hook.matcher;
         hook.matcher = context => original(context) || (context.path === undefined && typeof context.body?.oidcUserId === 'string');
     }
-    /** The isAccountUsable hook, refusing a closed account by default. */
-    const usable = (account) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
     const verifiedUser = async (context, field) => {
         const userId = context.body?.[field];
         if (typeof userId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(userId))
@@ -491,6 +489,9 @@ function build(options, keys, locking, internal = {}) {
             return legacy ? legacyOk : modernOk;
         },
     } : undefined;
+    /** The isAccountUsable hook, refusing a closed account by default. */
+    const usable = (account) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
+    const usableUser = (user) => usable({ id: user.id, email: user.email, closedAt: user.closedAt ?? null });
     const auth = betterAuth({
         database: protectTokens(database, keys), baseURL: origin, secret, appName, trustedOrigins: [origin],
         // better-auth skips these checks when NODE_ENV=test or TEST is set unless they are pinned.
@@ -534,7 +535,31 @@ function build(options, keys, locking, internal = {}) {
             ...(legacyPassword ? { password: legacyPassword } : {}),
         },
         rateLimit: { enabled: false },
-        hooks: { after: createAuthMiddleware(async (context) => {
+        hooks: { before: createAuthMiddleware(async (context) => {
+                // An account isAccountUsable refuses (by default a closed one) gets no reset. The request is handed to better-auth's
+                // route with an address no account has (a reset token no row has), so it takes the route's own unknown-email (invalid
+                // token) path, after the same validation and origin checks: the same answer, no token, nothing sent.
+                const { internalAdapter } = context.context;
+                const body = (context.body ?? {});
+                // A body the route's own schema rejects is left to the route, so its 400 stays the same for every account.
+                if (context.path === '/request-password-reset' && sendResetPassword && typeof body.email === 'string' && resetBody.safeParse(body).success) {
+                    // Every request makes this lookup, so a refused account costs what an unknown email does.
+                    const found = await internalAdapter.findUserByEmail(body.email, { includeAccounts: true });
+                    if (found && await usableUser(found.user) !== true) {
+                        return { context: { body: { ...body, email: `${randomBytes(12).toString('hex')}@unusable-account.invalid` } } };
+                    }
+                }
+                if (context.path === '/reset-password') {
+                    const token = body.token || context.query?.token;
+                    if (typeof token !== 'string' || !token)
+                        return;
+                    const row = await internalAdapter.findVerificationValue(`reset-password:${token}`);
+                    const user = row ? await internalAdapter.findUserById(row.value) : null;
+                    if (user && await usableUser(user) !== true) {
+                        return { context: { body: { ...body, token: randomBytes(18).toString('base64url') } } };
+                    }
+                }
+            }), after: createAuthMiddleware(async (context) => {
                 const path = context.path ?? '';
                 if ((path !== '/sign-in/email' && !twoFactorPaths.has(path)) || isAPIError(context.context.returned))
                     return;
@@ -561,6 +586,8 @@ function build(options, keys, locking, internal = {}) {
                 catch { /* retried on the next successful sign-in */ }
             }) },
     });
+    // The request-reset route's body schema, as better-auth validates it after the before hooks; read before any wrapping.
+    const resetBody = auth.api.requestPasswordReset.options.body;
     const helpers = {
         storedVerificationIdentifier: (identifier) => storedIdentifier(keys, raw(identifier)),
         sessionTokenKey: (token) => tokenHandle(keys, raw(token)),
@@ -753,10 +780,11 @@ function build(options, keys, locking, internal = {}) {
             // Normalised as the team controller's lockEmail does, so both take the same advisory lock.
             return byEmail(db, email.trim().toLowerCase(), run);
         },
-        async signInWithPassword(db, input, limit) {
-            if (typeof limit !== 'function')
-                throw new TypeError('signInWithPassword needs the app\'s rate limit.');
-            await ready(db, limit);
+        async signInWithPassword(db, input, limits) {
+            const { source: sourceLimit, account: accountLimit } = (limits ?? {});
+            if (typeof sourceLimit !== 'function' || typeof accountLimit !== 'function')
+                throw new TypeError('signInWithPassword needs the app\'s rate limits: { source, account }.');
+            await ready(db, accountLimit);
             const { email, password, source, rememberMe, headers } = (input ?? {});
             if (typeof source !== 'string' || !source)
                 throw new TypeError('signInWithPassword needs the request\'s source (the client address the app derived).');
@@ -767,16 +795,20 @@ function build(options, keys, locking, internal = {}) {
             if (crossSite(headers, origin))
                 return refusal(403, 'CROSS_SITE_SIGN_IN', 'Sign in from this site.');
             const address = email.trim().toLowerCase();
-            // 0. Whether this browser is a known device of the account behind this email: it then claims one of the device's
+            const tooMany = () => refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+            // 1. The app's per-source limits, counted before anything touches the database: a flood the app refuses costs a
+            // counter, never a pool connection, and one source cannot fill the verification queue.
+            if (await sourceLimit({ email: address, source }) !== true)
+                return tooMany();
+            // 2. Whether this browser is a known device of the account behind this email: it then claims one of the device's
             // attempts (released again below unless the password was checked). It never authenticates; it only tells the app.
             const claim = await claimDevice(db, address, headers);
             const unclaim = async () => { if (claim)
                 await (await storeOf(auth)).adapter.delete({ model: 'verification', where: [{ field: 'id', value: claim }] }); };
-            // 1. The app's limits, per source and per account, counted before any read, hash or queue: a flood of guesses costs
-            // a counter, and one source cannot fill the verification queue.
+            // 3. The app's account-wide limit, which may spare a known device its bucket, still before any hash or queue.
             let allowed;
             try {
-                allowed = await limit({ email: address, source, knownDevice: claim !== undefined });
+                allowed = await accountLimit({ email: address, source, knownDevice: claim !== undefined });
             }
             catch (error) {
                 await unclaim();
@@ -784,12 +816,12 @@ function build(options, keys, locking, internal = {}) {
             }
             if (allowed !== true) {
                 await unclaim();
-                return refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+                return tooMany();
             }
             // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
             if (password.length > ten98AuthPolicy.password.maxLength)
                 return refused();
-            // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
+            // 4. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
             // known-device claim was verified above (a database read, before anything that differs between a real and an
             // unknown account) takes the reserved lane and only the lane, so a flood cannot crowd it out and many valid
             // cookies cannot take shared capacity. Every other attempt (an unknown email, an account without a cookie, a
@@ -801,7 +833,7 @@ function build(options, keys, locking, internal = {}) {
             }
             let verified, stored;
             try {
-                // 3. One short pool read; its connection is back in the pool before any hashing starts.
+                // 5. One short pool read; its connection is back in the pool before any hashing starts.
                 [stored] = await db.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt, password: accountTable.password }).from(userTable)
                     .leftJoin(accountTable, and(eq(accountTable.userId, userTable.id), eq(accountTable.providerId, 'credential')))
                     .where(sql `lower(${userTable.email}) = lower(${address})`).limit(1);
@@ -816,7 +848,7 @@ function build(options, keys, locking, internal = {}) {
             // asks again, for an account closed in between.
             if (await usable({ id: stored.id, email: stored.email, closedAt: stored.closedAt }) !== true)
                 return refused();
-            // 4. Only a correct password takes the lock; better-auth verifies again there and creates the session, for the
+            // 6. Only a correct password takes the lock; better-auth verifies again there and creates the session, for the
             // locked account only.
             let response;
             try {

@@ -143,8 +143,10 @@ export interface Ten98AuthOptions {
     /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
     cookiePrefix?: string;
     /**
-     * Whether an account may sign in with its password, asked under the account's lock in `signInWithPassword`; anything
-     * but `true` gets the uniform 401. Defaults to refusing a closed account (`closedAt` set).
+     * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
+     * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
+     * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
+     * Defaults to refusing a closed account (`closedAt` set).
      */
     isAccountUsable?(account: {
         id: string;
@@ -251,18 +253,19 @@ export interface Ten98Auth {
     withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
     /**
      * The supported password sign-in. A browser request from another site (an Origin other than `appUrl`'s, or a
-     * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: whether the browser's known-device
-     * cookie holds a live device of the account behind `email` (`knownDevice`; see the guide); `limit` (the app's
-     * per-source and per-account limits, evaluated and counted before any hash; anything but `true` answers 429; with
-     * `knownDevice` the app may skip only its account-wide bucket); a slot among the bounded verifications (503 when none is
-     * free in time); one short pool read of the credential, its connection released; both the modern and the legacy
+     * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: `limits.source` (the app's per-source
+     * and per-pair limits, before anything touches the database); whether the browser's known-device cookie holds a live
+     * device of the account behind `email` (`knownDevice`; see the guide); `limits.account` (the app's account-wide limit,
+     * which may skip its bucket for a known device); anything but `true` at either step answers 429; a slot among the
+     * bounded verifications (503 when none is free in time); one short pool read of the credential, its connection
+     * released; both the modern and the legacy
      * verifier, one of them against a fixed dummy, outside any transaction. A wrong password, an unknown email and an
      * account without a password all get the same 401. Only a correct password enters `withLockedAuthByEmail`, where
      * better-auth verifies again under the lock and creates the session (a legacy hash is replaced there once); if the
      * password changed in between, the answer is the same 401 and no session is created. The response carries the
      * session cookie, or the two-factor challenge, as `/sign-in/email` does.
      */
-    signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: PasswordAttempt) => boolean | Promise<boolean>): Promise<Response>;
+    signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limits: PasswordSignInLimits): Promise<Response>;
     /**
      * Resolves when the user table has the unique index on `lower(email)` that the locked lookups rely on, and rejects
      * otherwise. Call it at start-up; every locked call also checks it once per database and refuses to run without it.
@@ -293,15 +296,24 @@ export type PasswordSignIn = {
     headers?: HeadersInit;
 };
 /**
- * What `signInWithPassword` gives the app's limiter, before any hash and before the verification queue: the normalised
- * email; `source`, the client address the app derived for the request (`clientLimitKey` of its trusted address), so it
- * counts per source as well as per account; and `knownDevice`, whether this browser is a known device of that account.
- * A known device may skip only the account-wide bucket: never the per-source or per-pair limits, and never the password.
+ * What `signInWithPassword` gives the app's limiter: the normalised email; `source`, the client address the app derived
+ * for the request (`clientLimitKey` of its trusted address); and, at the account step, `knownDevice`, whether this
+ * browser is a known device of that account.
  */
 export type PasswordAttempt = {
     email: string;
     source: string;
     knownDevice: boolean;
+};
+/**
+ * The app's limiter for `signInWithPassword`, asked in two steps; each counts the attempt and answers anything but `true`
+ * with 429. `source` comes first, before anything touches the database: the per-source and per-pair (source and email)
+ * limits, so a flood the app refuses costs a counter and nothing else. Only an attempt it allows has its known-device
+ * cookie checked; `account` then gets `knownDevice` and may skip the account-wide bucket for it, and only that bucket.
+ */
+export type PasswordSignInLimits = {
+    source(attempt: Omit<PasswordAttempt, 'knownDevice'>): boolean | Promise<boolean>;
+    account(attempt: PasswordAttempt): boolean | Promise<boolean>;
 };
 /**
  * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
