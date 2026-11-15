@@ -400,8 +400,9 @@ export interface Ten98AuthOptions {
    */
   isAccountUsable?(account: { id: string; email: string; closedAt: Date | null }): boolean | Promise<boolean>;
   /**
-   * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) on the instance the
-   * app holds. It has no rate limit, no lock and no constant-cost check: do not use it outside tests and migrations.
+   * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) and its own two-factor
+   * routes and calls on the instance the app holds. They have no rate limit, no lock, no constant-cost check, no replay
+   * ledger and no factor proof: do not use it outside tests and migrations.
    */
   allowRawPasswordSignIn?: boolean;
 }
@@ -615,7 +616,8 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   const expiryScopes = (name: string, path: string | undefined) => {
     if (name.startsWith('__Host-')) return [{ path: '/', domain: undefined as string | undefined }];
     const prefixes = (value: string) => value.split('/').filter(Boolean).map((_, at, parts) => `/${parts.slice(0, at + 1).join('/')}`);
-    const paths = new Set(['/', ...prefixes(basePath), ...(path ? prefixes(path) : [])]);
+    const safe = path !== undefined && /^\/[\x21-\x3a\x3c-\x7e]*$/.test(path);
+    const paths = new Set(['/', ...prefixes(basePath), ...(safe ? prefixes(path) : [])]);
     const all = [...[...paths].map(value => ({ path: value, domain: undefined as string | undefined })), ...scopes.slice(1)];
     return all.filter((scope, at) => all.findIndex(other => other.path === scope.path && other.domain === scope.domain) === at);
   };
@@ -931,10 +933,10 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     return proved ? 'proved' : 'refused';
   };
   /** better-auth's own answer to a wrong code on a session-bound verification, so a refused proof reads the same. */
-  const wrongCode = (bound: LockedTen98Auth, request: Request) => {
+  const wrongCode = async (bound: LockedTen98Auth, request: Request) => {
     const url = new URL(request.url);
     url.pathname = url.pathname.replace(/\/two-factor\/[^/]+\/*$/i, '/two-factor/verify-totp');
-    return bound.handler(new Request(url, { method: 'POST', headers: request.headers, body: JSON.stringify({ code: notACode }) }));
+    return bound.handler(await asJson(new Request(url, { method: 'POST', headers: request.headers }), { code: notACode }));
   };
   const factorActionsLocked = (seconds: number) => new Response(JSON.stringify({ code: 'FACTOR_ACTIONS_LOCKED', message: 'Too many wrong codes. Try again later.', retryAfterSeconds: seconds }),
     { status: 429, headers: { 'content-type': 'application/json', 'retry-after': String(seconds) } });
@@ -949,7 +951,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     if (!body || typeof body.code !== 'string') return run(request);
     const store = await storeOf(bound);
     const step = await ledger.fresh(store, userId, body.code, false);
-    const sent = step !== undefined ? request : new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify({ ...body, code: notACode }) });
+    const sent = step !== undefined ? request : await asJson(request, { ...body, code: notACode });
     const response = await run(sent);
     if (response.ok && step !== undefined) await ledger.record(store, userId, step);
     return response;
@@ -1284,7 +1286,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // another column (updatedAt, a boolean), every account would read as closed or open by accident.
       const column = (adapter as { options?: { schema?: Record<string, Record<string, { name?: unknown; columnType?: unknown; withTimezone?: unknown } | undefined> | undefined> } })
         .options?.schema?.user?.closedAt;
-      if (column && (column.name !== 'closed_at' || column.columnType !== 'PgTimestamp' || column.withTimezone !== true)) {
+      if (column && (column.name !== 'closed_at' || (column.columnType !== 'PgTimestamp' && column.columnType !== 'PgTimestampString') || column.withTimezone !== true)) {
         throw new SchemaMismatchError([`closedAt mapped to ${String(column.name)} (${String(column.columnType)}); it must map closed_at, a timestamp with time zone`]);
       }
     });
@@ -1429,6 +1431,9 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     async verifyTwoFactor(db, request) {
       await ready(db, () => undefined);
       if (!(request instanceof Request) || request.method !== 'POST' || !twoFactorRoute.test(new URL(request.url).pathname)) throw new TypeError('verifyTwoFactor takes a POST to a /two-factor/* route.');
+      // better-call reads a body by its Content-Type (a form, say), the preset as JSON: read it once, as JSON, and hand
+      // better-auth that body, so a code the ledger or a proof did not see can never reach it.
+      request = await asJson(request);
       // A request that is not the completion of a sign-in's challenge needs a session, and runs under that user's lock.
       if (!challengeRoute.test(new URL(request.url).pathname) || !cookiePairs(request.headers).some(([name]) => name === cookieName('two_factor'))) {
         return sessionTwoFactor(db, request);
@@ -1561,6 +1566,21 @@ export class FactorActionsLockedError extends Error {
     this.name = 'FactorActionsLockedError';
     this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+/**
+ * `request` with a JSON body: `body` when given, otherwise its own body read as JSON (an object, or {} when it is not
+ * one). Content-Type and Content-Length are set for that body, whatever the request said.
+ */
+async function asJson(request: Request, body?: Record<string, unknown>): Promise<Request> {
+  let parsed = body;
+  if (parsed === undefined) {
+    const read: unknown = await request.clone().json().catch(() => undefined);
+    parsed = read !== null && typeof read === 'object' && !Array.isArray(read) ? read as Record<string, unknown> : {};
+  }
+  const headers = new Headers(request.headers);
+  headers.delete('content-length');
+  headers.set('content-type', 'application/json');
+  return new Request(request.url, { method: 'POST', headers, body: JSON.stringify(parsed) });
 }
 /** What a code that is not fresh is replaced with: it matches no step, so better-auth refuses and counts it as wrong. */
 const notACode = '------';

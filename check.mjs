@@ -662,7 +662,7 @@ function authCookieReads(directory, profileName, profile) {
             if (!policy.names.some(name => value.includes(name)) && !policy.prefixes.some(prefix => value.startsWith(prefix)))
                 continue;
             const before = text.slice(0, match.index).trimEnd();
-            if (policy.allowedCalls.some(call => before.endsWith(`${call}(`)))
+            if (policy.allowedCalls.some(call => new RegExp(`(?:^|[^A-Za-z0-9_$])${call}\\s*\\($`, 'u').test(before)))
                 continue;
             errors.push(`${path}:${line(match.index)}: names an auth cookie ('${value}'); read it through the preset's helpers (auth.cookieName, auth.readTwoFactorChallenge, auth.api.getSession).`);
         }

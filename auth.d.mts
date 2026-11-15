@@ -180,8 +180,9 @@ export interface Ten98AuthOptions {
         closedAt: Date | null;
     }): boolean | Promise<boolean>;
     /**
-     * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) on the instance the
-     * app holds. It has no rate limit, no lock and no constant-cost check: do not use it outside tests and migrations.
+     * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) and its own two-factor
+     * routes and calls on the instance the app holds. They have no rate limit, no lock, no constant-cost check, no replay
+     * ledger and no factor proof: do not use it outside tests and migrations.
      */
     allowRawPasswordSignIn?: boolean;
 }
