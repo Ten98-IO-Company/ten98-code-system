@@ -57,7 +57,8 @@ const refused = (files: Record<string, string | undefined>, pattern: RegExp) => 
   assert.equal(errors.length, 1, errors.join('\n'));
   assert.match(errors[0]!, pattern);
 };
-const SHAPE = /^src\/start\.ts must export const startInstance = createStart\(\(\) => ten98StartOptions/;
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+const SHAPE =/^src\/start\.ts must export const startInstance = createStart\(\(\) => ten98StartOptions/;
 const IMPORTS = "import { createStart } from '@tanstack/react-start';\nimport { ten98StartOptions } from '@ten98/runtime/start';\n";
 
 test('each refusal names the file and the required shape', needsParser, () => {
@@ -160,7 +161,7 @@ test("an errorComponent or defaultErrorComponent that reads its error's text is 
     ['copies the rest of the error', "export const Route = createFileRoute('/x')({ errorComponent: ({ error }) => { const { ...fields } = error; return <p>{Object.keys(fields)}</p>; } });\n"],
   ];
   for (const [finding, body] of refusals) {
-    refused({ 'src/routes/failure.tsx': ROUTE + body }, new RegExp(`^src/routes/failure\\.tsx line \\d+: ${finding.replace(/[.()]/gu, '\\$&')}: an errorComponent also renders on the server with the original error, so it shows publicErrorMessage\\(error\\)`, 'u'));
+    refused({ 'src/routes/failure.tsx': ROUTE + body }, new RegExp(`^src/routes/failure\\.tsx line \\d+: ${escapeRegExp(finding)}: an errorComponent also renders on the server with the original error, so it shows publicErrorMessage\\(error\\)`, 'u'));
   }
   // The shown sentence, the planned shared screen, and other components and props that read a message are fine.
   assert.deepEqual(app({
