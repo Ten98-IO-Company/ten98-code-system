@@ -1,4 +1,8 @@
 {
+  "src/auth.mts": {
+    "count": 3,
+    "reason": "Locked-auth transactions set their lock_timeout (set_config), withLockedAuthByEmail takes the team controller's email advisory lock (pg_advisory_xact_lock), and the start-up check reads pg_index for the unique index on lower(email); Drizzle has no builder for any of them. The user-row locks and the credential read are typed Drizzle queries."
+  },
   "src/check.mts": {
     "count": 8,
     "reason": "Not statements: the raw-statement scanner's own comments and patterns name the forms it counts."

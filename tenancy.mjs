@@ -9,6 +9,7 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { pgPolicy, PgTransaction } from 'drizzle-orm/pg-core';
 import { membership, transaction, workspace } from './db.mjs';
+import { refuseLockedAuth } from './locked-auth.mjs';
 /** One answer for a missing workspace and for a workspace the user may not reach (or not write), so ids reveal nothing. */
 export const workspaceNotFound = 'Workspace not found or unavailable.';
 export class WorkspaceAccessError extends Error {
@@ -157,6 +158,8 @@ export function createTenancy({ setting, column, tables }) {
          * a READ ONLY transaction it admits only this user's memberships that the transaction's top-level helper call locked.
          */
         async withWorkspace(db, userId, workspaceId, mode, run, outer) {
+            refuseLockedAuth(db, 'withWorkspace');
+            refuseLockedAuth(outer, 'withWorkspace');
             return scopedTransaction(db, outer, async (tx, caller, record, locked) => {
                 const [access] = await memberships(tx, userId, [workspaceId], caller, record, locked);
                 if (!access || (mode !== 'read' && !writers.includes(access.role)))
@@ -171,7 +174,8 @@ export function createTenancy({ setting, column, tables }) {
          * the user cannot reach are left out silently; `run` receives the ones admitted. Given a transaction as `db` it runs in
          * a savepoint, as `withWorkspace` does, and restores the caller's scope.
          */
-        withWorkspaces(db, userId, workspaceIds, run) {
+        async withWorkspaces(db, userId, workspaceIds, run) {
+            refuseLockedAuth(db, 'withWorkspaces');
             return scopedTransaction(db, undefined, async (tx, caller, record, locked) => {
                 const access = await memberships(tx, userId, workspaceIds, caller, record, locked);
                 if (!caller)

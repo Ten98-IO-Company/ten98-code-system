@@ -1,4 +1,6 @@
 import { type BetterAuthOptions } from 'better-auth';
+import { type AnyDatabase, type ScopedTransaction } from './db.mjs';
+export { LockedAuthTransactionError } from './locked-auth.mjs';
 /** The shared identity policy. Apps read it for forms and route limiters, so the numbers never drift between them. */
 export declare const ten98AuthPolicy: Readonly<{
     password: Readonly<{
@@ -56,9 +58,62 @@ export type ResetPasswordMessage = {
 };
 /** Verifies a Campaign `scrypt$salt$key` hash; any other format is not legacy and returns false. */
 export declare function verifyLegacyScryptHash(hash: string, password: string): Promise<boolean>;
+/**
+ * The `verification.identifier` the preset stores for a raw identifier, for an app that locks or reads the row with its
+ * own SQL. Prefer the instance method, which needs no secret.
+ */
+export declare function storedVerificationIdentifier(secret: string, identifier: string): string;
+/**
+ * The `session.token` the preset stores (a `v1.` handle) for a raw session token, the cookie's value without its
+ * signature. For an app's own read of session liveness; prefer the instance method, which needs no secret.
+ */
+export declare function sessionTokenKey(secret: string, token: string): string;
+/**
+ * The statements every app's numbered migration runs once when it adopts hashed token storage, separated as drizzle-kit
+ * separates statements. Rows stored in plain text before it would never match again: every session ends, and reset
+ * links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go with them.
+ * Rows an app writes with its own SQL are its own decision.
+ */
+export declare const tokenStorageUpgradeStatements: string;
+/** The user `withLockedAuth` was asked to lock does not exist; answer it as not found. */
+export declare class LockedAuthUserNotFoundError extends Error {
+    readonly status: 404;
+    readonly code: 'USER_NOT_FOUND';
+    constructor();
+}
+/**
+ * A locked-auth instance or transaction was used after its callback returned (an un-awaited call, say), or a second
+ * locked-auth transaction was opened inside one. Either would run outside, or wait on, the lock: a programming error.
+ */
+export declare class LockedAuthClosedError extends Error {
+    readonly code: 'LOCKED_AUTH_CLOSED';
+    constructor(message?: string);
+}
 export interface Ten98AuthOptions {
-    /** The app's better-auth database adapter, such as `drizzleAdapter(db, { provider: 'pg', schema })`. */
+    /** The app's better-auth adapter factory, such as `drizzleAdapter(db, { provider: 'pg', schema })`. */
     database: BetterAuthOptions['database'];
+    /**
+     * The same adapter over one transaction, such as `tx => drizzleAdapter(tx, { provider: 'pg', schema })`. Needed by
+     * `withLockedAuth` and `withLockedAuthByEmail`, which bind a better-auth instance to the transaction they open.
+     */
+    transactionDatabase?(tx: ScopedTransaction<AnyDatabase>): BetterAuthOptions['database'];
+    /** The first key of the email advisory lock; the team controller's `emailLockKey`, 109859 by default. */
+    emailLockKey?: number;
+    /**
+     * `lock_timeout` for a locked-auth transaction (SET LOCAL, in milliseconds, 5000 by default), so a wait on a lock it
+     * cannot get fails with SQLSTATE 55P03 instead of hanging.
+     */
+    lockTimeoutMs?: number;
+    /**
+     * The bound on concurrent `signInWithPassword` verifications in this process: `concurrency` at once (2 by default,
+     * each running two scrypt derivations, which together fill libuv's default four threads), at most `queue` waiting
+     * (100), each for at most `waitMs` (15000). Past either bound the attempt is answered 503, never left waiting.
+     */
+    passwordVerification?: {
+        concurrency?: number;
+        queue?: number;
+        waitMs?: number;
+    };
     /** The app's public URL (APP_URL); validated with `appOrigin`. */
     appUrl: string;
     secret: string;
@@ -75,6 +130,20 @@ export interface Ten98AuthOptions {
     allowPasswordless?: boolean;
     /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
     cookiePrefix?: string;
+    /**
+     * Whether an account may sign in with its password, asked under the account's lock in `signInWithPassword`; anything
+     * but `true` gets the uniform 401. Defaults to refusing a closed account (`closedAt` set).
+     */
+    isAccountUsable?(account: {
+        id: string;
+        email: string;
+        closedAt: Date | null;
+    }): boolean | Promise<boolean>;
+    /**
+     * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) on the instance the
+     * app holds. It has no rate limit, no lock and no constant-cost check: do not use it outside tests and migrations.
+     */
+    allowRawPasswordSignIn?: boolean;
 }
 export interface Ten98AuthSession {
     session: {
@@ -124,17 +193,101 @@ export interface Ten98Auth {
         completeOidcSession: ServerCall<{
             oidcUserId: string;
         }>;
+        /**
+         * Revokes the caller's other live sessions by id and keeps the current one (found from the cookie in `headers`).
+         * `revoked` counts the sessions it ended. The same endpoint serves POST /revoke-other-sessions.
+         */
+        revokeOtherSessions(input: {
+            headers: HeadersInit;
+        }): Promise<{
+            status: true;
+            revoked: number;
+        }>;
     };
     options: {
         readonly telemetry: {
             readonly enabled: false;
         };
     };
+    /** The stored `verification.identifier` for a raw identifier; see the standalone `storedVerificationIdentifier`. */
+    storedVerificationIdentifier(identifier: string): string;
+    /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
+    sessionTokenKey(token: string): string;
+    /**
+     * Runs `run` in one transaction (`transaction` from ./db) that sets its `lock_timeout` and then locks the user row
+     * FOR NO KEY UPDATE, with a better-auth instance bound to that transaction. A missing user throws
+     * LockedAuthUserNotFoundError (404). The callback runs its own statements on `tx` and may lock that user's session,
+     * credential and verification rows, in that order. Tenancy helpers, workspace-level team operations, `lockEmail`
+     * (except for the email `withLockedAuthByEmail` holds) and a nested locked-auth call refuse the transaction. When `run`
+     * throws, or the transaction fails, nothing it did persists and the error is rethrown; Set-Cookie headers from inside
+     * are lost with it. Once `run` settles, `tx` and the instance throw LockedAuthClosedError.
+     */
+    withLockedAuth<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>) => Promise<T>): Promise<T>;
+    /**
+     * `withLockedAuth` for a flow that knows only an email (password sign-in, reset request): takes the email advisory
+     * lock (`pg_advisory_xact_lock(emailLockKey, hashtext(email))`, the team controller's `lockEmail`) first, then locks
+     * that account's user row if there is one. `userId` is undefined when no account has the email.
+     */
+    withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
+    /**
+     * The supported password sign-in. A browser request from another site (an Origin other than `appUrl`'s, or a
+     * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: `limit` (the app's per-source and per-account limits, evaluated and counted
+     * before anything else; anything but `true` answers 429); a slot among the bounded verifications (503 when none is
+     * free in time); one short pool read of the credential, its connection released; both the modern and the legacy
+     * verifier, one of them against a fixed dummy, outside any transaction. A wrong password, an unknown email and an
+     * account without a password all get the same 401. Only a correct password enters `withLockedAuthByEmail`, where
+     * better-auth verifies again under the lock and creates the session (a legacy hash is replaced there once); if the
+     * password changed in between, the answer is the same 401 and no session is created. The response carries the
+     * session cookie, or the two-factor challenge, as `/sign-in/email` does.
+     */
+    signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: PasswordAttempt) => boolean | Promise<boolean>): Promise<Response>;
+    /**
+     * Resolves when the user table has the unique index on `lower(email)` that the locked lookups rely on, and rejects
+     * otherwise. Call it at start-up; every locked call also checks it once per database and refuses to run without it.
+     */
+    assertEmailIndex(db: AnyDatabase): Promise<void>;
+}
+/** `signInWithPassword`'s input; `headers` are the request's, for the session's user agent and address. */
+export type PasswordSignIn = {
+    email: string;
+    password: string;
+    source: string;
+    rememberMe?: boolean;
+    headers?: HeadersInit;
+};
+/**
+ * What `signInWithPassword` gives the app's limiter, before any hash and before the verification queue: the normalised
+ * email, and `source`, the client address the app derived for the request (`clientLimitKey` of its trusted address), so
+ * it counts per source as well as per account.
+ */
+export type PasswordAttempt = {
+    email: string;
+    source: string;
+};
+/**
+ * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
+ * in with a password (use `signInWithPassword`), and throws LockedAuthClosedError once the callback has returned.
+ */
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword' | 'assertEmailIndex'> {
+    /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
+    readonly userId: string | undefined;
+    /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
+    revokeAllSessions(): Promise<void>;
 }
 /**
  * A better-auth instance with the Ten98 policy. Sign-up stays closed: the first-boot claim creates the owner in the
  * app's own transaction (hash with `hashPassword` from 'better-auth/crypto') and then signs in. Origin and CSRF checks
- * are pinned on, so no environment variable can turn them off.
+ * are pinned on, so no environment variable can turn them off. Session tokens and verification identifiers are stored
+ * as keyed hashes; the cookie cache stays off and no secondary storage is used, so no token is kept anywhere else.
  */
-export declare function createTen98Auth({ database, appUrl, secret, appName, sendResetPassword, legacyPasswords, allowPasswordless, cookiePrefix }: Ten98AuthOptions): Ten98Auth;
-export {};
+export declare function createTen98Auth(options: Ten98AuthOptions): Ten98Auth;
+/** More than one account matches an email: the unique index on lower(email) is missing. Nothing is picked. */
+export declare class AmbiguousAccountError extends Error {
+    readonly code: 'AMBIGUOUS_ACCOUNT';
+    constructor();
+}
+/** The user table has no valid unique index on lower(email), which the locked lookups need to find one account. */
+export declare class MissingEmailIndexError extends Error {
+    readonly code: 'MISSING_EMAIL_INDEX';
+    constructor();
+}

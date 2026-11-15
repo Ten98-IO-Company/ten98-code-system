@@ -63,12 +63,21 @@ const isClient = (client) => client instanceof pg.Client;
 // Drizzle writes `SET TRANSACTION` with nothing after it for a config that sets nothing, which PostgreSQL refuses.
 const setsSomething = (config) => config !== undefined && Object.values(config).some(value => value !== undefined);
 /**
+ * COMMIT ended in a rollback: a statement failed inside the transaction (an error the callback caught, say), so nothing
+ * it did persisted. `transaction` throws this instead of returning the callback's result.
+ */
+export class TransactionRolledBackError extends Error {
+    code = 'TRANSACTION_ROLLED_BACK';
+    constructor() { super('The transaction was rolled back: a statement in it failed, so nothing it did persisted.'); this.name = 'TransactionRolledBackError'; }
+}
+/**
  * `db.transaction` without drizzle-orm 0.45.2's connection leak. Its node-postgres transaction sends BEGIN before its
  * `try`, so a failed BEGIN never releases the pooled connection, and a failed ROLLBACK replaces the error that caused
  * it. Over a pool this checks the connection out and runs BEGIN, COMMIT and ROLLBACK itself. It always releases the
  * connection, and discards it when BEGIN, COMMIT or ROLLBACK failed or the server ended it (its state is then
  * unknown; a COMMIT refused for a constraint or serialisation failure also discards a usable connection, which costs
- * only a reconnect). It throws the callback's own error, or a failed COMMIT's. While the connection is checked out it has an
+ * only a reconnect). It throws the callback's own error, or a failed COMMIT's, or TransactionRolledBackError when COMMIT
+ * ended in a rollback because a statement failed and the callback caught it. While the connection is checked out it has an
  * `error` listener, so a backend the server terminates fails the transaction instead of crashing the process.
  *
  * Given a transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. Any other
@@ -108,13 +117,17 @@ export async function transaction(db, run, config) {
             throw error;
         }
         // A failed COMMIT has already ended the transaction; the discarded connection needs no ROLLBACK.
+        let committed;
         try {
-            await tx.execute(sql `commit`);
+            committed = await tx.execute(sql `commit`);
         }
         catch (error) {
             broken = true;
             throw error;
         }
+        // A transaction a failed statement aborted answers COMMIT with ROLLBACK and no error: report it, never the result.
+        if (committed.command !== 'COMMIT')
+            throw new TransactionRolledBackError();
         return result;
     }
     finally {
