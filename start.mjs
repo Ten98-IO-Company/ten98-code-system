@@ -15,8 +15,8 @@ export class PublicError extends Error {
     name = 'PublicError';
 }
 // Start's own default, which it applies only when an app has no start instance: server functions answer a
-// cross-origin request with 403.
-const csrfMiddleware = createCsrfMiddleware({ filter: context => context.handlerType === 'serverFn' });
+// cross-origin request with 403. Made afresh for each call, so changing one returned middleware changes no other.
+const csrfMiddleware = () => createCsrfMiddleware({ filter: context => context.handlerType === 'serverFn' });
 const references = new WeakMap();
 const REFERENCE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 // One reference and one log line per error object, however often Start serialises it. Start gives a request no id, so
@@ -81,7 +81,7 @@ export function ten98StartOptions({ reporter, requestMiddleware } = {}) {
     });
     return {
         serializationAdapters: [errorAdapter],
-        requestMiddleware: [csrfMiddleware, ...requestMiddleware ?? []],
+        requestMiddleware: [csrfMiddleware(), ...requestMiddleware ?? []],
     };
 }
 /**

@@ -32,8 +32,8 @@ export interface Ten98StartOptions<TMiddleware extends readonly AnyRequestMiddle
 type ErrorWire = { reference: string } | { public: string };
 
 // Start's own default, which it applies only when an app has no start instance: server functions answer a
-// cross-origin request with 403.
-const csrfMiddleware = createCsrfMiddleware({ filter: context => context.handlerType === 'serverFn' });
+// cross-origin request with 403. Made afresh for each call, so changing one returned middleware changes no other.
+const csrfMiddleware = () => createCsrfMiddleware({ filter: context => context.handlerType === 'serverFn' });
 const references = new WeakMap<Error, string>();
 const REFERENCE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
@@ -93,7 +93,7 @@ export function ten98StartOptions<const TMiddleware extends readonly AnyRequestM
   });
   return {
     serializationAdapters: [errorAdapter] as const,
-    requestMiddleware: [csrfMiddleware, ...requestMiddleware ?? []] as unknown as readonly [typeof csrfMiddleware, ...TMiddleware],
+    requestMiddleware: [csrfMiddleware(), ...requestMiddleware ?? []] as unknown as readonly [ReturnType<typeof csrfMiddleware>, ...TMiddleware],
   };
 }
 

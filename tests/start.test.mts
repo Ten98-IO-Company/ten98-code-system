@@ -244,12 +244,35 @@ test('the adapter rebuilds a PublicError and a referenced Error, and logs one li
   } finally { console.error = error; }
 });
 
-test('the CSRF middleware always comes first, ahead of the app middleware', () => {
+// What a request middleware answers for one request to a server function: a status, or NEXT where it lets the request
+// on. Start passes the middleware the request, the handler type and next.
+const NEXT = 'next';
+const answer = async (middleware: unknown, headers: Record<string, string>, method = 'POST', handlerType = 'serverFn'): Promise<number | string> => {
+  const { server } = (middleware as { options: { server: (context: object) => Promise<unknown> } }).options;
+  const result = await server({ request: new Request('http://app.test/_serverFn/fn', { method, headers }), handlerType, next: () => NEXT });
+  return result instanceof Response ? result.status : result as string;
+};
+const crossOrigin = { Origin: 'https://elsewhere.example' };
+
+test('the CSRF middleware always comes first, ahead of the app middleware, and no call can change another', async () => {
   const marker = { options: {} } as never;
   const [csrf, ...rest] = ten98StartOptions({ requestMiddleware: [marker] }).requestMiddleware;
   assert.deepEqual(rest, [marker]);
-  assert.equal(ten98StartOptions().requestMiddleware[0], csrf);
   assert.equal(ten98StartOptions().requestMiddleware.length, 1);
+  assert.equal(await answer(csrf, crossOrigin), 403);
+  assert.equal(await answer(csrf, { Origin: 'http://app.test' }), NEXT);
+  // Turning off the middleware one call returned, in place or by replacing its options, leaves every later call's,
+  // the no-argument call's included, refusing a cross-origin request.
+  const allow = (context: { next: () => unknown }) => context.next();
+  for (const options of [ten98StartOptions(), ten98StartOptions({ requestMiddleware: [marker] })]) {
+    const [changed] = options.requestMiddleware as unknown as { options: { server: unknown } }[];
+    changed!.options.server = allow;
+    assert.equal(await answer(changed, crossOrigin), NEXT);
+  }
+  Object.assign(ten98StartOptions().requestMiddleware[0], { options: { server: allow } });
+  for (const options of [ten98StartOptions(), ten98StartOptions({ requestMiddleware: [marker] })]) {
+    assert.equal(await answer(options.requestMiddleware[0], crossOrigin), 403);
+  }
 });
 
 test('React root errors are silent in production apart from the reporter, and logged with the component stack in development', async () => {

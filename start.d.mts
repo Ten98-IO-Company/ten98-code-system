@@ -25,7 +25,7 @@ type ErrorWire = {
 } | {
     public: string;
 };
-declare const csrfMiddleware: import("@tanstack/react-start").RequestMiddlewareAfterServer<{}, undefined, undefined>;
+declare const csrfMiddleware: () => import("@tanstack/react-start").RequestMiddlewareAfterServer<{}, undefined, undefined>;
 /**
  * The text an error component may show. An errorComponent also renders on the server with the original error, so it
  * shows this, never `error.message`: a PublicError's message, the fixed sentence with the reference for an error the
@@ -39,7 +39,7 @@ export declare function publicErrorMessage(error: unknown): string;
  */
 export declare function ten98StartOptions<const TMiddleware extends readonly AnyRequestMiddleware[] = []>({ reporter, requestMiddleware }?: Ten98StartOptions<TMiddleware>): {
     serializationAdapters: readonly [import("@tanstack/react-router").SerializationAdapter<Error, ErrorWire, never>];
-    requestMiddleware: readonly [typeof csrfMiddleware, ...TMiddleware];
+    requestMiddleware: readonly [ReturnType<typeof csrfMiddleware>, ...TMiddleware];
 };
 /** Receives each error React reports in the browser, in production as well as development. It may be async. */
 export type ClientErrorReporter = (error: unknown, details: {
