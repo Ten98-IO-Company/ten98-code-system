@@ -690,6 +690,8 @@
           "auth.d.mts": "Generated declarations from src/auth.mts.",
           "locked-auth.mjs": "Generated locked-auth transaction mark from src/locked-auth.mts, internal module imported by auth, tenancy and workspace-team, not re-exported by index.mjs; Node standard library only.",
           "locked-auth.d.mts": "Generated declarations from src/locked-auth.mts.",
+          "oidc-issuer.mjs": "Generated OIDC issuer normaliser from src/oidc-issuer.mts, internal module imported by auth (which exports it) and workspace-team, not re-exported by index.mjs; no imports.",
+          "oidc-issuer.d.mts": "Generated declarations from src/oidc-issuer.mts.",
           "csv.mjs": "Generated runtime executable from src/csv.mts, re-exported by browser.mjs and index.mjs.",
           "csv.d.mts": "Generated declarations from src/csv.mts.",
           "money.mjs": "Generated runtime executable from src/money.mts, re-exported by browser.mjs and index.mjs.",

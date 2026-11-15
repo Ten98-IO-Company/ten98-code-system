@@ -22,10 +22,10 @@ import { account as accountTable, session as sessionTable, transaction, Transact
 import { isEmailAddress } from './email-message.mjs';
 import { appOrigin } from './index.mjs';
 import { lockedAuthUser, LockedAuthTransactionError, markLockedAuth, refuseLockedAuth } from './locked-auth.mjs';
-import { oidcProviderId } from './workspace-team.mjs';
+import { isOidcSubject, oidcProviderId } from './oidc-issuer.mjs';
 
 export { LockedAuthTransactionError } from './locked-auth.mjs';
-export { normaliseOidcIssuer, normaliseOidcIssuerSql, oidcProviderId } from './workspace-team.mjs';
+export { normaliseOidcIssuer, normaliseOidcIssuerSql, oidcProviderId } from './oidc-issuer.mjs';
 
 /** The shared identity policy. Apps read it for forms and route limiters, so the numbers never drift between them. */
 export const ten98AuthPolicy = Object.freeze({
@@ -1148,7 +1148,7 @@ export type OidcProviderTrust = { trustVerifiedEmail?: boolean };
 
 /** The account row key of an identity; TypeError for an issuer without a host or a `sub` that is not 1 to 255 characters. */
 function identityKey(issuer: unknown, subject: unknown): { providerId: string; accountId: string } {
-  if (typeof subject !== 'string' || subject.length < 1 || subject.length > 255) throw new TypeError('An OIDC subject is a string of 1 to 255 characters.');
+  if (!isOidcSubject(subject)) throw new TypeError('An OIDC subject is a string of 1 to 255 characters.');
   return { providerId: oidcProviderId(issuer as string), accountId: subject };
 }
 /** The user a by-id withLockedAuth transaction holds; TypeError outside one (by email included), as a programming error. */

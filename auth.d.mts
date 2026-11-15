@@ -1,7 +1,7 @@
 import { type BetterAuthOptions } from 'better-auth';
 import { type AnyDatabase, type ScopedTransaction } from './db.mjs';
 export { LockedAuthTransactionError } from './locked-auth.mjs';
-export { normaliseOidcIssuer, normaliseOidcIssuerSql, oidcProviderId } from './workspace-team.mjs';
+export { normaliseOidcIssuer, normaliseOidcIssuerSql, oidcProviderId } from './oidc-issuer.mjs';
 /** The shared identity policy. Apps read it for forms and route limiters, so the numbers never drift between them. */
 export declare const ten98AuthPolicy: Readonly<{
     password: Readonly<{
