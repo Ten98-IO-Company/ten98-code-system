@@ -9,7 +9,7 @@ import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { boolean, integer, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
 import pg from 'pg';
-import { AmbiguousAccountError, createTen98Auth, signInOidcUser, linkOidcIdentity, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError,
+import { AmbiguousAccountError, createTen98Auth, FactorActionsLockedError, ten98AuthPolicy, signInOidcUser, linkOidcIdentity, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError,
   normaliseOidcIssuer, normaliseOidcIssuerSql, OidcIdentityError, oidcProviderId, revokeProviderSessions, SchemaMismatchError, tokenStorageUpgradeStatements, unlinkOidcIdentity, verifyCodeForAction } from '../auth.mjs';
 import type { PasswordAttempt, Ten98Auth, Ten98AuthOptions } from '../auth.mjs';
 import { session, transaction, TransactionRolledBackError, user } from '../db.mjs';
@@ -2705,4 +2705,145 @@ test('a backup code is single-use across challenges', { skip }, async () => {
   const code = enabled.backupCodes[0]!;
   assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-backup-code', await challengeFor(email), { code }))).status, 200);
   assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-backup-code', await challengeFor(email), { code }))).status, 401);
+});
+
+// ---- Factor proof for factor-weakening actions, and the factor-action counter ----
+// An account with a verified factor, signed in (its own session, after completing the challenge), and its recovery codes.
+async function withFactor(label: string) {
+  const email = address(label);
+  const id = await account_(email);
+  const session = cookieOf(await signIn(email));
+  const enabled = await (await auth.verifyTwoFactor(db, post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string; backupCodes: string[] };
+  const enrolCode = totp(enabled.totpURI);
+  const confirmed = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', session, { code: enrolCode }));
+  assert.equal(confirmed.status, 200);
+  return { email, id, uri: enabled.totpURI, backupCodes: enabled.backupCodes, session: cookieOf(confirmed) };
+}
+const factorAction = (session: string, route: string, body: Record<string, unknown>) => auth.verifyTwoFactor(db, post(`/two-factor/${route}`, session, body));
+const factorOn = async (userId: string) => (await pool!.query<{ on: boolean }>('SELECT "twoFactorEnabled" AS on FROM "user" WHERE id=$1', [userId])).rows[0]!.on;
+const actionCounter = async (userId: string) => {
+  const row = (await pool!.query<{ value: string }>('SELECT value FROM verification WHERE identifier=$1', [auth.storedVerificationIdentifier(`factor-actions:${userId}`)])).rows[0];
+  return row ? JSON.parse(row.value) as { failures: number; lockedUntil: number } : { failures: 0, lockedUntil: 0 };
+};
+
+test('turning the factor off needs a proof of it: the password alone, a wrong or a replayed code are refused as a wrong code', { skip }, async () => {
+  const user = await withFactor('proof-disable');
+  const wrongCode = await answer(await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', user.session, { code: '000000' })));
+  for (const body of [{ password: PASSWORD }, { password: PASSWORD, code: '000000' }, { password: PASSWORD, code: totp(user.uri) }]) {
+    const refused = await answer(await factorAction(user.session, 'disable', body));
+    assert.deepEqual([refused.status, refused.body], [wrongCode.status, wrongCode.body], JSON.stringify(body));
+  }
+  assert.equal(await factorOn(user.id), true);
+  // A fresh code turns it off.
+  assert.equal((await factorAction(user.session, 'disable', { password: PASSWORD, code: totp(user.uri, 1) })).status, 200);
+  assert.equal(await factorOn(user.id), false);
+});
+
+test('recovery codes, the TOTP URI and re-enrolling need a proof; a code proves one action only; a recovery code proves once', { skip }, async () => {
+  const user = await withFactor('proof-codes');
+  // Without a proof: refused.
+  for (const route of ['generate-backup-codes', 'get-totp-uri', 'enable']) {
+    assert.equal((await factorAction(user.session, route, { password: PASSWORD })).status, 401, route);
+  }
+  // A fresh code issues new recovery codes; the same code cannot then turn the factor off.
+  const code = totp(user.uri, 1);
+  const issued = await factorAction(user.session, 'generate-backup-codes', { password: PASSWORD, code });
+  assert.equal(issued.status, 200);
+  const { backupCodes } = await issued.json() as { backupCodes: string[] };
+  assert.equal((await factorAction(user.session, 'disable', { password: PASSWORD, code })).status, 401);
+  // A recovery code of the verified factor is a proof, once.
+  assert.equal((await factorAction(user.session, 'get-totp-uri', { password: PASSWORD, code: backupCodes[0] })).status, 200);
+  assert.equal((await factorAction(user.session, 'get-totp-uri', { password: PASSWORD, code: backupCodes[0] })).status, 401);
+  // The codes issued before regeneration are void.
+  assert.equal((await factorAction(user.session, 'get-totp-uri', { password: PASSWORD, code: user.backupCodes[0] })).status, 401);
+  assert.equal(await factorOn(user.id), true);
+});
+
+test('codes returned during an enrolment not yet confirmed are no proof', { skip }, async () => {
+  const email = address('proof-pending');
+  const id = await account_(email);
+  const session = cookieOf(await signIn(email));
+  const pending = await (await auth.verifyTwoFactor(db, post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string; backupCodes: string[] };
+  assert.equal(await auth.withLockedAuth(db, id, (_bound, tx) => verifyCodeForAction(tx, id, pending.backupCodes[0]!)), false);
+  assert.equal(await auth.withLockedAuth(db, id, (_bound, tx) => verifyCodeForAction(tx, id, totp(pending.totpURI, 1))), false);
+});
+
+test('refused proofs lock factor actions with FACTOR_ACTIONS_LOCKED; sign-in still works; only a successful proof resets the count', { skip }, async () => {
+  const user = await withFactor('proof-counter');
+  const { maxFailedAttempts } = ten98AuthPolicy.twoFactor;
+  for (let refused = 0; refused < maxFailedAttempts - 1; refused++) assert.equal((await factorAction(user.session, 'disable', { password: PASSWORD, code: '000000' })).status, 401);
+  // A successful sign-in, challenge and all, does not reset it.
+  const challenge = cookieOf(await signIn(user.email));
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', challenge, { code: totp(user.uri, 1) }))).status, 200);
+  assert.equal((await actionCounter(user.id)).failures, maxFailedAttempts - 1);
+  const locked = await factorAction(user.session, 'disable', { password: PASSWORD, code: '000000' });
+  assert.equal(locked.status, 401);
+  const lockedNow = await factorAction(user.session, 'disable', { password: PASSWORD, code: totp(user.uri, -1) });
+  assert.equal(lockedNow.status, 429);
+  const body = await lockedNow.json() as { code: string; retryAfterSeconds: number };
+  assert.equal(body.code, 'FACTOR_ACTIONS_LOCKED');
+  assert.ok(body.retryAfterSeconds > 0 && body.retryAfterSeconds <= ten98AuthPolicy.twoFactor.lockoutSeconds);
+  assert.equal(lockedNow.headers.get('retry-after'), String(body.retryAfterSeconds));
+  await assert.rejects(auth.withLockedAuth(db, user.id, (_bound, tx) => verifyCodeForAction(tx, user.id, '000000')), (error: unknown) => error instanceof FactorActionsLockedError && error.retryAfterSeconds > 0);
+  // Sign-in is not affected.
+  const another = cookieOf(await signIn(user.email));
+  const fresh = totp(user.uri, 1) === totp(user.uri) ? totp(user.uri, 1) : totp(user.uri, 1);
+  assert.notEqual((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', another, { code: fresh }))).status, 429);
+  assert.equal(await factorOn(user.id), true);
+  // A successful proof resets the count: once the lock has passed, nine refusals and a proof leave room for nine more.
+  await pool!.query('DELETE FROM verification WHERE identifier=$1', [auth.storedVerificationIdentifier(`factor-actions:${user.id}`)]);
+  for (let refused = 0; refused < maxFailedAttempts - 1; refused++) await factorAction(user.session, 'get-totp-uri', { password: PASSWORD, code: '000000' });
+  const proved = await auth.withLockedAuth(db, user.id, (_bound, tx) => verifyCodeForAction(tx, user.id, user.backupCodes[1]!));
+  assert.equal(proved, true);
+  assert.equal((await actionCounter(user.id)).failures, 0);
+});
+
+test('a replayed code on a session-bound verification counts toward the factor-action counter', { skip }, async () => {
+  const user = await withFactor('proof-replay-session');
+  const before = (await actionCounter(user.id)).failures;
+  // The confirmation's code again, with the session.
+  const replayed = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', user.session, { code: totp(user.uri) }));
+  assert.equal(replayed.status, 401);
+  assert.equal((await actionCounter(user.id)).failures, before + 1);
+});
+
+test('linking a new sign-in identity to an account with a factor needs a proof of it', { skip }, async () => {
+  const user = await withFactor('proof-link');
+  const identity = () => ({ issuer: ISSUER, subject: subject() });
+  const link = (options?: { code?: string }) => auth.withLockedAuth(db, user.id, (_bound, tx) => linkOidcIdentity(tx, identity(), options));
+  await assert.rejects(link(), refusedWith('OIDC_FACTOR_PROOF_REQUIRED', 403));
+  await assert.rejects(link({ code: '000000' }), refusedWith('OIDC_FACTOR_PROOF_REQUIRED', 403));
+  const code = totp(user.uri, 1);
+  assert.deepEqual(await link({ code }), { linked: true });
+  await assert.rejects(link({ code }), refusedWith('OIDC_FACTOR_PROOF_REQUIRED', 403));
+  // Without a factor, no proof is asked for.
+  const plain = await account_(address('proof-link-plain'));
+  assert.deepEqual(await auth.withLockedAuth(db, plain, (_bound, tx) => linkOidcIdentity(tx, identity())), { linked: true });
+});
+
+test('changing the password needs no factor proof; a reset by email leaves the factor on, and the next sign-in asks for it', { skip }, async () => {
+  const user = await withFactor('proof-password');
+  const changed = await auth.withLockedAuth(db, user.id, bound => (bound.api as unknown as ChangePassword).changePassword({
+    body: { currentPassword: PASSWORD, newPassword: NEW_PASSWORD, revokeOtherSessions: true }, headers: { cookie: user.session }, asResponse: true,
+  }));
+  assert.equal(changed.status, 200);
+  const sent: string[] = [];
+  const resetting = authOver(db, { sendResetPassword: ({ token }) => { sent.push(token); } });
+  assert.equal((await resetRequest(resetting, '/request-password-reset', { email: user.email, redirectTo: '/' })).status, 200);
+  assert.equal((await resetRequest(resetting, '/reset-password', { token: sent[0], newPassword: PASSWORD })).status, 200);
+  assert.equal(await factorOn(user.id), true);
+  const next = await signIn(user.email);
+  assert.equal((await next.clone().json() as { twoFactorRedirect?: boolean }).twoFactorRedirect, true);
+});
+
+test('revoking a provider also removes the trusted devices its sign-ins set; a password sign-in\'s stay', { skip }, async () => {
+  const viaProvider = await challenged('trust-provider'), viaPassword = await challenged('trust-password');
+  const trusted = async (userId: string) => (await pool!.query('SELECT 1 FROM verification WHERE value=$1 AND starts_with(identifier, \'trust-device-\')', [userId])).rowCount;
+  const tied = async () => (await pool!.query('SELECT 1 FROM verification WHERE starts_with(identifier, \'oidc-trust:\') AND value=\'p-trust\'')).rowCount;
+  const providerChallenge = cookieOf(await providerSignIn(viaProvider.id, 'p-trust'));
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', providerChallenge, { code: totp(viaProvider.uri, 1), trustDevice: true }))).status, 200);
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', viaPassword.challenge, { code: totp(viaPassword.uri, 1), trustDevice: true }))).status, 200);
+  assert.deepEqual([await trusted(viaProvider.id), await tied(), await trusted(viaPassword.id)], [1, 1, 1]);
+  assert.equal(await revokeProviderSessions(db, 'p-trust'), 1);
+  assert.deepEqual([await trusted(viaProvider.id), await tied(), await trusted(viaPassword.id)], [0, 0, 1]);
 });

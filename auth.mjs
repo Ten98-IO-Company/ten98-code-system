@@ -15,7 +15,7 @@ import { PgTransaction } from 'drizzle-orm/pg-core';
 import { betterAuth, getCurrentAdapter } from 'better-auth';
 import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, isAPIError, sensitiveSessionMiddleware } from 'better-auth/api';
 import { setSessionCookie } from 'better-auth/cookies';
-import { hashPassword, symmetricDecrypt, verifyPassword } from 'better-auth/crypto';
+import { hashPassword, symmetricDecrypt, symmetricEncrypt, verifyPassword } from 'better-auth/crypto';
 import { twoFactor } from 'better-auth/plugins/two-factor';
 import { account as accountTable, session as sessionTable, transaction, TransactionRolledBackError, user as userTable } from './db.mjs';
 import { isEmailAddress } from './email-message.mjs';
@@ -34,8 +34,18 @@ export const ten98AuthPolicy = Object.freeze({
      * a code whose step is at or before it is refused everywhere a TOTP code is taken. `replaySeconds` is how long that
      * refusal can matter (the ±1-step window). Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
      * `backupCodeInputLength` characters as typed, with the hyphen.
-     * The lockout counts failures during sign-in challenges only; session-bound step-up checks are limited per user by the
-     * app (`rateLimits.accountSecurityWritesPerUser`).
+     * Two counters. The sign-in lockout (better-auth's) counts failed codes in sign-in challenges, replays included, and
+     * locks completing a challenge for `lockoutSeconds` after `maxFailedAttempts`; a completed challenge resets it. The
+     * factor-action counter (the preset's) counts refused factor proofs outside sign-in (wrong, replayed or missing) and
+     * after `maxFailedAttempts` refuses factor-weakening actions for `lockoutSeconds` with FACTOR_ACTIONS_LOCKED; only a
+     * successful proof resets it, never a sign-in. Neither locks the other.
+     *
+     * Factor proof, when the account has a verified second factor: a current TOTP code or an unused recovery code, checked
+     * under the user's lock through the replay ledger. Required to turn the factor off, to issue, regenerate or view
+     * recovery codes, to re-enrol or replace the authenticator (and to read its TOTP URI), to remove or reset trusted
+     * devices, to change the account email, to link a new sign-in identity and to add a password to an account without one.
+     * Not required to change the password (it needs the current one and ends the other sessions) or to unlink an identity
+     * (the last-method rule applies). A password reset by email never removes or skips the factor.
      */
     twoFactor: Object.freeze({ digits: 6, periodSeconds: 30, replaySeconds: 90, backupCodes: 10, backupCodePattern: '^[A-Za-z0-9]{5}-[A-Za-z0-9]{15}$', backupCodeInputLength: 21, maxFailedAttempts: 10, lockoutSeconds: 900 }),
     reset: Object.freeze({ expiresInSeconds: 3600, revokesSessions: true }),
@@ -94,7 +104,9 @@ const tokenHandle = (keys, token) => handlePrefix + mac(keys.session, token);
 // 'oidc-challenge:') || <stored challenge identifier>, which revokeProviderSessions joins on in SQL.
 const attemptsPrefix = '2fa-attempts-';
 const challengeProviderPrefix = 'oidc-challenge:';
-const namingPrefixes = [attemptsPrefix, challengeProviderPrefix];
+/** A trusted device a provider-bound sign-in set: 'oidc-trust:' || <stored trust-device identifier>, holding the provider. */
+const trustProviderPrefix = 'oidc-trust:';
+const namingPrefixes = [attemptsPrefix, challengeProviderPrefix, trustProviderPrefix];
 const keptPrefixes = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:', 'known-device-attempt:', 'known-device:'];
 function storedIdentifier(keys, identifier) {
     let head = '', rest = identifier;
@@ -478,6 +490,13 @@ function build(options, keys, locking, internal = {}) {
                     // better-auth's generateRandomString (letters, digits, '-' and '_'); its '2fa-attempts-' and '2fa-otp-' rows name
                     // the challenge and are always longer. completeOidcSession is a server call (no path); any other is a password sign-in.
                     const hook = context;
+                    // A trusted device set by a sign-in completed into a provider-bound session is tied to that provider.
+                    if (hook && data.identifier.startsWith('trust-device-')) {
+                        const provider = providerKey(hook.context.newSession?.session?.oidcProvider);
+                        if (provider !== undefined)
+                            await hook.context.internalAdapter.createVerificationValue({ identifier: trustProviderPrefix + data.identifier, value: provider, expiresAt: data.expiresAt });
+                        return;
+                    }
                     if (!hook || !/^2fa-[A-Za-z0-9_-]{20}$/.test(data.identifier))
                         return;
                     const provider = hook.path === undefined && typeof hook.body?.oidcUserId === 'string' ? providerKey(hook.body.provider) : undefined;
@@ -595,12 +614,111 @@ function build(options, keys, locking, internal = {}) {
         },
         /** The step a TOTP code is accepted for now, or undefined when it matches none, or only one at or before the last. */
         async fresh(store, userId, code, verifiedOnly) {
+            return (await ledger.inspect(store, userId, code, verifiedOnly)).fresh;
+        },
+        /** `fresh` as above, and whether the code matched a step that was already used (a replay). */
+        async inspect(store, userId, code, verifiedOnly) {
             const secret = await ledger.secretOf(store, userId, verifiedOnly);
             const { step: last } = await ledger.last(store, userId);
             const step = secret === undefined || typeof code !== 'string' ? undefined : matchedStep(secret, code);
-            return step !== undefined && step > last ? step : undefined;
+            return { fresh: step !== undefined && step > last ? step : undefined, replay: step !== undefined && step <= last };
         },
     };
+    /**
+     * The factor-action counter: one verification row per user, `factor-actions:<userId>`, holding the refused proofs in a
+     * row and the time factor actions are locked until. Read and written on the transaction holding the user's row.
+     */
+    const factorActions = {
+        row: (userId) => `factor-actions:${userId}`,
+        async read(store, userId) {
+            const row = await store.adapter.findOne({ model: 'verification', where: [{ field: 'identifier', value: factorActions.row(userId) }] });
+            let state = { failures: 0, lockedUntil: 0 };
+            try {
+                if (row)
+                    state = { failures: 0, lockedUntil: 0, ...JSON.parse(row.value) };
+            }
+            catch { /* a malformed row counts as none */ }
+            const failures = Number.isSafeInteger(state.failures) ? state.failures : 0, lockedUntil = Number.isSafeInteger(state.lockedUntil) ? state.lockedUntil : 0;
+            // An expired lock starts the count again, as better-auth's sign-in lockout does.
+            return { row, failures: lockedUntil && lockedUntil <= Date.now() ? 0 : failures, lockedUntil: lockedUntil > Date.now() ? lockedUntil : 0 };
+        },
+        async write(store, userId, failures, lockedUntil, row) {
+            const value = JSON.stringify({ failures, lockedUntil }), expiresAt = new Date(Date.now() + 366 * 86_400_000);
+            if (row)
+                await store.adapter.update({ model: 'verification', where: [{ field: 'id', value: row.id }], update: { value, expiresAt } });
+            else
+                await store.internalAdapter.createVerificationValue({ identifier: factorActions.row(userId), value, expiresAt });
+        },
+        async locked(store, userId) {
+            const { lockedUntil } = await factorActions.read(store, userId);
+            return lockedUntil ? Math.max(1, Math.ceil((lockedUntil - Date.now()) / 1000)) : 0;
+        },
+        async failed(store, userId) {
+            const { row, failures } = await factorActions.read(store, userId);
+            const count = failures + 1;
+            await factorActions.write(store, userId, count >= factor.maxFailedAttempts ? 0 : count, count >= factor.maxFailedAttempts ? Date.now() + factor.lockoutSeconds * 1000 : 0, row);
+        },
+        async succeeded(store, userId) {
+            const { row, failures, lockedUntil } = await factorActions.read(store, userId);
+            if (row && (failures || lockedUntil))
+                await factorActions.write(store, userId, 0, 0, row);
+        },
+    };
+    /** The user's verified second factor, or undefined (none, or an enrolment not yet confirmed). */
+    const verifiedFactor = async (store, userId) => {
+        const row = await store.adapter.findOne({ model: 'twoFactor', where: [{ field: 'userId', value: userId }] });
+        return row && row.verified !== false ? row : undefined;
+    };
+    /** Consumes an unused recovery code of the verified factor; false when it is not one of them. */
+    const consumeRecoveryCode = async (store, userId, code) => {
+        const row = await verifiedFactor(store, userId);
+        if (!row || !new RegExp(factor.backupCodePattern).test(code))
+            return false;
+        let codes;
+        try {
+            codes = JSON.parse(await symmetricDecrypt({ key: store.secretConfig, data: row.backupCodes }));
+        }
+        catch {
+            return false;
+        }
+        if (!Array.isArray(codes) || !codes.includes(code))
+            return false;
+        const backupCodes = await symmetricEncrypt({ key: store.secretConfig, data: JSON.stringify(codes.filter(item => item !== code)) });
+        await store.adapter.update({ model: 'twoFactor', where: [{ field: 'id', value: row.id }], update: { backupCodes } });
+        return true;
+    };
+    /**
+     * A factor proof for the user the transaction holds: a fresh TOTP code (recorded in the ledger) or an unused recovery
+     * code (consumed). 'locked' while factor actions are locked; a refused proof is counted, a successful one resets the
+     * count.
+     */
+    const proveFactor = async (store, userId, code) => {
+        const lockedFor = await factorActions.locked(store, userId);
+        if (lockedFor)
+            return { lockedFor };
+        let proved = false;
+        if (typeof code === 'string') {
+            const step = await ledger.fresh(store, userId, code, true);
+            if (step !== undefined) {
+                await ledger.record(store, userId, step);
+                proved = true;
+            }
+            else
+                proved = await consumeRecoveryCode(store, userId, code);
+        }
+        if (proved)
+            await factorActions.succeeded(store, userId);
+        else
+            await factorActions.failed(store, userId);
+        return proved ? 'proved' : 'refused';
+    };
+    /** better-auth's own answer to a wrong code on a session-bound verification, so a refused proof reads the same. */
+    const wrongCode = (bound, request) => {
+        const url = new URL(request.url);
+        url.pathname = url.pathname.replace(/\/two-factor\/[^/]+\/*$/i, '/two-factor/verify-totp');
+        return bound.handler(new Request(url, { method: 'POST', headers: request.headers, body: JSON.stringify({ code: notACode }) }));
+    };
+    const factorActionsLocked = (seconds) => new Response(JSON.stringify({ code: 'FACTOR_ACTIONS_LOCKED', message: 'Too many wrong codes. Try again later.', retryAfterSeconds: seconds }), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': String(seconds) } });
     /**
      * A TOTP request (verify-totp, at sign-in or with a session) run through the ledger: a code that is not fresh reaches
      * better-auth as a code that matches nothing, so it is refused, counted and answered exactly as a wrong code; a fresh
@@ -917,12 +1035,15 @@ function build(options, keys, locking, internal = {}) {
                 async check(code) {
                     if (!open)
                         throw closed();
-                    const store = await storeOf(bound);
-                    const step = await ledger.fresh(store, lockedUserId, code, true);
-                    if (step === undefined)
-                        return false;
-                    await ledger.record(store, lockedUserId, step);
-                    return true;
+                    const proof = await proveFactor(await storeOf(bound), lockedUserId, code);
+                    if (typeof proof === 'object')
+                        throw new FactorActionsLockedError(proof.lockedFor);
+                    return proof === 'proved';
+                },
+                async factorOn() {
+                    if (!open)
+                        throw closed();
+                    return (await verifiedFactor(await storeOf(bound), lockedUserId)) !== undefined;
                 },
             });
         }
@@ -1224,7 +1345,25 @@ function build(options, keys, locking, internal = {}) {
                 const [row] = await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, current.user.id)).for('no key update');
                 if (!row)
                     return challengeRefused();
-                return bind(tx, { userId: row.id, email: undefined }, bound => throughLedger(bound, row.id, request, sent => bound.handler(sent)), 'twoFactor');
+                return bind(tx, { userId: row.id, email: undefined }, async (bound) => {
+                    const store = await storeOf(bound);
+                    const route = /\/two-factor\/([^/]+)\/*$/i.exec(new URL(request.url).pathname)?.[1]?.toLowerCase();
+                    // Turning the factor off, recovery codes, re-enrolling and the TOTP URI, while a verified factor is on.
+                    if (route !== undefined && factorWeakening.has(route) && await verifiedFactor(store, row.id)) {
+                        const body = await request.clone().json().catch(() => undefined);
+                        const proof = await proveFactor(store, row.id, body?.code);
+                        if (typeof proof === 'object')
+                            return factorActionsLocked(proof.lockedFor);
+                        if (proof === 'refused')
+                            return wrongCode(bound, request);
+                    }
+                    if (route === 'verify-totp') {
+                        const body = await request.clone().json().catch(() => undefined);
+                        if ((await ledger.inspect(store, row.id, body?.code, false)).replay)
+                            await factorActions.failed(store, row.id);
+                    }
+                    return throughLedger(bound, row.id, request, sent => bound.handler(sent));
+                }, 'twoFactor');
             });
         }
         catch (error) {
@@ -1275,6 +1414,18 @@ const disabledRoutes = Object.freeze({
 const passwordRoute = /\/sign-in\/email\/*$/i;
 /** The TOTP verification route. */
 const totpRoute = /\/two-factor\/verify-totp\/*$/i;
+/** The session-bound two-factor routes that weaken or replace a factor, and need a proof of it while it is on. */
+const factorWeakening = new Set(['disable', 'generate-backup-codes', 'enable', 'get-totp-uri', 'view-backup-codes']);
+/** Factor actions are locked after too many refused proofs; `retryAfterSeconds` says for how long. */
+export class FactorActionsLockedError extends Error {
+    code = 'FACTOR_ACTIONS_LOCKED';
+    retryAfterSeconds;
+    constructor(retryAfterSeconds) {
+        super('Too many wrong codes. Try again later.');
+        this.name = 'FactorActionsLockedError';
+        this.retryAfterSeconds = retryAfterSeconds;
+    }
+}
 /** What a code that is not fresh is replaced with: it matches no step, so better-auth refuses and counts it as wrong. */
 const notACode = '------';
 /** The step in better-auth's window (current ±1) a TOTP code matches, the latest if several, or undefined. */
@@ -1467,6 +1618,7 @@ const oidcRefusals = {
     OIDC_IDENTITY_IN_USE: [409, 'This provider identity is linked to another account.'],
     OIDC_IDENTITY_NOT_FOUND: [404, 'This provider identity is not linked to the account.'],
     OIDC_LAST_SIGN_IN_METHOD: [409, 'Set a password or link another provider before unlinking the last way to sign in.'],
+    OIDC_FACTOR_PROOF_REQUIRED: [403, 'Enter a code from your authenticator app, or a recovery code, to link this provider.'],
 };
 /** A refusal of a linked-identity operation: `status` is the HTTP status that fits and `message` is safe to show. */
 export class OidcIdentityError extends Error {
@@ -1545,9 +1697,10 @@ export async function signInOidcUser(db, claims, provider, { emailLockKey = 109_
     }
 }
 /**
- * Checks a TOTP code for an app's own account action, inside `withLockedAuth` on its `tx`, for the user it locked: true
- * only for a code of that user's verified factor whose step is newer than the last one accepted anywhere (sign-in,
- * enrolment, another action), and records that step, so the code is refused everywhere afterwards.
+ * Checks a factor proof for an app's own account action, inside `withLockedAuth` on its `tx`, for the user it locked:
+ * true only for a TOTP code of that user's verified factor whose step is newer than the last one accepted anywhere
+ * (sign-in, enrolment, another action), which it records, or an unused recovery code, which it consumes. A refusal
+ * counts toward the factor-action counter; while factor actions are locked it throws FactorActionsLockedError.
  */
 export async function verifyCodeForAction(tx, userId, code) {
     return codeCheckOf(tx, 'verifyCodeForAction', userId).check(code);
@@ -1557,8 +1710,12 @@ export async function verifyCodeForAction(tx, userId, code) {
  * after the app verified an ID token the user obtained while signed in. `linked` is false when the identity already
  * belongs to this user. An identity linked to another account is refused with OIDC_IDENTITY_IN_USE; nothing moves it.
  */
-export async function linkOidcIdentity(tx, identity) {
+export async function linkOidcIdentity(tx, identity, { code } = {}) {
     const userId = lockedUser(tx, 'linkOidcIdentity');
+    // A new way in for an account with a second factor needs a proof of it, checked like verifyCodeForAction's.
+    const checks = codeCheckOf(tx, 'linkOidcIdentity', userId);
+    if (await checks.factorOn() && (code === undefined || !await checks.check(code)))
+        throw new OidcIdentityError('OIDC_FACTOR_PROOF_REQUIRED');
     const key = identityKey(identity?.issuer, identity?.subject);
     const inserted = await tx.insert(accountTable).values({ id: randomUUID(), userId, ...key })
         .onConflictDoNothing({ target: [accountTable.providerId, accountTable.accountId] }).returning({ id: accountTable.id });
@@ -1628,6 +1785,10 @@ export async function revokeProviderSessions(db, provider) {
         WHERE starts_with(identifier, ${challengeProviderPrefix}) AND value = ${key})
       DELETE FROM verification WHERE identifier IN (SELECT identifier FROM bound UNION ALL SELECT challenge FROM bound UNION ALL SELECT ${attemptsPrefix} || challenge FROM bound)`);
         const ended = await tx.delete(sessionTable).where(eq(sessionTable.oidcProvider, key)).returning({ userId: sessionTable.userId });
+        // The trusted devices those sign-ins set, with the rows that tie them to the provider.
+        await tx.execute(sql `WITH bound AS (SELECT identifier, substr(identifier, ${trustProviderPrefix.length + 1}) AS trusted FROM verification
+        WHERE starts_with(identifier, ${trustProviderPrefix}) AND value = ${key})
+      DELETE FROM verification WHERE identifier IN (SELECT identifier FROM bound UNION ALL SELECT trusted FROM bound)`);
         const users = [...new Set(ended.map(row => row.userId))];
         if (users.length)
             await tx.execute(sql `DELETE FROM verification WHERE value IN ${users} AND starts_with(identifier, ${devicePrefix})`);

@@ -18,8 +18,18 @@ export declare const ten98AuthPolicy: Readonly<{
      * a code whose step is at or before it is refused everywhere a TOTP code is taken. `replaySeconds` is how long that
      * refusal can matter (the ±1-step window). Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
      * `backupCodeInputLength` characters as typed, with the hyphen.
-     * The lockout counts failures during sign-in challenges only; session-bound step-up checks are limited per user by the
-     * app (`rateLimits.accountSecurityWritesPerUser`).
+     * Two counters. The sign-in lockout (better-auth's) counts failed codes in sign-in challenges, replays included, and
+     * locks completing a challenge for `lockoutSeconds` after `maxFailedAttempts`; a completed challenge resets it. The
+     * factor-action counter (the preset's) counts refused factor proofs outside sign-in (wrong, replayed or missing) and
+     * after `maxFailedAttempts` refuses factor-weakening actions for `lockoutSeconds` with FACTOR_ACTIONS_LOCKED; only a
+     * successful proof resets it, never a sign-in. Neither locks the other.
+     *
+     * Factor proof, when the account has a verified second factor: a current TOTP code or an unused recovery code, checked
+     * under the user's lock through the replay ledger. Required to turn the factor off, to issue, regenerate or view
+     * recovery codes, to re-enrol or replace the authenticator (and to read its TOTP URI), to remove or reset trusted
+     * devices, to change the account email, to link a new sign-in identity and to add a password to an account without one.
+     * Not required to change the password (it needs the current one and ends the other sessions) or to unlink an identity
+     * (the last-method rule applies). A password reset by email never removes or skips the factor.
      */
     twoFactor: Readonly<{
         digits: 6;
@@ -373,6 +383,12 @@ export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'wit
  * as keyed hashes; the cookie cache stays off and no secondary storage is used, so no token is kept anywhere else.
  */
 export declare function createTen98Auth(options: Ten98AuthOptions): Ten98Auth;
+/** Factor actions are locked after too many refused proofs; `retryAfterSeconds` says for how long. */
+export declare class FactorActionsLockedError extends Error {
+    readonly code: 'FACTOR_ACTIONS_LOCKED';
+    readonly retryAfterSeconds: number;
+    constructor(retryAfterSeconds: number);
+}
 /** More than one account matches an email: the unique index on lower(email) is missing. Nothing is picked. */
 export declare class AmbiguousAccountError extends Error {
     readonly code: 'AMBIGUOUS_ACCOUNT';
@@ -389,7 +405,7 @@ export declare class SchemaMismatchError extends Error {
     readonly missing: readonly string[];
     constructor(missing: readonly string[]);
 }
-export type OidcIdentityErrorCode = 'OIDC_EMAIL_UNVERIFIED' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OIDC_IDENTITY_NOT_FOUND' | 'OIDC_LAST_SIGN_IN_METHOD';
+export type OidcIdentityErrorCode = 'OIDC_EMAIL_UNVERIFIED' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OIDC_IDENTITY_NOT_FOUND' | 'OIDC_LAST_SIGN_IN_METHOD' | 'OIDC_FACTOR_PROOF_REQUIRED';
 /** A refusal of a linked-identity operation: `status` is the HTTP status that fits and `message` is safe to show. */
 export declare class OidcIdentityError extends Error {
     readonly status: 403 | 404 | 409;
@@ -431,9 +447,10 @@ export declare function signInOidcUser(db: AnyDatabase, claims: OidcClaims, prov
     created: boolean;
 }>;
 /**
- * Checks a TOTP code for an app's own account action, inside `withLockedAuth` on its `tx`, for the user it locked: true
- * only for a code of that user's verified factor whose step is newer than the last one accepted anywhere (sign-in,
- * enrolment, another action), and records that step, so the code is refused everywhere afterwards.
+ * Checks a factor proof for an app's own account action, inside `withLockedAuth` on its `tx`, for the user it locked:
+ * true only for a TOTP code of that user's verified factor whose step is newer than the last one accepted anywhere
+ * (sign-in, enrolment, another action), which it records, or an unused recovery code, which it consumes. A refusal
+ * counts toward the factor-action counter; while factor actions are locked it throws FactorActionsLockedError.
  */
 export declare function verifyCodeForAction(tx: AnyDatabase, userId: string, code: string): Promise<boolean>;
 /**
@@ -441,7 +458,9 @@ export declare function verifyCodeForAction(tx: AnyDatabase, userId: string, cod
  * after the app verified an ID token the user obtained while signed in. `linked` is false when the identity already
  * belongs to this user. An identity linked to another account is refused with OIDC_IDENTITY_IN_USE; nothing moves it.
  */
-export declare function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity): Promise<{
+export declare function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity, { code }?: {
+    code?: string;
+}): Promise<{
     linked: boolean;
 }>;
 /** What `unlinkOidcIdentity` counts as another way to sign in. */
