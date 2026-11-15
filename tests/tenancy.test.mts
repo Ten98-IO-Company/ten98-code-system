@@ -8,7 +8,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { getTableConfig, PgDialect, pgTable, serial, text } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 import { createPool, teamSchema, transaction } from '../db.mjs';
-import { createTenancy, DatabaseRoleError, WorkspaceAccessError, workspaceNotFound } from '../tenancy.mjs';
+import { createTenancy, DatabaseRoleError, UnlockedScopeError, WorkspaceAccessError, workspaceNotFound } from '../tenancy.mjs';
 import * as tenancyTesting from '../tenancy-testing.mjs';
 
 const tenancy = createTenancy({ setting: 'app.workspace_ids', column: 'workspace_id', tables: ['note'] });
@@ -146,10 +146,25 @@ test('the exported transaction refuses a database it cannot run safely instead o
   const Minified = class a extends ScriptedPool {}, minified = new Minified({});
   assert.equal(await transaction(drizzle(minified as never), async () => 'done'), 'done');
   assert.deepEqual([minified.sent, minified.released], [['begin', 'commit'], [false]]);
-  // A single client is Drizzle's own transaction on that client: nothing to check out or release.
-  const sent: string[] = [], client = { query: async (config: string | { text: string }) => { sent.push(typeof config === 'string' ? config : config.text); return { rows: [], fields: [] }; } };
+  // A pg Client (a checked-out client is one) is Drizzle's own transaction on that client: nothing to check out or release.
+  const sent: string[] = [], query = async (config: string | { text: string }) => { sent.push(typeof config === 'string' ? config : config.text); return { rows: [], fields: [] }; };
+  const client = Object.assign(new pg.Client(), { query });
   assert.equal(await transaction(drizzle(client as never), async () => 'done'), 'done');
   assert.deepEqual(sent, ['begin', 'commit']);
+  // Wrappers are refused, whatever their shape: statements through them could run on different backends.
+  for (const wrapped of [{ query, connect: async () => ({ query, release: () => undefined }) }, { query, release: () => undefined }, { query }]) {
+    await assert.rejects(transaction(drizzle(wrapped as never), async () => 'unreached'), refusedDatabase);
+  }
+  assert.deepEqual(sent, ['begin', 'commit']);
+});
+
+test('the exported transaction sends SET TRANSACTION only for a config that sets something', async () => {
+  const pool = new ScriptedPool({});
+  for (const config of [undefined, {}, { accessMode: undefined }]) assert.equal(await transaction(drizzle(pool as never), async () => 'done', config), 'done');
+  assert.deepEqual(pool.sent, ['begin', 'commit', 'begin', 'commit', 'begin', 'commit']);
+  const configured = new ScriptedPool({});
+  await transaction(drizzle(configured as never), async () => undefined, { accessMode: 'read only' });
+  assert.deepEqual(configured.sent, ['begin', 'set', 'commit']);
 });
 
 // Integration tests on real PostgreSQL, opt-in: set TEN98_TEST_DATABASE_URL to a disposable server (a superuser URL; each
@@ -396,7 +411,7 @@ test('a nested scoped call gives the caller its own scope back, after success an
   });
 });
 
-const unlocked = (error: unknown) => error instanceof Error && /nested in a READ ONLY transaction may admit only workspaces/u.test(error.message);
+const unlocked = (error: unknown) => error instanceof UnlockedScopeError && error.code === 'TENANCY_SCOPE_UNLOCKED';
 
 test('a scoped call nested in a READ ONLY transaction admits only memberships a helper share-locked, and fails closed otherwise', { skip }, async () => {
   const db = appDb(), readOnly = (error: unknown) => sqlState(error) === '25006';
@@ -456,6 +471,108 @@ test('a removal waits for a nested read of a locked membership, and cannot commi
   } finally {
     await root!.query("INSERT INTO membership(workspace_id, user_id, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING", [fixture.w2, fixture.a]);
   }
+});
+
+test('one user\'s locked membership never admits another user\'s nested read of the same workspace', { skip }, async () => {
+  // A owns W2 and D edits W2. The outer read locks A's membership row only; D's row stays unlocked.
+  const db = appDb(), visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note)).map(row => row.id);
+  let removed = false;
+  const removeD = async () => {
+    await root!.query('DELETE FROM membership WHERE workspace_id = $1 AND user_id = $2', [fixture.w2, fixture.d]);
+    removed = true;
+  };
+  const asD = (tx: Parameters<Parameters<typeof tenancy.withWorkspaces<typeof db, unknown>>[3]>[0]) => [
+    // In a savepoint, through withWorkspace and withWorkspaces, and joined as outer.
+    () => tenancy.withWorkspace(tx, fixture.d, fixture.w2, 'read', async inner => { await removeD(); return visible(inner); }),
+    () => tenancy.withWorkspaces(tx, fixture.d, [fixture.w2], async inner => { await removeD(); return visible(inner); }),
+    () => tenancy.withWorkspace(db, fixture.d, fixture.w2, 'read', async inner => { await removeD(); return visible(inner); }, tx),
+  ];
+  try {
+    for (const index of [0, 1, 2]) {
+      await assert.rejects(tenancy.withWorkspaces(db, fixture.a, [fixture.w2], tx => asD(tx)[index]!()), unlocked, `nested call ${index}`);
+      assert.equal(removed, false, `nested call ${index} ran its callback`);
+    }
+  } finally {
+    await root!.query("INSERT INTO membership(workspace_id, user_id, role) VALUES ($1, $2, 'editor') ON CONFLICT DO NOTHING", [fixture.w2, fixture.d]);
+  }
+});
+
+test('locks released by a rollback the helper did not make never admit a later nested read', { skip }, async () => {
+  const db = appDb(), visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note)).map(row => row.id);
+  const failure = new Error('the inner callback failed');
+  // An outer-joined call inside a helper savepoint that then throws: the savepoint's rollback releases W2's lock.
+  await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'write', async tx => {
+    await assert.rejects(tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'write', async inner => {
+      await tenancy.withWorkspace(db, fixture.a, fixture.w2, 'write', async () => undefined, inner);
+      throw failure;
+    }), error => error === failure);
+    await tx.setTransaction({ accessMode: 'read only' });
+    await assert.rejects(tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible), unlocked);
+  });
+  // A raw SAVEPOINT and ROLLBACK TO around an outer-joined call.
+  await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'write', async tx => {
+    await tx.execute(sql`SAVEPOINT caller`);
+    await tenancy.withWorkspace(db, fixture.a, fixture.w2, 'write', async () => undefined, tx);
+    await tx.execute(sql`ROLLBACK TO SAVEPOINT caller`);
+    await tx.setTransaction({ accessMode: 'read only' });
+    await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w2, 'read', visible, tx), unlocked);
+  });
+  // A helper call given the parent inside the caller's own Drizzle savepoint, which then rolls back.
+  await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'write', async tx => {
+    await assert.rejects(tx.transaction(async () => {
+      await tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'write', async () => undefined);
+      throw failure;
+    }), error => error === failure);
+    await tx.setTransaction({ accessMode: 'read only' });
+    await assert.rejects(tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible), unlocked);
+    // The top-level lock on W1 still holds and still admits.
+    assert.deepEqual(await tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'read', visible), [fixture.w1]);
+  });
+  // Documented limit, failing closed: the caller's own Drizzle savepoint has no record, though the lock is held.
+  await assert.rejects(tenancy.withWorkspaces(db, fixture.a, [fixture.w1], tx => tx.transaction(own => tenancy.withWorkspace(own, fixture.a, fixture.w1, 'read', visible))), unlocked);
+});
+
+test('a REPEATABLE READ read-only transaction of the caller never admits a membership its snapshot still shows after removal', { skip }, async () => {
+  const db = appDb(), visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note)).map(row => row.id);
+  try {
+    await db.transaction(async outer => {
+      await outer.execute(sql`SELECT 1`); // takes the snapshot, in which A is still a member of W2
+      await root!.query('DELETE FROM membership WHERE workspace_id = $1 AND user_id = $2', [fixture.w2, fixture.a]);
+      await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w2, 'read', visible, outer), unlocked);
+      await assert.rejects(tenancy.withWorkspaces(outer, fixture.a, [fixture.w2], visible), unlocked);
+    }, { isolationLevel: 'repeatable read', accessMode: 'read only' });
+  } finally {
+    await root!.query("INSERT INTO membership(workspace_id, user_id, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING", [fixture.w2, fixture.a]);
+  }
+});
+
+test('a lock record never outlives its transaction: a stale transaction object inside a later READ ONLY transaction is refused', { skip }, async () => {
+  // One connection, so the stale object's statements land in the later transaction on that same connection.
+  const single = createPool(urlFor(roles.app), { max: 1 });
+  pools.push(single);
+  const db = drizzle(single, { schema }), visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note)).map(row => row.id);
+  type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+  let stale: Tx | undefined;
+  const failure = new Error('the callback failed');
+  // Reused after the helper's transaction committed, and after it rolled back.
+  for (const end of ['commit', 'rollback'] as const) {
+    const finished = tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], async tx => { stale = tx as Tx; if (end === 'rollback') throw failure; });
+    if (end === 'rollback') await assert.rejects(finished, error => error === failure); else await finished;
+    await db.transaction(async () => {
+      await assert.rejects(tenancy.withWorkspace(stale!, fixture.a, fixture.w1, 'read', visible), unlocked, `${end}: as db`);
+      await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', visible, stale), unlocked, `${end}: as outer`);
+      await assert.rejects(tenancy.withWorkspaces(stale!, fixture.a, [fixture.w1], visible), unlocked, `${end}: withWorkspaces`);
+    }, { accessMode: 'read only' });
+  }
+  // A caller's own ROLLBACK and BEGIN READ ONLY inside a live helper transaction starts a transaction the record does not cover.
+  await tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], async tx => {
+    await tx.execute(sql`ROLLBACK`);
+    await tx.execute(sql`BEGIN READ ONLY`);
+    await assert.rejects(tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'read', visible), unlocked, 'after ROLLBACK and BEGIN');
+    await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', visible, tx), unlocked, 'as outer, after ROLLBACK and BEGIN');
+  });
+  // The live record still admits within its own transaction.
+  assert.deepEqual(await tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], tx => tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'read', visible)), [fixture.w1]);
 });
 
 // Last: this changes D's membership.

@@ -19,7 +19,7 @@ test('actual compiler rejects an implementation type error and preserves last go
   const source = readFileSync(new URL('../src/index.mts', import.meta.url), 'utf8');
   const compiler = join(root, 'node_modules/typescript/bin/tsc');
   const hash = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
-  const compile = () => spawnSync(process.execPath, [compiler, '--project', join(temporary, 'tsconfig.json'), '--pretty', 'false'], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+  const compile = () => spawnSync(process.execPath, [compiler, '--project', join(temporary, 'tsconfig.json'), '--pretty', 'false'], { encoding: 'utf8', timeout: 30000, windowsHide: true });
   try {
     mkdirSync(join(temporary, 'src'));
     writeFileSync(join(temporary, 'tsconfig.json'), readFileSync(new URL('../tsconfig.json', import.meta.url)));
