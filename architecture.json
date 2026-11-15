@@ -628,7 +628,8 @@
         "@types/pg": "8.15.6",
         "better-auth": "1.7.7",
         "drizzle-orm": "0.45.2",
-        "pg": "8.23.0"
+        "pg": "8.23.0",
+        "zod": "4.6.6"
       },
       "sharedDependencies": [],
       "sharedDevDependencies": [
@@ -637,7 +638,8 @@
       "peerDependencies": {
         "better-auth": "1.7.7",
         "drizzle-orm": "0.45.2",
-        "pg": "8.23.0"
+        "pg": "8.23.0",
+        "zod": "4.6.6"
       },
       "checkScripts": [
         "test",
@@ -723,7 +725,9 @@
           "tenancy.mjs": "Generated row-level security tenancy entry from src/tenancy.mts, exported as ./tenancy only; needs the optional drizzle-orm and pg peers.",
           "tenancy.d.mts": "Generated declarations from src/tenancy.mts.",
           "tenancy-testing.mjs": "Generated test-only scope setter from src/tenancy-testing.mts, exported as ./tenancy/testing only, never from ./tenancy or the root.",
-          "tenancy-testing.d.mts": "Generated declarations from src/tenancy-testing.mts."
+          "tenancy-testing.d.mts": "Generated declarations from src/tenancy-testing.mts.",
+          "config.mjs": "Generated environment and secret reader from src/config.mts, exported as ./config only; loadConfig needs the optional zod peer.",
+          "config.d.mts": "Generated declarations from src/config.mts."
         },
         "compilerProjects": [
           "tsconfig.json",
