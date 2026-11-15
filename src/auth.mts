@@ -116,7 +116,7 @@ function storedIdentifier(keys: TokenKeys, identifier: string): string {
 // limiter to spare it the account-wide bucket. Each is a verification row `known-device:<deviceId>` (value: the user id,
 // expiresAt: its 90 days) with one `known-device-attempt:<deviceId>` row per attempt it was trusted for since its last
 // success; at 5 it is no longer trusted. Both prefixes are kept in storage, so a user's rows go with one prefix filter.
-const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts: 5, entries: 5, devices: 5, cookieLength: 1024 } as const;
+const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts: 5, entries: 5, devices: 5, cookieLength: 1024, claims: { concurrency: 2, queue: 8, waitMs: 1000 } } as const;
 const devicePrefix = 'known-device', deviceRow = (deviceId: string) => `known-device:${deviceId}`, attemptRow = (deviceId: string) => `known-device-attempt:${deviceId}`;
 type DeviceEntry = { readonly deviceId: string; readonly tag: string; readonly text: string };
 const deviceEntryPattern = /^([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/;
@@ -459,14 +459,20 @@ export type PasswordSignIn = { email: string; password: string; source: string; 
  */
 export type PasswordAttempt = { email: string; source: string; knownDevice: boolean };
 /**
- * The app's limiter for `signInWithPassword`, asked in two steps; each counts the attempt and answers anything but `true`
- * with 429. `source` comes first, before anything touches the database: the per-source and per-pair (source and email)
- * limits, so a flood the app refuses costs a counter and nothing else. Only an attempt it allows has its known-device
- * cookie checked; `account` then gets `knownDevice` and may skip the account-wide bucket for it, and only that bucket.
+ * One step's answer: `true` allows the attempt; `{ retryAfterSeconds }` (an integer from 1 to 86400) refuses it with that
+ * wait; `false`, or anything else, refuses it with a wait of 60 seconds. Every refusal is a 429 with `Retry-After`.
+ */
+export type PasswordLimitAnswer = boolean | { retryAfterSeconds: number };
+/**
+ * The app's limiter for `signInWithPassword`, asked in two steps. `source` comes first, before anything touches the
+ * database: the per-source and per-pair (source and email) limits, so a flood the app refuses costs a counter and nothing
+ * else. Only an attempt it allows has its known-device cookie checked; `account` then gets `knownDevice` and may skip the
+ * account-wide bucket for it, and only that bucket. Both are asked before the password is checked: count an attempt
+ * against the failure buckets once its response is the 401, never on a 429 or a success.
  */
 export type PasswordSignInLimits = {
-  source(attempt: Omit<PasswordAttempt, 'knownDevice'>): boolean | Promise<boolean>;
-  account(attempt: PasswordAttempt): boolean | Promise<boolean>;
+  source(attempt: Omit<PasswordAttempt, 'knownDevice'>): PasswordLimitAnswer | Promise<PasswordLimitAnswer>;
+  account(attempt: PasswordAttempt): PasswordLimitAnswer | Promise<PasswordLimitAnswer>;
 };
 
 /**
@@ -565,11 +571,9 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
         const provider = providerKey((context.body as Record<string, unknown> | undefined)?.provider);
         if (provider === undefined) throw APIError.fromStatus('BAD_REQUEST');
         const user = await verifiedUser(context, 'oidcUserId');
-        // closedAt is undefined only when the app's Drizzle user table does not map closed_at: then usability cannot be
-        // judged, so the sign-in fails loudly instead of skipping the check. An unusable account gets the unknown-user 401.
-        const closedAt = (user as { closedAt?: Date | null }).closedAt;
-        if (closedAt === undefined) throw new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
-        if (await usable({ id: user.id, email: user.email, closedAt }) !== true) throw APIError.fromStatus('UNAUTHORIZED');
+        // The same usability read as the reset routes (storedAccount): an unmapped closed_at fails loudly, never open, and
+        // an unusable account gets the unknown-user 401.
+        if (await refusedAccount(await getCurrentAdapter(context.context.adapter), { field: 'id', value: user.id })) throw APIError.fromStatus('UNAUTHORIZED');
         return issue(context, user, provider);
       }),
     },
@@ -704,7 +708,23 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
 
   /** The isAccountUsable hook, refusing a closed account by default. */
   const usable = (account: { id: string; email: string; closedAt: Date | null }) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
-  const usableUser = (user: { id: string; email: string; closedAt?: Date | null }) => usable({ id: user.id, email: user.email, closedAt: user.closedAt ?? null });
+  /**
+   * The account an isAccountUsable check outside signInWithPassword reads (a reset or completeOidcSession, by id or
+   * lower-cased email): one
+   * indexed read of the user row's id, email and closedAt, never joined, so it costs the same whether or not a row
+   * exists. Through the adapter, whose user model must map closed_at as closedAt: without it the select throws, so the
+   * check fails loudly instead of being skipped (instanceSchema refuses such an adapter at start-up).
+   */
+  const storedAccount = async (adapter: unknown, where: { field: 'id' | 'email'; value: string }) => {
+    const found = await (adapter as { findOne<T>(query: { model: string; where: { field: string; value: string }[]; select: string[] }): Promise<T | null> })
+      .findOne<{ id: string; email: string; closedAt?: Date | null }>({ model: 'user', where: [where], select: ['id', 'email', 'closedAt'] });
+    if (found && found.closedAt === undefined) throw new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
+    return found;
+  };
+  const refusedAccount = async (adapter: unknown, where: { field: 'id' | 'email'; value: string }) => {
+    const found = await storedAccount(adapter, where);
+    return found !== null && await usable({ id: found.id, email: found.email, closedAt: found.closedAt ?? null }) !== true;
+  };
 
   const auth = betterAuth({
     database: protectTokens(database as AdapterFactory, keys) as unknown as BetterAuthOptions['database'], baseURL: origin, secret, appName, trustedOrigins: [origin],
@@ -720,10 +740,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     // oidcProvider is server-set only (input: false): no request can bind or unbind a session.
     session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false },
       additionalFields: { oidcProvider: { type: 'string', required: false, input: false } } },
-    // closed_at, read by completeOidcSession's usability check; never written through better-auth nor returned by it.
-    user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false } } },
+    // closed_at, read by every isAccountUsable check outside signInWithPassword (storedAccount); never written through
+    // better-auth nor returned by it.
+    user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false, defaultValue: () => null } } },
     // Identities are linked and unlinked only through linkOidcIdentity and unlinkOidcIdentity, under the user's lock.
-    disabledPaths: ['/unlink-account', '/list-accounts'],
+    disabledPaths: [...Object.keys(disabledRoutes)],
     databaseHooks,
     plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
     emailAndPassword: {
@@ -753,12 +774,12 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // route with an address no account has (a reset token no row has), so it takes the route's own unknown-email (invalid
       // token) path, after the same validation and origin checks: the same answer, no token, nothing sent.
       const { internalAdapter } = context.context;
+      const adapter = await getCurrentAdapter(context.context.adapter);
       const body = (context.body ?? {}) as { email?: unknown; token?: unknown };
       // A body the route's own schema rejects is left to the route, so its 400 stays the same for every account.
       if (context.path === '/request-password-reset' && sendResetPassword && typeof body.email === 'string' && resetBody.safeParse(body).success) {
-        // Every request makes this lookup, so a refused account costs what an unknown email does.
-        const found = await internalAdapter.findUserByEmail(body.email, { includeAccounts: true });
-        if (found && await usableUser(found.user as { id: string; email: string; closedAt?: Date | null }) !== true) {
+        // Every request makes this one read, so an existing account costs what an unknown email does.
+        if (await refusedAccount(adapter, { field: 'email', value: body.email.toLowerCase() })) {
           return { context: { body: { ...body, email: `${randomBytes(12).toString('hex')}@unusable-account.invalid` } } };
         }
       }
@@ -766,8 +787,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
         const token = body.token || (context.query as { token?: unknown } | undefined)?.token;
         if (typeof token !== 'string' || !token) return;
         const row = await internalAdapter.findVerificationValue(`reset-password:${token}`);
-        const user = row ? await internalAdapter.findUserById(row.value) : null;
-        if (user && await usableUser(user as { id: string; email: string; closedAt?: Date | null }) !== true) {
+        if (row && await refusedAccount(adapter, { field: 'id', value: row.value })) {
           return { context: { body: { ...body, token: randomBytes(18).toString('base64url') } } };
         }
       }
@@ -793,6 +813,14 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   });
   // The request-reset route's body schema, as better-auth validates it after the before hooks; read before any wrapping.
   const resetBody = (auth.api as unknown as { requestPasswordReset: { options: { body: { safeParse(input: unknown): { success: boolean } } } } }).requestPasswordReset.options.body;
+  // disabledPaths turns a route off in the router only: its server call (auth.api.*) would still run. Each one throws
+  // instead, naming what to use, on this instance and on every bound one.
+  for (const [name, endpoint] of Object.entries(auth.api as unknown as Record<string, { path?: unknown }>)) {
+    const path = typeof endpoint?.path === 'string' ? endpoint.path : undefined;
+    if (path === undefined || !Object.hasOwn(disabledRoutes, path)) continue;
+    const message = `auth.api.${name} (${path}) is off in the preset: ${disabledRoutes[path]}.`;
+    Object.assign(auth.api, { [name]() { throw new TypeError(message); } });
+  }
   const helpers = {
     storedVerificationIdentifier: (identifier: string) => storedIdentifier(keys, raw(identifier)),
     sessionTokenKey: (token: string) => tokenHandle(keys, raw(token)),
@@ -826,6 +854,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   const slots = boundedSlots(options.passwordVerification);
   const { concurrency: laneConcurrency = 1, queue: laneQueue = 20, waitMs: laneWaitMs = options.passwordVerification?.waitMs } = options.passwordVerification?.knownDevices ?? {};
   const lane = boundedSlots({ concurrency: laneConcurrency, queue: laneQueue, waitMs: laneWaitMs }, 'passwordVerification.knownDevices');
+  const claims = boundedSlots(device.claims, 'knownDeviceClaims');
   void modernDummy();
 
   /**
@@ -903,7 +932,20 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     refuseLockedAuth(db, 'withLockedAuth');
     const outside = {};
     if (await getCurrentAdapter(outside as never) !== outside) throw new TypeError('withLockedAuth cannot run inside a better-auth request or hook.');
-    await schemaOf(db as AnyDatabase);
+    await instanceSchema(db as AnyDatabase);
+  };
+  /** The database schema, then the adapter's user model: it must map closed_at as closedAt, which the reset checks read. */
+  let adapterChecked: { check: Promise<void>; retryAt: number } | undefined;
+  const instanceSchema = async (db: AnyDatabase) => {
+    await schemaOf(db);
+    adapterChecked = recheckable(adapterChecked, async () => {
+      // Drizzle cannot build a select of an unmapped field and throws a TypeError; any other failure is reported as it is.
+      try { await storedAccount((await storeOf(auth)).adapter, { field: 'id', value: '' }); } catch (error) {
+        if (error instanceof TypeError) throw new SchemaMismatchError(['closedAt (closed_at) in the adapter\'s user model']);
+        throw error;
+      }
+    });
+    return adapterChecked.check;
   };
   // Parameterised raw statements by necessity: Drizzle has no builder for set_config or advisory locks. The timeout comes
   // first, so the lock statements that follow cannot wait forever.
@@ -929,6 +971,13 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     const store = await storeOf(auth);
     const entries = deviceEntries(cookieFrom(headers, store.createAuthCookie(device.cookie).name));
     if (!entries.length) return undefined;
+    // At most `device.claims` claims at once in this process (each one pool read, then one short locked transaction)
+    // and a few waiting; past that the browser counts as not known, so its cookie never holds more of the pool than that.
+    const release = await claims();
+    if (!release) return undefined;
+    try { return await claimed(db, address, entries); } finally { release(); }
+  };
+  const claimed = async (db: AnyDatabase, address: string, entries: DeviceEntry[]): Promise<string | undefined> => {
     const [account] = await db.select({ id: userTable.id }).from(userTable).where(sql`lower(${userTable.email}) = lower(${address})`).limit(1);
     const entry = account ? deviceFor(keys, account.id, entries) : undefined;
     if (!account || !entry) return undefined;
@@ -971,10 +1020,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // Origin and Sec-Fetch-Site are checked here: a cross-site form cannot sign a victim in to another account.
       if (crossSite(headers, origin)) return refusal(403, 'CROSS_SITE_SIGN_IN', 'Sign in from this site.');
       const address = email.trim().toLowerCase();
-      const tooMany = () => refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+      const tooMany = (answer: unknown) => refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.', { 'retry-after': String(retryAfter(answer)) });
       // 1. The app's per-source limits, counted before anything touches the database: a flood the app refuses costs a
       // counter, never a pool connection, and one source cannot fill the verification queue.
-      if (await sourceLimit({ email: address, source }) !== true) return tooMany();
+      const sourceAnswer = await sourceLimit({ email: address, source });
+      if (sourceAnswer !== true) return tooMany(sourceAnswer);
       // 2. Whether this browser is a known device of the account behind this email: it then claims one of the device's
       // attempts (released again below unless the password was checked). It never authenticates; it only tells the app.
       const claim = await claimDevice(db, address, headers);
@@ -982,7 +1032,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // 3. The app's account-wide limit, which may spare a known device its bucket, still before any hash or queue.
       let allowed: unknown;
       try { allowed = await accountLimit({ email: address, source, knownDevice: claim !== undefined }); } catch (error) { await unclaim(); throw error; }
-      if (allowed !== true) { await unclaim(); return tooMany(); }
+      if (allowed !== true) { await unclaim(); return tooMany(allowed); }
       // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
       if (password.length > ten98AuthPolicy.password.maxLength) return refused();
       // 4. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
@@ -1030,7 +1080,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       return response.status === 401 ? refused() : response;
     },
     assertEmailIndex: db => emailIndex(db),
-    assertSchema: db => schemaOf(db),
+    assertSchema: db => instanceSchema(db),
     async verifyTwoFactor(db, request) {
       await ready(db, () => undefined);
       if (!(request instanceof Request) || !challengeRoute.test(new URL(request.url).pathname)) throw new TypeError('verifyTwoFactor completes a request to /two-factor/verify-totp, -backup-code or -otp.');
@@ -1088,6 +1138,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
 let dummyModernHash: Promise<string> | undefined;
 const modernDummy = () => (dummyModernHash ??= hashPassword('ten98-timing-equaliser'));
 const lockedContext = new AsyncLocalStorage<true>();
+/** The better-auth routes the preset turns off, router and server call alike, and what to use instead. */
+const disabledRoutes: Readonly<Record<string, string>> = Object.freeze({
+  '/unlink-account': 'use unlinkOidcIdentity inside withLockedAuth',
+  '/list-accounts': 'read the user\'s identities from the account table',
+});
 /** better-auth's password route, in any case and with any trailing slash. */
 const passwordRoute = /\/sign-in\/email\/*$/i;
 /** The two-factor routes that complete a sign-in's challenge, in any case and with any trailing slash. */
@@ -1151,13 +1206,26 @@ export class SchemaMismatchError extends Error {
     this.missing = missing;
   }
 }
-const schemaChecks = new WeakMap<object, Promise<void>>();
+type Recheckable = { check: Promise<void>; retryAt: number };
+/** How long a failed start-up check is answered from memory before it runs again. */
+const recheckMs = 2000;
+/**
+ * The check in `entry`, or a new run of `run`: a pass (or a run in flight) is kept for good; a failure is answered from
+ * memory for `recheckMs`, then checked again, so fixing the schema needs no restart and a wrong one costs one query per
+ * interval, not one per attempt.
+ */
+function recheckable(entry: Recheckable | undefined, run: () => Promise<void>): Recheckable {
+  if (entry && Date.now() < entry.retryAt) return entry;
+  const fresh: Recheckable = { check: run(), retryAt: Number.POSITIVE_INFINITY };
+  fresh.check.catch(() => { fresh.retryAt = Date.now() + recheckMs; });
+  return fresh;
+}
+const schemaChecks = new WeakMap<object, Recheckable>();
 /** The tables and columns, then the email index; cached per database like the index check. */
 function schemaOf(db: AnyDatabase): Promise<void> {
-  let check = schemaChecks.get(db);
-  if (!check) {
+  const entry = recheckable(schemaChecks.get(db), () =>
     // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
-    check = db.execute(sql`SELECT t.name, a.attname AS "column" FROM unnest(string_to_array(${Object.keys(schemaTables).join(',')}, ',')) AS t(name)
+    db.execute(sql`SELECT t.name, a.attname AS "column" FROM unnest(string_to_array(${Object.keys(schemaTables).join(',')}, ',')) AS t(name)
         LEFT JOIN pg_attribute a ON a.attrelid = to_regclass(quote_ident(t.name)) AND a.attnum > 0 AND NOT a.attisdropped`)
       .then(result => {
         const found = new Map<string, Set<string>>();
@@ -1175,11 +1243,9 @@ function schemaOf(db: AnyDatabase): Promise<void> {
         if (missing.length) throw new SchemaMismatchError(missing);
       })
       .then(() => identityIndex(db))
-      .then(() => emailIndex(db));
-    check.catch(() => schemaChecks.delete(db));
-    schemaChecks.set(db, check);
-  }
-  return check;
+      .then(() => emailIndex(db)));
+  schemaChecks.set(db, entry);
+  return entry.check;
 }
 
 /**
@@ -1195,25 +1261,21 @@ async function identityIndex(db: AnyDatabase): Promise<void> {
   if ((result as unknown as { rows: { indexed: boolean }[] }).rows[0]?.indexed !== true) throw new SchemaMismatchError([`account unique ("${accountTable.providerId.name}", "${accountTable.accountId.name}")`]);
 }
 
-// One check per database object. Only a pass is remembered: a refusal, or a failed query, is checked again on the next
-// call, so fixing the schema needs no restart.
-const emailIndexChecks = new WeakMap<object, Promise<void>>();
+// One check per database object, kept like the schema check: a pass for good, a refusal for `recheckMs`.
+const emailIndexChecks = new WeakMap<object, Recheckable>();
 function emailIndex(db: AnyDatabase): Promise<void> {
-  let check = emailIndexChecks.get(db);
-  if (!check) {
+  const entry = recheckable(emailIndexChecks.get(db), () =>
     // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
-    check = db.execute(sql`SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${`"${getTableName(userTable)}"`})
+    db.execute(sql`SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${`"${getTableName(userTable)}"`})
         AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indnatts = 1 AND (
           -- lower(email) on a text column, or lower(email::text) on a varchar one
           pg_get_expr(i.indexprs, i.indrelid) IN ('lower(email)', 'lower((email)::text)')
           -- or a plain unique index on a citext email column, which compares case-insensitively itself
           OR (i.indexprs IS NULL AND EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
             WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[0] AND a.attname = 'email' AND t.typname = 'citext')))) AS indexed`)
-      .then(result => { if ((result as unknown as { rows: { indexed: boolean }[] }).rows[0]?.indexed !== true) throw new MissingEmailIndexError(); });
-    check.catch(() => emailIndexChecks.delete(db));
-    emailIndexChecks.set(db, check);
-  }
-  return check;
+      .then(result => { if ((result as unknown as { rows: { indexed: boolean }[] }).rows[0]?.indexed !== true) throw new MissingEmailIndexError(); }));
+  emailIndexChecks.set(db, entry);
+  return entry.check;
 }
 
 /** An app's provider key: at most 256 characters, not blank, with no control characters; undefined for anything else. */
@@ -1418,6 +1480,11 @@ function crossSite(headers: HeadersInit | undefined, origin: string): boolean {
 
 const refusal = (status: number, code: string, message: string, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify({ code, message }), { status, headers: { 'content-type': 'application/json', ...headers } });
+/** The wait a limiter's refusal names: its `retryAfterSeconds` when that is an integer from 1 to 86400, otherwise 60. */
+function retryAfter(answer: unknown): number {
+  const seconds = (answer as { retryAfterSeconds?: unknown } | null)?.retryAfterSeconds;
+  return typeof seconds === 'number' && Number.isInteger(seconds) && seconds >= 1 && seconds <= 86_400 ? seconds : 60;
+}
 /** One answer for an unknown email, a wrong password and an account without a password. */
 const refused = () => refusal(401, 'INVALID_EMAIL_OR_PASSWORD', 'Invalid email or password');
 

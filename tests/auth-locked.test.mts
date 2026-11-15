@@ -1478,6 +1478,7 @@ test('the email index may be lower(email), lower(email::text) on varchar or a un
     await assert.rejects(lateAuth.assertSchema(lateDb!), MissingEmailIndexError);
     // The index added while the app runs: the next call passes, with no restart.
     await pool!.query('CREATE UNIQUE INDEX ON late."user" (lower(email))');
+    await delay(2100);
     assert.equal(await lateAuth.assertSchema(lateDb!), undefined);
     assert.equal(await lateAuth.withLockedAuthByEmail(lateDb!, address('none'), async (_bound, _tx, userId) => userId), undefined);
   } finally { await Promise.all(pools.map(item => item.end())); }
@@ -1937,13 +1938,15 @@ test('the guide closure checklist leaves no session, no known device and no rese
     return seen;
   };
   assert.equal(await known(), true);
-  // The guide's checklist, as written: closed_at set, then the user's sessions and every verification row it owns deleted,
-  // in the app's closure transaction.
-  await transaction(db, async tx => {
-    await tx.execute(sql`UPDATE "user" SET closed_at = now() WHERE id = ${id}`);
-    await tx.execute(sql`DELETE FROM session WHERE "userId" = ${id}`);
-    await tx.execute(sql`DELETE FROM verification WHERE value = ${id}`);
-  });
+  // The guide's closure statements, read from the guide and run as written, in one transaction.
+  const statements = closureStatements();
+  assert.equal(statements.length, 3, statements.join(' | '));
+  const client = await pool!.connect();
+  try {
+    await client.query('BEGIN');
+    for (const statement of statements) await client.query(statement, [id]);
+    await client.query('COMMIT');
+  } finally { client.release(); }
   assert.equal(await closing.api.getSession({ headers: { cookie: browser.header() } }), null);
   assert.equal(await known(), false);
   assert.equal((await resetRequest(closing, '/reset-password', { token: sent[0], newPassword: NEW_PASSWORD })).status, 400);
@@ -1972,4 +1975,256 @@ test('a right password on a closed account is refused before the lock: it never 
     assert.equal((await openSignIn).status, 200);
     assert.equal(await sessions(id), 0);
   } finally { await holder.query('SELECT pg_advisory_unlock_all()'); holder.release(); }
+});
+
+// The guide's account-closure statements, from its `sql` block under **Account closure.**
+function closureStatements(): string[] {
+  const guide = readFileSync(new URL('../docs/FEATURE-ADOPTION.md', import.meta.url), 'utf8');
+  const block = /\*\*Account closure\.\*\*[\s\S]*?```sql\n([\s\S]*?)```/.exec(guide);
+  assert.ok(block, 'the guide has an Account closure sql block');
+  return block[1]!.split(';').map(statement => statement.trim()).filter(Boolean);
+}
+
+// The median of a list of numbers.
+const median = (values: number[]) => { const sorted = [...values].sort((a, b) => a - b); return sorted[Math.floor(sorted.length / 2)]!; };
+
+test('a reset request costs the same for an unknown email, a closed account and a usable one', { skip }, async () => {
+  const resetting = authOver(db, { sendResetPassword: () => {} });
+  const usableEmail = address('reset-timing'), closedEmail = address('reset-timing');
+  await account_(usableEmail);
+  await pool!.query('UPDATE "user" SET closed_at = now() WHERE id = $1', [await account_(closedEmail)]);
+  const timed = async (email: string) => {
+    const started = performance.now();
+    const response = await resetRequest(resetting, '/request-password-reset', { email, redirectTo: '/' });
+    await response.text();
+    assert.equal(response.status, 200);
+    return performance.now() - started;
+  };
+  for (let warm = 0; warm < 20; warm++) for (const email of [address('nobody'), closedEmail, usableEmail]) await timed(email);
+  // 600 samples, interleaved in a fresh random order each round so drift and load fall on every kind alike.
+  const closed: number[] = [], usable: number[] = [], unknown: number[] = [];
+  for (let round = 0; round < 200; round++) {
+    const kinds = ['unknown', 'closed', 'usable'].sort(() => Math.random() - 0.5);
+    const took: Record<string, number> = {};
+    for (const kind of kinds) took[kind] = await timed(kind === 'unknown' ? address('nobody') : kind === 'closed' ? closedEmail : usableEmail);
+    unknown.push(took.unknown!);
+    closed.push(took.closed! - took.unknown!);
+    usable.push(took.usable! - took.unknown!);
+  }
+  // The tolerance is a share of an unknown email's median time, so it holds on a fast and a slow machine alike: the joined
+  // lookup added 17 to 35% for an existing account. A closed account takes the route's unknown-email path after the
+  // preset's read, so that read alone separates it from an unknown email: within 10% is parity. A usable account also
+  // stores a token and sends, which better-auth's own route does whether or not the preset reads first; it is reported.
+  const base = median(unknown);
+  assert.ok(Math.abs(median(closed)) < base * 0.1, `closed minus unknown: median ${median(closed).toFixed(2)} ms of ${base.toFixed(2)} ms (usable: ${median(usable).toFixed(2)} ms)`);
+});
+
+// The user table of an app whose Drizzle schema does not map closed_at.
+const bareUser = pgTable('user', {
+  id: text('id').primaryKey(), name: text('name').notNull(), email: text('email').notNull(), emailVerified: boolean('emailVerified').notNull(), image: text('image'),
+  createdAt: stamp('createdAt').notNull(), updatedAt: stamp('updatedAt').notNull(), twoFactorEnabled: boolean('twoFactorEnabled'),
+});
+
+test('an adapter whose user model does not map closedAt is refused at start-up, and its resets fail closed', { skip }, async () => {
+  const bareSchema = { ...schema, user: bareUser };
+  const bareAdapter = (client: unknown) => drizzleAdapter(client as Database, { provider: 'pg', schema: bareSchema });
+  const sent: string[] = [];
+  const bare = createTen98Auth({ database: bareAdapter(db), transactionDatabase: bareAdapter, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test', sendResetPassword: ({ token }) => { sent.push(token); } });
+  await assert.rejects(bare.assertSchema(db), (error: unknown) => error instanceof SchemaMismatchError && /closedAt/.test(error.message));
+  const email = address('bare');
+  const id = await account_(email);
+  await pool!.query('UPDATE "user" SET closed_at = now() WHERE id = $1', [id]);
+  const response = await resetRequest(bare, '/request-password-reset', { email, redirectTo: '/' });
+  assert.equal(response.status, 500);
+  assert.deepEqual([sent.length, await resetRows(id)], [0, 0]);
+  // Control: the same app with the runtime's user table passes and refuses the closed account as an unknown email.
+  assert.equal(await authOver(db).assertSchema(db), undefined);
+});
+
+test('a flood of one valid device cookie that the account step refuses never fills the pool', { skip }, async () => {
+  const email = address('claim-flood'), bystander = address('claim-flood');
+  await account_(email);
+  await account_(bystander);
+  const flood = new pg.Pool({ connectionString: url, max: 10 });
+  try {
+    const floodDb = drizzle(flood, { schema });
+    const floodAuth = authOver(floodDb);
+    await floodAuth.assertSchema(floodDb);
+    const valid = jar().take(await floodAuth.signInWithPassword(floodDb, { source: SOURCE, email, password: PASSWORD }, allow)).header();
+    let known = 0;
+    const refuseEveryAccount = { source: () => true, account: (attempt: PasswordAttempt) => { if (attempt.knownDevice) known++; return false; } };
+    let waiters = 0;
+    const sampler = setInterval(() => { waiters = Math.max(waiters, flood.waitingCount); }, 2);
+    const until = performance.now() + 1500;
+    const workers = Array.from({ length: 200 }, async () => {
+      while (performance.now() < until) {
+        assert.equal((await floodAuth.signInWithPassword(floodDb, { source: `ip:${randomUUID()}`, email, password: PASSWORD, headers: { cookie: valid } }, refuseEveryAccount)).status, 429);
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    });
+    await delay(200);
+    const started = performance.now();
+    const other = await floodAuth.signInWithPassword(floodDb, { source: `ip:${randomUUID()}`, email: bystander, password: PASSWORD }, allow);
+    const waited = performance.now() - started;
+    await Promise.all(workers);
+    clearInterval(sampler);
+    assert.deepEqual([waiters, other.status], [0, 200]);
+    assert.ok(waited < 2500, `another user's sign-in took ${waited.toFixed(0)} ms`);
+    // The cookie was still recognised while the claims kept within their bound.
+    assert.ok(known > 0);
+  } finally { await flood.end(); }
+});
+
+test('a failed schema check is answered from memory for two seconds, then checked again', { skip }, async () => {
+  await pool!.query('CREATE SCHEMA recheck; CREATE TABLE recheck."user" (LIKE public."user" INCLUDING ALL); ALTER TABLE recheck."user" DROP COLUMN closed_at');
+  const counted = new pg.Pool({ connectionString: url, max: 2, options: '-c search_path=recheck,public' });
+  try {
+    let catalogue = 0;
+    const query = counted.query.bind(counted) as (...args: unknown[]) => unknown;
+    (counted as unknown as { query: (...args: unknown[]) => unknown }).query = (...args: unknown[]) => {
+      const text = typeof args[0] === 'string' ? args[0] : (args[0] as { text?: string })?.text;
+      if (text?.includes('pg_attribute')) catalogue++;
+      return query(...args);
+    };
+    const countedDb = drizzle(counted, { schema });
+    const checked = authOver(countedDb);
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await assert.rejects(checked.signInWithPassword(countedDb, { source: SOURCE, email: address('recheck'), password: PASSWORD }, allow), SchemaMismatchError);
+    }
+    assert.equal(catalogue, 1);
+    await delay(2100);
+    await assert.rejects(checked.assertSchema(countedDb), SchemaMismatchError);
+    assert.equal(catalogue, 2);
+  } finally { await counted.end(); }
+});
+
+test('closedAt can be neither set by a client nor read from a response', { skip }, async () => {
+  const email = address('closed-field');
+  const id = await account_(email);
+  const signedIn = await signIn(email);
+  assert.equal(signedIn.status, 200);
+  assert.equal('closedAt' in ((await signedIn.clone().json()) as { user: Record<string, unknown> }).user, false);
+  const cookie = cookieOf(signedIn);
+  const session = await auth.handler(new Request(`${ORIGIN}/api/auth/get-session`, { headers: { cookie } }));
+  assert.equal('closedAt' in ((await session.json()) as { user: Record<string, unknown> }).user, false);
+  const update = await auth.handler(new Request(`${ORIGIN}/api/auth/update-user`, {
+    method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN, cookie }, body: JSON.stringify({ closedAt: new Date().toISOString() }),
+  }));
+  assert.equal(update.ok, false);
+  assert.equal((await pool!.query<{ closed: Date | null }>('SELECT closed_at AS closed FROM "user" WHERE id = $1', [id])).rows[0]!.closed, null);
+});
+
+test('every limiter refusal answers 429 with Retry-After: the step\'s own wait, or 60 seconds', { skip }, async () => {
+  const email = address('retry-after');
+  await account_(email);
+  const refusedWith = async (limits: Parameters<Ten98Auth['signInWithPassword']>[2]) => {
+    const response = await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, limits);
+    return [response.status, response.headers.get('retry-after')];
+  };
+  assert.deepEqual(await refusedWith({ source: () => ({ retryAfterSeconds: 120 }), account: () => true }), [429, '120']);
+  assert.deepEqual(await refusedWith({ source: () => true, account: () => ({ retryAfterSeconds: 30 }) }), [429, '30']);
+  assert.deepEqual(await refusedWith({ source: async () => ({ retryAfterSeconds: 86_400 }), account: () => true }), [429, '86400']);
+  assert.deepEqual(await refusedWith({ source: () => false, account: () => true }), [429, '60']);
+  assert.deepEqual(await refusedWith({ source: () => true, account: () => false }), [429, '60']);
+  // Out of range, not an integer or not a number: still refused, with the default wait.
+  for (const retryAfterSeconds of [0, 86_401, 1.5, -5, '30', Number.NaN] as unknown as number[]) {
+    assert.deepEqual(await refusedWith({ source: () => ({ retryAfterSeconds }), account: () => true }), [429, '60'], String(retryAfterSeconds));
+    assert.deepEqual(await refusedWith({ source: () => true, account: () => ({ retryAfterSeconds }) }), [429, '60'], String(retryAfterSeconds));
+  }
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).status, 200);
+});
+
+test('the server calls of the routes the preset turns off throw, naming what to use, on the held and the bound instance', { skip }, async () => {
+  const id = await account_(address('off-calls'));
+  const calls = (target: { api: unknown }) => target.api as unknown as Record<'unlinkAccount' | 'listUserAccounts', (input?: unknown) => unknown>;
+  assert.throws(() => calls(auth).unlinkAccount({ body: { providerId: 'credential' }, headers: {} }), (error: unknown) => error instanceof TypeError && /unlinkOidcIdentity/.test(error.message));
+  assert.throws(() => calls(auth).listUserAccounts({ headers: {} }), (error: unknown) => error instanceof TypeError && /account table/.test(error.message));
+  await auth.withLockedAuth(db, id, async bound => {
+    assert.throws(() => calls(bound).unlinkAccount({ body: { providerId: 'credential' }, headers: {} }), TypeError);
+    assert.throws(() => calls(bound).listUserAccounts({ headers: {} }), TypeError);
+  });
+  assert.equal((await pool!.query('SELECT 1 FROM account WHERE "userId"=$1 AND "providerId"=\'credential\'', [id])).rowCount, 1);
+});
+
+test('only a strict true from isAccountUsable or isIssuerUsable counts as usable', { skip }, async () => {
+  const user = await account_(address('truthy'));
+  for (const answer of [1, 'yes', {}, [], 'true']) {
+    const lenient = authOver(db, { isAccountUsable: () => answer as never });
+    assert.equal((await providerSignIn(user, 'idp', lenient)).status, 401, JSON.stringify(answer));
+  }
+  assert.equal(await sessions(user), 0);
+  const id = await account_(address('truthy-issuer'), { hash: null });
+  const identity = { issuer: ISSUER, subject: subject() }, other = { issuer: 'https://other.example.com', subject: subject() };
+  await auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, identity));
+  await auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, other));
+  for (const answer of [1, 'yes', {}, [], 'true']) {
+    await assert.rejects(auth.withLockedAuth(db, id, (_bound, tx) => unlinkOidcIdentity(tx, identity, { isIssuerUsable: () => answer as never })), refusedWith('OIDC_LAST_SIGN_IN_METHOD'), JSON.stringify(answer));
+  }
+  await auth.withLockedAuth(db, id, (_bound, tx) => unlinkOidcIdentity(tx, identity, { isIssuerUsable: () => true }));
+  assert.deepEqual((await identitiesOf(id)).length, 1);
+});
+
+test('a revocation pass a deadlock keeps aborting is retried a bounded number of times, then the error is thrown', { skip }, async () => {
+  const failing = new pg.Pool({ connectionString: url, max: 2 });
+  let aborted = 0;
+  const connect = failing.connect.bind(failing) as () => Promise<pg.PoolClient>;
+  (failing as unknown as { connect: () => Promise<pg.PoolClient> }).connect = async () => {
+    const client = await connect();
+    const query = client.query.bind(client) as (...args: unknown[]) => unknown;
+    (client as unknown as { query: (...args: unknown[]) => unknown }).query = (...args: unknown[]) => {
+      const text = typeof args[0] === 'string' ? args[0] : (args[0] as { text?: string })?.text;
+      // Every pass aborts as a deadlock victim, up to 20 times; past that a pass would succeed.
+      if (text?.includes('WITH bound AS') && aborted < 20) { aborted++; return Promise.reject(Object.assign(new Error('deadlock detected'), { code: '40P01' })); }
+      return query(...args);
+    };
+    return client;
+  };
+  try {
+    await assert.rejects(revokeProviderSessions(drizzle(failing, { schema }), 'deadlocked'), (error: unknown) => [error, (error as { cause?: unknown }).cause].some(item => (item as { code?: string } | null)?.code === '40P01'));
+    assert.equal(aborted, 5);
+  } finally { await failing.end(); }
+});
+
+test('a session with a stale challenge cookie of another account leaves that challenge\'s binding alone', { skip }, async () => {
+  // The raw instance routes session-bound verification itself; the guard keeps a challenge cookie from binding it.
+  const raw = authOver(db, { allowRawPasswordSignIn: true });
+  const factor = await challenged('stale-holder');
+  const stale = cookieOf(await providerSignIn(factor.id, 'p-stale'));
+  const bindings = async () => (await pool!.query('SELECT 1 FROM verification WHERE starts_with(identifier, \'oidc-challenge:\') AND value=\'p-stale\'')).rowCount;
+  assert.equal(await bindings(), 1);
+  const email = address('stale-session');
+  const id = await account_(email);
+  const session = cookieOf(await signIn(email));
+  const { totpURI } = await (await raw.handler(post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string };
+  const enrolled = await raw.handler(post('/two-factor/verify-totp', `${session}; ${stale}`, { code: totp(totpURI) }));
+  assert.equal(enrolled.status, 200);
+  assert.equal(await bindings(), 1);
+  const providers = (await pool!.query<{ provider: string | null }>('SELECT "oidcProvider" AS provider FROM session WHERE "userId"=$1', [id])).rows.map(row => row.provider);
+  assert.deepEqual(providers, [null]);
+});
+
+test('two concurrent invitation acceptances with one identity: the second waits on the first and is refused', { skip }, async () => {
+  // Two workspaces, so the acceptances share no workspace or invitation lock and meet only at the identity insert.
+  const invite = async (email: string) => {
+    const owner = await account_(address('race-owner'));
+    const workspace = await workspaceOf(owner);
+    return inTransaction(async client => team.inviteMember(client, workspace, owner, { email, role: 'viewer' }));
+  };
+  const [first, second] = [address('race-one'), address('race-two')];
+  const [one, two] = [await invite(first), await invite(second)];
+  const identity = { issuer: ISSUER, subject: subject() };
+  const [a, b] = [await pool!.connect(), await pool!.connect()];
+  try {
+    await a.query('BEGIN');
+    await b.query('BEGIN');
+    await team.acceptVerifiedOidcInvitation(a as unknown as TeamClient, one.token, { email: first, name: 'One', ...identity });
+    // Its pre-check cannot see the first's uncommitted identity, so it reaches the insert and waits there.
+    const racing = team.acceptVerifiedOidcInvitation(b as unknown as TeamClient, two.token, { email: second, name: 'Two', ...identity })
+      .then(() => 'accepted', (error: { code?: string }) => error.code);
+    await delay(200);
+    await a.query('COMMIT');
+    assert.equal(await racing, 'OIDC_IDENTITY_IN_USE');
+    await b.query('ROLLBACK');
+  } finally { a.release(); b.release(); }
+  assert.deepEqual([await usersAt(first), await usersAt(second)], [1, 0]);
 });
