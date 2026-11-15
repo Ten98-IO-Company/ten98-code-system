@@ -546,15 +546,29 @@ export function checkStartEntry(directory: string, manifest: PackageManifest, { 
   if (!existsSync(resolve(directory, START_FILE))) errors.push(`${START_FILE} is missing: a Start app exports startInstance = createStart(() => ten98StartOptions(...)) there, with ten98StartOptions from ${START_ENTRY}.`);
   else if (start) {
     const createStart = importedAs(start, START, 'createStart'), options = importedAs(start, START_ENTRY, 'ten98StartOptions');
-    const exported = start.some(node => node.type === 'ExportNamedDeclaration' && node.declaration?.type === 'VariableDeclaration' && node.declaration.kind === 'const'
-      && node.declaration.declarations.some((declarator: AstNode) => {
+    // Each callee must be bound by exactly one import, and the callback takes no parameters, so neither name can be
+    // shadowed: the file holds no other declarations.
+    const imported = start.flatMap(node => node.type === 'ImportDeclaration' ? node.specifiers.map((specifier: AstNode) => specifier.local.name as string) : []);
+    const importedOnce = (locals: Set<string>, name: string): boolean => locals.has(name) && imported.filter(local => local === name).length === 1;
+    const exported = start.find(node => node.type === 'ExportNamedDeclaration' && node.declaration?.type === 'VariableDeclaration' && node.declaration.kind === 'const'
+      && node.declaration.declarations.every((declarator: AstNode) => {
         const init = declarator.init, getOptions = init?.arguments?.[0], body = getOptions?.body;
-        return declarator.id.type === 'Identifier' && declarator.id.name === 'startInstance' && init?.type === 'CallExpression' && init.callee.type === 'Identifier' && createStart.has(init.callee.name)
-          && init.arguments.length === 1 && getOptions.type === 'ArrowFunctionExpression' && getOptions.expression === true
-          && body.type === 'CallExpression' && body.callee.type === 'Identifier' && options.has(body.callee.name);
+        return declarator.id.type === 'Identifier' && declarator.id.name === 'startInstance' && init?.type === 'CallExpression' && init.callee.type === 'Identifier' && importedOnce(createStart, init.callee.name)
+          && init.arguments.length === 1 && getOptions.type === 'ArrowFunctionExpression' && getOptions.expression === true && getOptions.params.length === 0
+          && body.type === 'CallExpression' && body.callee.type === 'Identifier' && importedOnce(options, body.callee.name);
       }));
+    let instanceNames = 0;
+    const countInstanceNames = (node: unknown): void => {
+      if (Array.isArray(node)) return node.forEach(countInstanceNames);
+      if (!node || typeof node !== 'object') return;
+      if ((node as AstNode).type === 'Identifier' && (node as AstNode).name === 'startInstance') instanceNames++;
+      for (const value of Object.values(node)) if (value && typeof value === 'object') countInstanceNames(value);
+    };
+    countInstanceNames(start);
     if (!exported) errors.push(`${START_FILE} must export const startInstance = createStart(() => ten98StartOptions(...)), returning ten98StartOptions from ${START_ENTRY} directly, so the shared error serialisation and CSRF middleware cannot be dropped.`);
-    else if (createStartUses(start, createStart).calls !== 1) errors.push(`${START_FILE} must call createStart only once, for startInstance.`);
+    else if (start.some(node => node !== exported && node.type !== 'ImportDeclaration') || instanceNames !== 1) {
+      errors.push(`${START_FILE} must hold only its imports and the startInstance export, and name startInstance nowhere else, so nothing else can change the start instance.`);
+    } else if (createStartUses(start, createStart).calls !== 1) errors.push(`${START_FILE} must call createStart only once, for startInstance.`);
   }
   const client = existsSync(resolve(directory, CLIENT_FILE)) ? parse(CLIENT_FILE) : undefined;
   if (!existsSync(resolve(directory, CLIENT_FILE))) errors.push(`${CLIENT_FILE} is missing: a Start app calls hydrateTen98Start() from ${START_ENTRY} there.`);

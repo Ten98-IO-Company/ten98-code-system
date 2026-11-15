@@ -49,12 +49,16 @@ test('the two one-line entries pass, aliased imports included', needsParser, () 
   }), []);
 });
 
+// The passing app with `files` replaced, or removed where undefined, gives exactly one error, matching `pattern`.
+const refused = (files: Record<string, string | undefined>, pattern: RegExp) => {
+  const errors = app(Object.fromEntries(Object.entries({ ...passing, ...files }).filter((entry): entry is [string, string] => entry[1] !== undefined)));
+  assert.equal(errors.length, 1, errors.join('\n'));
+  assert.match(errors[0]!, pattern);
+};
+const SHAPE = /^src\/start\.ts must export const startInstance = createStart\(\(\) => ten98StartOptions/;
+const IMPORTS = "import { createStart } from '@tanstack/react-start';\nimport { ten98StartOptions } from '@ten98/runtime/start';\n";
+
 test('each refusal names the file and the required shape', needsParser, () => {
-  const refused = (files: Record<string, string | undefined>, pattern: RegExp) => {
-    const errors = app(Object.fromEntries(Object.entries({ ...passing, ...files }).filter((entry): entry is [string, string] => entry[1] !== undefined)));
-    assert.equal(errors.length, 1, errors.join('\n'));
-    assert.match(errors[0]!, pattern);
-  };
   refused({ 'src/start.ts': undefined }, /^src\/start\.ts is missing/);
   refused({ 'src/client.tsx': undefined }, /^src\/client\.tsx is missing/);
   // Start's own options with no shared defaults, the shared options spread and overridden, a wrapper, and an import
@@ -67,7 +71,7 @@ test('each refusal names the file and the required shape', needsParser, () => {
     "import { createStart } from '@tanstack/react-start';\nimport { ten98StartOptions } from '@ten98/runtime/start';\nexport const instance = createStart(() => ten98StartOptions());\n",
     "import { createStart } from '@tanstack/react-start';\nimport { ten98StartOptions } from '@ten98/runtime/start';\nexport let startInstance = createStart(() => ten98StartOptions());\n",
   ]) refused({ 'src/start.ts': body }, /^src\/start\.ts must export const startInstance = createStart\(\(\) => ten98StartOptions/);
-  refused({ 'src/start.ts': `${START}export const other = createStart(() => ({}));\n` }, /^src\/start\.ts must call createStart only once/);
+  refused({ 'src/start.ts': START.replace('[auditMiddleware]', '[auditMiddleware, createStart(() => ({})) as never]') }, /^src\/start\.ts must call createStart only once/);
   for (const body of [
     "import { hydrateRoot } from 'react-dom/client';\nhydrateRoot(document, null);\n",
     "import { hydrateTen98Start } from '@ten98/runtime/start';\nif (Math.random() > 2) hydrateTen98Start();\n",
@@ -80,6 +84,32 @@ test('each refusal names the file and the required shape', needsParser, () => {
     "import * as Start from '@tanstack/react-start';\nexport const second = Start.createStart(() => ({}));\n",
     "export { createStart } from '@tanstack/react-start';\n",
   ]) refused({ 'src/server/other.ts': body }, /^src\/server\/other\.ts: createStart belongs in src\/start\.ts only/);
+});
+
+test('in src/start.ts ten98StartOptions is the import, and nothing else can reach the start instance', needsParser, () => {
+  for (const body of [
+    // A parameter, with or without a default, that shadows the import; a second import of the same local name.
+    `${IMPORTS}export const startInstance = createStart((ten98StartOptions = () => ({})) => ten98StartOptions());\n`,
+    `${IMPORTS}export const startInstance = createStart((ten98StartOptions: () => object) => ten98StartOptions() as never);\n`,
+    `${IMPORTS}import { ten98StartOptions as copy, ten98StartOptions } from './local-copy';\nexport const startInstance = createStart(() => ten98StartOptions());\n`,
+    // A second declarator in the export.
+    `${IMPORTS}export const startInstance = createStart(() => ten98StartOptions()), other = 1;\n`,
+  ]) refused({ 'src/start.ts': body }, SHAPE);
+  // Any other statement, or any other use of startInstance, could replace or change the start instance.
+  for (const body of [
+    `${START}export const other = createStart(() => ({}));\n`,
+    `${START}startInstance.getOptions = async () => ({}) as never;\n`,
+    `${START}Object.assign(startInstance, { getOptions: async () => ({}) });\n`,
+    `const prepared = 1;\n${START}`,
+    `${START}export default startInstance;\n`,
+    START.replace('auditMiddleware] }', 'auditMiddleware], ...Object.assign(startInstance, {}) as never }'),
+  ]) refused({ 'src/start.ts': body }, /^src\/start\.ts must hold only its imports and the startInstance export, and name startInstance nowhere else/);
+});
+
+test('a second createStart argument and an entry that does not parse are refusals', needsParser, () => {
+  refused({ 'src/start.ts': `${IMPORTS}export const startInstance = createStart(() => ten98StartOptions(), {} as never);\n` }, SHAPE);
+  refused({ 'src/start.ts': 'export const startInstance = ;\n' }, /^src\/start\.ts: cannot parse for the Start entry check/);
+  refused({ 'src/client.tsx': 'hydrateTen98Start(<\n' }, /^src\/client\.tsx: cannot parse for the Start entry check/);
 });
 
 test('no other file may carry an entry name Start resolves, so the checked entries are the ones Start runs', needsParser, () => {
