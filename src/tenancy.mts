@@ -11,6 +11,7 @@ import { pgPolicy, PgTransaction, type PgPolicy } from 'drizzle-orm/pg-core';
 import type pg from 'pg';
 import type { WorkspaceRole } from './browser.mjs';
 import { membership, transaction, workspace, type AnyDatabase, type ScopedTransaction } from './db.mjs';
+import { refuseLockedAuth } from './locked-auth.mjs';
 
 export type { ScopedTransaction } from './db.mjs';
 
@@ -185,6 +186,8 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
      */
     async withWorkspace<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceId: string, mode: WorkspaceMode,
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess) => Promise<T>, outer?: ScopedTransaction<TDatabase>): Promise<T> {
+      refuseLockedAuth(db, 'withWorkspace');
+      refuseLockedAuth(outer, 'withWorkspace');
       return scopedTransaction(db, outer, async (tx, caller, record, locked) => {
         const [access] = await memberships(tx, userId, [workspaceId], caller, record, locked);
         if (!access || (mode !== 'read' && !writers.includes(access.role))) throw new WorkspaceAccessError();
@@ -197,8 +200,9 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
      * the user cannot reach are left out silently; `run` receives the ones admitted. Given a transaction as `db` it runs in
      * a savepoint, as `withWorkspace` does, and restores the caller's scope.
      */
-    withWorkspaces<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceIds: readonly string[],
+    async withWorkspaces<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceIds: readonly string[],
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess[]) => Promise<T>): Promise<T> {
+      refuseLockedAuth(db, 'withWorkspaces');
       return scopedTransaction(db, undefined, async (tx, caller, record, locked) => {
         const access = await memberships(tx, userId, workspaceIds, caller, record, locked);
         if (!caller) await tx.setTransaction({ accessMode: 'read only' });

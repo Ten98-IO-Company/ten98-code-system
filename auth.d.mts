@@ -1,4 +1,6 @@
 import { type BetterAuthOptions } from 'better-auth';
+import { type AnyDatabase, type ScopedTransaction } from './db.mjs';
+export { LockedAuthTransactionError } from './locked-auth.mjs';
 /** The shared identity policy. Apps read it for forms and route limiters, so the numbers never drift between them. */
 export declare const ten98AuthPolicy: Readonly<{
     password: Readonly<{
@@ -56,9 +58,39 @@ export type ResetPasswordMessage = {
 };
 /** Verifies a Campaign `scrypt$salt$key` hash; any other format is not legacy and returns false. */
 export declare function verifyLegacyScryptHash(hash: string, password: string): Promise<boolean>;
+/**
+ * The `verification.identifier` the preset stores for a raw identifier, for an app that locks or reads the row with its
+ * own SQL. Prefer the instance method, which needs no secret.
+ */
+export declare function storedVerificationIdentifier(secret: string, identifier: string): string;
+/**
+ * The `session.token` the preset stores (a `v1.` handle) for a raw session token, the cookie's value without its
+ * signature. For an app's own read of session liveness; prefer the instance method, which needs no secret.
+ */
+export declare function sessionTokenKey(secret: string, token: string): string;
+/**
+ * The statements every app's numbered migration runs once when it adopts hashed token storage, separated as drizzle-kit
+ * separates statements. Rows stored in plain text before it would never match again: every session ends, and reset
+ * links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go with them.
+ * Rows an app writes with its own SQL are its own decision.
+ */
+export declare const tokenStorageUpgradeStatements: string;
+/** The user `withLockedAuth` was asked to lock does not exist; answer it as not found. */
+export declare class LockedAuthUserNotFoundError extends Error {
+    readonly status: 404;
+    readonly code: 'USER_NOT_FOUND';
+    constructor();
+}
 export interface Ten98AuthOptions {
-    /** The app's better-auth database adapter, such as `drizzleAdapter(db, { provider: 'pg', schema })`. */
+    /** The app's better-auth adapter factory, such as `drizzleAdapter(db, { provider: 'pg', schema })`. */
     database: BetterAuthOptions['database'];
+    /**
+     * The same adapter over one transaction, such as `tx => drizzleAdapter(tx, { provider: 'pg', schema })`. Needed by
+     * `withLockedAuth` and `withLockedAuthByEmail`, which bind a better-auth instance to the transaction they open.
+     */
+    transactionDatabase?(tx: ScopedTransaction<AnyDatabase>): BetterAuthOptions['database'];
+    /** The first key of the email advisory lock; the team controller's `emailLockKey`, 109859 by default. */
+    emailLockKey?: number;
     /** The app's public URL (APP_URL); validated with `appOrigin`. */
     appUrl: string;
     secret: string;
@@ -124,17 +156,52 @@ export interface Ten98Auth {
         completeOidcSession: ServerCall<{
             oidcUserId: string;
         }>;
+        /**
+         * Revokes the caller's other live sessions by id and keeps the current one (found from the cookie in `headers`).
+         * `revoked` counts the sessions it ended. The same endpoint serves POST /revoke-other-sessions.
+         */
+        revokeOtherSessions(input: {
+            headers: HeadersInit;
+        }): Promise<{
+            status: true;
+            revoked: number;
+        }>;
     };
     options: {
         readonly telemetry: {
             readonly enabled: false;
         };
     };
+    /** The stored `verification.identifier` for a raw identifier; see the standalone `storedVerificationIdentifier`. */
+    storedVerificationIdentifier(identifier: string): string;
+    /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
+    sessionTokenKey(token: string): string;
+    /**
+     * Runs `run` in one transaction (`transaction` from ./db) whose first statement locks the user row FOR NO KEY UPDATE,
+     * with a better-auth instance bound to that transaction. A missing user throws LockedAuthUserNotFoundError (404). The
+     * callback runs its own statements on `tx` and may lock that user's session, credential and verification rows, in
+     * that order; tenancy helpers and workspace-level team operations refuse the transaction. When `run` throws, or the
+     * transaction fails, nothing it did persists and the error is rethrown; Set-Cookie headers from inside are lost with it.
+     */
+    withLockedAuth<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>) => Promise<T>): Promise<T>;
+    /**
+     * `withLockedAuth` for a flow that knows only an email (password sign-in, reset request): takes the email advisory
+     * lock (`pg_advisory_xact_lock(emailLockKey, hashtext(email))`, the team controller's `lockEmail`) first, then locks
+     * that account's user row if there is one. `userId` is undefined when no account has the email.
+     */
+    withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
+}
+/** The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions. */
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail'> {
+    /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
+    readonly userId: string | undefined;
+    /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
+    revokeAllSessions(): Promise<void>;
 }
 /**
  * A better-auth instance with the Ten98 policy. Sign-up stays closed: the first-boot claim creates the owner in the
  * app's own transaction (hash with `hashPassword` from 'better-auth/crypto') and then signs in. Origin and CSRF checks
- * are pinned on, so no environment variable can turn them off.
+ * are pinned on, so no environment variable can turn them off. Session tokens and verification identifiers are stored
+ * as keyed hashes; the cookie cache stays off and no secondary storage is used, so no token is kept anywhere else.
  */
-export declare function createTen98Auth({ database, appUrl, secret, appName, sendResetPassword, legacyPasswords, allowPasswordless, cookiePrefix }: Ten98AuthOptions): Ten98Auth;
-export {};
+export declare function createTen98Auth(options: Ten98AuthOptions): Ten98Auth;

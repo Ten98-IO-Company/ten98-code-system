@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHmac, scryptSync } from 'node:crypto';
+import { createHmac, hkdfSync, scryptSync } from 'node:crypto';
+import { readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import { memoryAdapter } from 'better-auth/adapters/memory';
 import { hashPassword } from 'better-auth/crypto';
-import { createTen98Auth, ten98AuthPolicy, verifyLegacyScryptHash } from '../auth.mjs';
+import { createTen98Auth, sessionTokenKey, storedVerificationIdentifier, ten98AuthPolicy, verifyLegacyScryptHash } from '../auth.mjs';
 import type { Ten98AuthOptions } from '../auth.mjs';
 
 // better-auth on its in-memory adapter: no database, no network. Origin and cookies go through the real handler.
@@ -17,7 +18,8 @@ type Context = { internalAdapter: {
   createUser(user: Row): Promise<{ id: string }>;
   linkAccount(account: Row): Promise<unknown>;
   findAccounts(userId: string): Promise<{ providerId: string; password?: string | null }[]>;
-} };
+  createVerificationValue(data: { identifier: string; value: string; expiresAt: Date }): Promise<unknown>;
+}; adapter: { count(query: { model: string; where: { field: string; value: string }[] }): Promise<number> } };
 type Adapter = ReturnType<typeof memoryAdapter>;
 
 function setup(options: Partial<Ten98AuthOptions> = {}, wrap?: (adapter: Adapter) => Adapter) {
@@ -289,4 +291,169 @@ test('createTen98Auth refuses an invalid URL, a short secret, no app name or a b
   for (const options of [{ appUrl: 'ftp://example.com' }, { appUrl: 'http://example.com' }, { secret: 'short' }, { appName: ' ' }, { cookiePrefix: 'a;b' }, { cookiePrefix: '' }]) {
     assert.throws(() => createTen98Auth({ database, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test', ...options }), TypeError, JSON.stringify(options));
   }
+});
+
+// Tokens at rest (#131). The expected values are computed here from the published labels and rule, independently of
+// the preset, so a changed label, key derivation or prefix rule fails these tests.
+const keyFor = (label: string) => Buffer.from(hkdfSync('sha256', SECRET, '', label, 32));
+const hmacOf = (label: string, value: string) => createHmac('sha256', keyFor(label)).update(value).digest('base64url');
+const expectedHandle = (token: string) => `v1.${hmacOf('ten98-auth:session-token:v1', token)}`;
+const expectedIdentifier = (identifier: string): string => {
+  if (identifier.startsWith('2fa-attempts-')) return `2fa-attempts-${expectedIdentifier(identifier.slice('2fa-attempts-'.length))}`;
+  const prefix = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:'].find(candidate => identifier.startsWith(candidate));
+  const label = 'ten98-auth:verification-identifier:v1';
+  return prefix ? prefix + hmacOf(label, identifier.slice(prefix.length)) : `v1.${hmacOf(label, identifier)}`;
+};
+// A cookie's value without its better-call signature, and a value signed as better-call signs it.
+const cookieValue = (response: Response, suffix: string) => {
+  const pair = cookies(response).find(item => item.split('=')[0]!.endsWith(suffix))!;
+  const value = decodeURIComponent(pair.slice(pair.indexOf('=') + 1));
+  return value.slice(0, value.lastIndexOf('.'));
+};
+const signedCookie = (name: string, value: string) => `${name}=${encodeURIComponent(`${value}.${createHmac('sha256', SECRET).update(value).digest('base64')}`)}`;
+const get = (env: ReturnType<typeof setup>, path: string, cookie: string) => env.auth.handler(new Request(`${ORIGIN}/api/auth${path}`, { headers: cookie ? { cookie } : {} }));
+
+test('every better-auth 1.7.7 session-token path is one the storage wrapper was reviewed for', () => {
+  const dist = new URL('../node_modules/better-auth/dist/', import.meta.url);
+  const internal = readFileSync(new URL('db/internal-adapter.mjs', dist), 'utf8');
+  assert.deepEqual([...internal.matchAll(/^\t\t(\w*Session\w*): async/gm)].map(match => match[1]).sort(),
+    ['createSession', 'deleteSession', 'deleteSessions', 'deleteUserSessions', 'findSession', 'findSessions', 'listSessions', 'updateSession']);
+  const places: string[] = [];
+  for (const path of readdirSync(dist, { recursive: true, encoding: 'utf8' })) {
+    if (!path.endsWith('.mjs')) continue;
+    const file = path.replaceAll('\\', '/');
+    const found = readFileSync(new URL(file, dist), 'utf8').split('model: "session"').length - 1;
+    for (let at = 0; at < found; at++) places.push(file);
+  }
+  assert.deepEqual(places, Array(5).fill('db/internal-adapter.mjs'));
+});
+
+test('sessions are stored as keyed handles while the cookie, lookups and refreshes keep the raw token', async () => {
+  const env = setup();
+  await env.user('owner@example.com', await hashPassword(PASSWORD));
+  const signedIn = await env.signIn();
+  const token = cookieValue(signedIn, '.session_token');
+  assert.equal(env.db.session!.length, 1);
+  assert.equal(env.db.session![0]!.token, expectedHandle(token));
+  assert.equal(env.auth.sessionTokenKey(token), expectedHandle(token));
+  assert.equal(sessionTokenKey(SECRET, token), expectedHandle(token));
+  assert.equal(JSON.stringify(env.db).includes(token), false);
+  assert.equal((env.auth as unknown as { options: { session: { cookieCache: { enabled: boolean } } } }).options.session.cookieCache.enabled, false);
+  const cookie = cookieOf(signedIn);
+  assert.equal((await env.auth.api.getSession({ headers: { cookie } }))?.session.token, token);
+  // Past updateAge the session is extended and its cookie re-set; it must carry the raw token, not the handle.
+  env.db.session![0]!.expiresAt = new Date(Date.now() + (604_800 - 86_400 - 60) * 1000);
+  const refreshed = await get(env, '/get-session', cookie);
+  assert.equal(refreshed.status, 200);
+  assert.equal(cookieValue(refreshed, '.session_token'), token);
+  assert.ok((env.db.session![0]!.expiresAt as Date).getTime() > Date.now() + 604_000_000);
+  assert.ok(await env.auth.api.getSession({ headers: { cookie: cookieOf(refreshed) } }));
+  assert.equal(JSON.stringify(env.db).includes(token), false);
+});
+
+test('enabling two-factor replaces the session with another hashed one', async () => {
+  const env = setup();
+  const { cookie } = await withTwoFactor(env);
+  const pair = cookie.split('; ').find(item => item.split('=')[0]!.endsWith('.session_token'))!;
+  const value = decodeURIComponent(pair.slice(pair.indexOf('=') + 1));
+  const token = value.slice(0, value.lastIndexOf('.'));
+  assert.deepEqual(env.db.session!.map(row => row.token), [expectedHandle(token)]);
+  assert.equal(JSON.stringify(env.db.session).includes(token), false);
+});
+
+test('listings show handles; revoke-other keeps the current session by id; a handle neither revokes nor signs in', async () => {
+  const env = setup();
+  const id = await env.user('owner@example.com', await hashPassword(PASSWORD));
+  const responses = [await env.signIn(), await env.signIn(), await env.signIn()];
+  const [a, b, c] = responses.map(cookieOf) as [string, string, string];
+  const name = sessionCookieName(responses[0]!)!;
+  const live = async () => (await env.context).adapter.count({ model: 'session', where: [{ field: 'userId', value: id }] });
+  const valid = async (cookie: string) => !!(await env.auth.api.getSession({ headers: { cookie } }));
+  assert.equal(await live(), 3);
+  const listed = await (await get(env, '/list-sessions', a)).json() as { id: string; token: string }[];
+  assert.equal(listed.length, 3);
+  assert.ok(listed.every(session => session.token.startsWith('v1.')));
+  const handleOfB = listed.find(session => session.token === expectedHandle(cookieValue(responses[1]!, '.session_token')))!.token;
+  // A listed handle given to /revoke-session finds nothing, so it fails closed.
+  await env.post('/revoke-session', { token: handleOfB }, a);
+  assert.equal(await valid(b), true);
+  // A leaked handle signed into a cookie is hashed again and matches nothing; the same signing of the raw token works.
+  assert.equal(signedCookie(name, cookieValue(responses[1]!, '.session_token')), b.split('; ').find(item => item.startsWith(`${name}=`)));
+  assert.equal(await valid(signedCookie(name, handleOfB)), false);
+  const revoked = await env.post('/revoke-other-sessions', {}, a);
+  assert.deepEqual(await revoked.json(), { status: true, revoked: 2 });
+  assert.deepEqual([await valid(a), await valid(b), await valid(c)], [true, false, false]);
+  assert.equal(await live(), 1);
+  // The server call returns the same count.
+  const d = cookieOf(await env.signIn());
+  assert.equal(await live(), 2);
+  assert.deepEqual(await env.auth.api.revokeOtherSessions({ headers: { cookie: d } }), { status: true, revoked: 1 });
+  assert.deepEqual([await valid(a), await valid(d)], [false, true]);
+  assert.equal((await env.post('/sign-out', {}, d)).status, 200);
+  assert.equal(await valid(d), false);
+  assert.equal(await live(), 0);
+});
+
+test('verification identifiers keep their prefix, hash the rest, and match the exported helpers', async () => {
+  const env = setup();
+  const { uri } = await withTwoFactor(env);
+  const stored = () => env.db.verification!.map(row => row.identifier as string);
+  const agree = (identifier: string) => {
+    const expected = expectedIdentifier(identifier);
+    assert.equal(env.auth.storedVerificationIdentifier(identifier), expected, identifier);
+    assert.equal(storedVerificationIdentifier(SECRET, identifier), expected, identifier);
+    return expected;
+  };
+  // A sign-in challenge and its attempt counter: '2fa-attempts-' || <stored challenge identifier>.
+  const challenge = await env.signIn();
+  const challengeId = cookieValue(challenge, '.two_factor');
+  assert.ok(stored().includes(agree(challengeId)));
+  assert.ok(stored().includes(agree(`2fa-attempts-${challengeId}`)));
+  assert.equal(agree(`2fa-attempts-${challengeId}`), `2fa-attempts-${env.auth.storedVerificationIdentifier(challengeId)}`);
+  const trusted = await env.post('/two-factor/verify-totp', { code: totp(uri, 1), trustDevice: true }, cookieOf(challenge));
+  assert.equal(trusted.status, 200);
+  const trustId = cookieValue(trusted, '.trust_device').split('!')[1]!;
+  assert.ok(trustId.startsWith('trust-device-') && stored().includes(agree(trustId)));
+  assert.equal((await env.post('/request-password-reset', { email: 'owner@example.com', redirectTo: '/' })).status, 200);
+  assert.ok(stored().includes(agree(`reset-password:${env.resets.at(-1)}`)));
+  // The prefixes no flow above creates, written through the same adapter.
+  const { internalAdapter } = await env.context;
+  for (const identifier of ['2fa-otp-abc123', 'delete-account-xyz789']) {
+    await internalAdapter.createVerificationValue({ identifier, value: 'x', expiresAt: new Date(Date.now() + 60_000) });
+    assert.ok(stored().includes(agree(identifier)), identifier);
+  }
+  assert.match(agree('delete-account-xyz789'), /^v1\.[A-Za-z0-9_-]{43}$/);
+  const text = JSON.stringify(env.db.verification);
+  for (const secret of [challengeId.slice(4), trustId.slice('trust-device-'.length), env.resets.at(-1)!, 'abc123', 'xyz789']) assert.equal(text.includes(secret), false, secret);
+});
+
+test('a reset link works end to end, its stored row cannot be redeemed, and the reset still ends hashed trusted devices', async () => {
+  const env = setup();
+  const { uri } = await withTwoFactor(env);
+  const trusted = await env.post('/two-factor/verify-totp', { code: totp(uri, 1), trustDevice: true }, cookieOf(await env.signIn()));
+  const trustCookie = cookies(trusted).filter(pair => pair.split('=')[0]!.endsWith('.trust_device')).join('; ');
+  await env.signIn();
+  const prefixed = () => env.db.verification!.filter(row => row.value !== '0' && /^(trust-device-|2fa-(?!attempts-))/.test(row.identifier as string));
+  assert.ok(prefixed().length >= 2);
+  assert.equal((await env.post('/request-password-reset', { email: 'owner@example.com', redirectTo: '/' })).status, 200);
+  const token = env.resets.at(-1)!;
+  const row = env.db.verification!.find(item => (item.identifier as string).startsWith('reset-password:'))!;
+  // Someone who reads the row gets only its hash: sending the stored tail as the token is refused.
+  assert.notEqual((await env.post('/reset-password', { token: (row.identifier as string).slice('reset-password:'.length), newPassword: 'a brand new password' })).status, 200);
+  const callback = await get(env, `/reset-password/${token}?callbackURL=/done`, '');
+  assert.match(callback.headers.get('location') ?? '', new RegExp(`token=${token}`));
+  assert.equal((await env.post('/reset-password', { token, newPassword: 'a brand new password' })).status, 200);
+  assert.equal(prefixed().length, 0);
+  assert.deepEqual(await (await env.signIn('owner@example.com', 'a brand new password', trustCookie)).json(), { twoFactorRedirect: true, twoFactorMethods: ['totp'] });
+});
+
+test('the storage wrapper refuses what it cannot hash', async () => {
+  assert.throws(() => createTen98Auth({ database: {} as never, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test' }), TypeError);
+  assert.throws(() => storedVerificationIdentifier('short', 'reset-password:x'), TypeError);
+  assert.throws(() => sessionTokenKey(SECRET, 1 as never), TypeError);
+  // An adapter method better-auth 1.7.7 does not define would bypass the wrapper, so the adapter is refused.
+  const extra = setup({}, adapter => options => ({ ...adapter(options), findByToken: async () => null }) as ReturnType<Adapter>);
+  await assert.rejects(extra.context, /findByToken/);
+  const { adapter } = await setup().context as unknown as { adapter: { findMany(query: unknown): Promise<unknown> } };
+  await assert.rejects(adapter.findMany({ model: 'session', where: [{ field: 'token', operator: 'starts_with', value: 'v1.' }] }), TypeError);
 });

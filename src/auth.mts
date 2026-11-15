@@ -1,14 +1,25 @@
 // The Ten98 identity preset on better-auth, promoted from Discover src/server/auth.ts (dev, 2026-10-25) per decision #7/#97.
 // It fixes the shared policy (passwords, sessions, two-factor, reset, error redaction) in one place. Each app supplies its
 // database adapter, its URL and secret, its reset-email capture, and keeps its routes, transactions, rate limiters,
-// first-boot claim, OIDC protocol and workspace authorization. better-auth is an exact, optional peer dependency.
-import { createHash, scrypt, timingSafeEqual } from 'node:crypto';
-import { betterAuth, type BetterAuthOptions } from 'better-auth';
-import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, isAPIError } from 'better-auth/api';
+// first-boot claim, OIDC protocol and workspace authorization. better-auth, drizzle-orm and pg are exact, optional peers.
+//
+// Tokens at rest (#131): session tokens and verification identifiers are stored as HMACs under keys derived from the
+// secret, so reading the database yields no live session or reset link. Locked auth (#132): `withLockedAuth` runs
+// better-auth on one transaction that holds the user row, so a password change and a sign-in or revocation cannot
+// interleave.
+import { createHash, createHmac, hkdfSync, scrypt, timingSafeEqual } from 'node:crypto';
+import { eq, sql } from 'drizzle-orm';
+import { PgTransaction } from 'drizzle-orm/pg-core';
+import { betterAuth, getCurrentAdapter, type BetterAuthOptions } from 'better-auth';
+import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, isAPIError, sensitiveSessionMiddleware } from 'better-auth/api';
 import { setSessionCookie } from 'better-auth/cookies';
 import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import { twoFactor } from 'better-auth/plugins/two-factor';
+import { transaction, user as userTable, type AnyDatabase, type ScopedTransaction } from './db.mjs';
 import { appOrigin } from './index.mjs';
+import { markLockedAuth } from './locked-auth.mjs';
+
+export { LockedAuthTransactionError } from './locked-auth.mjs';
 
 /** The shared identity policy. Apps read it for forms and route limiters, so the numbers never drift between them. */
 export const ten98AuthPolicy = Object.freeze({
@@ -53,9 +64,171 @@ export function verifyLegacyScryptHash(hash: string, password: string): Promise<
   }));
 }
 
+// Keys for tokens at rest: HKDF-SHA256 over the secret, one label per use, so neither equals the secret or any other key
+// an app derives from it. Rotating the secret ends every session, reset link and trusted device, and makes enrolled
+// second factors (encrypted with the secret itself) unreadable: it is a re-enrolment event.
+const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1' } as const;
+type TokenKeys = Record<keyof typeof keyLabels, Buffer>;
+const checkedSecret = (secret: unknown): string => {
+  if (typeof secret !== 'string' || secret.length < 32) throw new TypeError('The auth secret must be at least 32 characters.');
+  return secret;
+};
+const deriveKeys = (secret: string): TokenKeys => ({
+  verification: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.verification, 32)),
+  session: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.session, 32)),
+});
+const mac = (key: Buffer, value: string) => createHmac('sha256', key).update(value).digest('base64url');
+const raw = (value: unknown): string => {
+  if (typeof value !== 'string') throw new TypeError('A token or identifier must be a string.');
+  return value;
+};
+
+/** Stored session tokens and whole-hashed identifiers start with this; better-auth's raw tokens are alphanumeric. */
+const handlePrefix = 'v1.';
+const isHandle = (value: unknown): value is string => typeof value === 'string' && value.startsWith(handlePrefix);
+const tokenHandle = (keys: TokenKeys, token: string) => handlePrefix + mac(keys.session, token);
+
+// The kept prefixes, longest first where they overlap. An attempt counter names its challenge, so its tail is stored
+// with this same rule and the stored counter is exactly '2fa-attempts-' || <stored challenge identifier>.
+const attemptsPrefix = '2fa-attempts-';
+const keptPrefixes = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:'] as const;
+function storedIdentifier(keys: TokenKeys, identifier: string): string {
+  let head = '', rest = identifier;
+  while (rest.startsWith(attemptsPrefix)) { head += attemptsPrefix; rest = rest.slice(attemptsPrefix.length); }
+  const prefix = keptPrefixes.find(candidate => rest.startsWith(candidate));
+  return head + (prefix ? prefix + mac(keys.verification, rest.slice(prefix.length)) : handlePrefix + mac(keys.verification, rest));
+}
+
+/**
+ * The `verification.identifier` the preset stores for a raw identifier, for an app that locks or reads the row with its
+ * own SQL. Prefer the instance method, which needs no secret.
+ */
+export function storedVerificationIdentifier(secret: string, identifier: string): string {
+  return storedIdentifier(deriveKeys(checkedSecret(secret)), raw(identifier));
+}
+
+/**
+ * The `session.token` the preset stores (a `v1.` handle) for a raw session token, the cookie's value without its
+ * signature. For an app's own read of session liveness; prefer the instance method, which needs no secret.
+ */
+export function sessionTokenKey(secret: string, token: string): string {
+  return tokenHandle(deriveKeys(checkedSecret(secret)), raw(token));
+}
+
+/**
+ * The statements every app's numbered migration runs once when it adopts hashed token storage, separated as drizzle-kit
+ * separates statements. Rows stored in plain text before it would never match again: every session ends, and reset
+ * links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go with them.
+ * Rows an app writes with its own SQL are its own decision.
+ */
+export const tokenStorageUpgradeStatements = [
+  'DELETE FROM "session";',
+  'DELETE FROM verification WHERE identifier LIKE \'reset-password:%\' OR identifier LIKE \'trust-device-%\' OR identifier LIKE \'2fa-%\';',
+].join('\n--> statement-breakpoint\n');
+
+type Clause = { field: string; value: unknown; operator?: string; [option: string]: unknown };
+type Query = { model: string; where?: Clause[]; data?: Record<string, unknown>; update?: Record<string, unknown>; set?: Record<string, unknown>; [option: string]: unknown };
+type Row = Record<string, unknown> | null | undefined;
+type StoreAdapter = { [method: string]: unknown };
+type AdapterFactory = (options: BetterAuthOptions) => StoreAdapter;
+/** Stored handle to the raw token the caller gave, so results carry the caller's own token back. */
+type Restore = Map<string, string>;
+
+// The adapter methods better-auth 1.7.7 defines. Any other function is refused rather than left unwrapped.
+const adapterMethods = new Set(['create', 'findOne', 'findMany', 'count', 'update', 'updateMany', 'delete', 'deleteMany', 'consumeOne', 'incrementOne', 'transaction', 'createSchema']);
+const fullValueOperators = new Set(['eq', 'ne', 'in', 'not_in']);
+
+/**
+ * Wraps the app's adapter so `session.token` and `verification.identifier` are stored as HMACs. Session reads always
+ * hash what they are given (a stored handle given back as a token matches nothing) and return the caller's raw token;
+ * updates and deletes pass a handle through; listings return handles. Verification identifiers follow
+ * `storedIdentifier`; prefix filters (`starts_with`) pass through, as the prefixes are kept.
+ *
+ * Identifiers are hashed here, not through better-auth's `verification.storeIdentifier`: in 1.7.7 a lookup under that
+ * option that finds nothing retries with the raw identifier (internal-adapter.mjs, findVerificationValue and
+ * consumeVerificationValue), so a database reader could redeem a stored reset row by sending its stored tail as the token.
+ */
+function protectTokens(factory: AdapterFactory, keys: TokenKeys): AdapterFactory {
+  const clause = (model: string, item: Clause, write: boolean, restore: Restore): Clause => {
+    const operator = item.operator ?? 'eq';
+    if (model === 'session' && item.field === 'token') {
+      if (!fullValueOperators.has(operator)) throw new TypeError(`Session tokens are stored hashed and cannot be matched with ${operator}.`);
+      const one = (value: unknown) => {
+        if (typeof value !== 'string' || (write && isHandle(value))) return value;
+        const handle = tokenHandle(keys, value);
+        restore.set(handle, value);
+        return handle;
+      };
+      return { ...item, value: Array.isArray(item.value) ? item.value.map(one) : one(item.value) };
+    }
+    if (model === 'verification' && item.field === 'identifier' && fullValueOperators.has(operator)) {
+      const one = (value: unknown) => typeof value === 'string' ? storedIdentifier(keys, value) : value;
+      return { ...item, value: Array.isArray(item.value) ? item.value.map(one) : one(item.value) };
+    }
+    return item;
+  };
+  const where = (query: Query, write: boolean, restore: Restore) => query.where?.map(item => clause(query.model, item, write, restore));
+  const data = (model: string, values: Record<string, unknown> | undefined, restore: Restore) => {
+    if (!values) return values;
+    if (model === 'session' && typeof values.token === 'string' && !isHandle(values.token)) {
+      const handle = tokenHandle(keys, values.token);
+      restore.set(handle, values.token);
+      return { ...values, token: handle };
+    }
+    if (model === 'verification' && typeof values.identifier === 'string') return { ...values, identifier: storedIdentifier(keys, values.identifier) };
+    return values;
+  };
+  const back = (row: Row, restore: Restore): Row => row && typeof row.token === 'string' && restore.has(row.token) ? { ...row, token: restore.get(row.token) } : row;
+
+  const wrap = (adapter: StoreAdapter): StoreAdapter => {
+    const unknown = Object.entries(adapter).filter(([name, value]) => typeof value === 'function' && !adapterMethods.has(name)).map(([name]) => name);
+    if (unknown.length) throw new TypeError(`The token storage wrapper does not know the adapter method(s) ${unknown.join(', ')}; review it before upgrading better-auth.`);
+    const call = (name: string, query: Query) => (adapter[name] as (query: Query) => Promise<unknown>)(query);
+    // `write`: an update or delete, where a stored handle passes through. `values`: the field holding row values.
+    const method = (name: string, write: boolean, values?: 'data' | 'update' | 'set') => async (query: Query) => {
+      const restore: Restore = new Map();
+      const result = await call(name, { ...query, where: where(query, write, restore), ...values ? { [values]: data(query.model, query[values] as Record<string, unknown> | undefined, restore) } : {} });
+      return Array.isArray(result) ? result.map(row => back(row as Row, restore)) : back(result as Row, restore);
+    };
+    const wrapped: StoreAdapter = {
+      ...adapter,
+      create: method('create', true, 'data'),
+      findOne: method('findOne', false),
+      findMany: method('findMany', false),
+      count: method('count', false),
+      update: method('update', true, 'update'),
+      updateMany: method('updateMany', true, 'update'),
+      delete: method('delete', true),
+      deleteMany: method('deleteMany', true),
+    };
+    if (typeof adapter.consumeOne === 'function') wrapped.consumeOne = method('consumeOne', true);
+    if (typeof adapter.incrementOne === 'function') wrapped.incrementOne = method('incrementOne', true, 'set');
+    if (typeof adapter.transaction === 'function') {
+      const run = adapter.transaction as (callback: (trx: StoreAdapter) => Promise<unknown>) => Promise<unknown>;
+      wrapped.transaction = (callback: (trx: StoreAdapter) => Promise<unknown>) => run(trx => callback(wrap(trx)));
+    }
+    return wrapped;
+  };
+  return options => wrap(factory(options));
+}
+
+/** The user `withLockedAuth` was asked to lock does not exist; answer it as not found. */
+export class LockedAuthUserNotFoundError extends Error {
+  readonly status = 404 as const;
+  readonly code = 'USER_NOT_FOUND' as const;
+  constructor() { super('User not found.'); this.name = 'LockedAuthUserNotFoundError'; }
+}
+
 export interface Ten98AuthOptions {
-  /** The app's better-auth database adapter, such as `drizzleAdapter(db, { provider: 'pg', schema })`. */
+  /** The app's better-auth adapter factory, such as `drizzleAdapter(db, { provider: 'pg', schema })`. */
   database: BetterAuthOptions['database'];
+  /**
+   * The same adapter over one transaction, such as `tx => drizzleAdapter(tx, { provider: 'pg', schema })`. Needed by
+   * `withLockedAuth` and `withLockedAuthByEmail`, which bind a better-auth instance to the transaction they open.
+   */
+  transactionDatabase?(tx: ScopedTransaction<AnyDatabase>): BetterAuthOptions['database'];
+  /** The first key of the email advisory lock; the team controller's `emailLockKey`, 109859 by default. */
+  emailLockKey?: number;
   /** The app's public URL (APP_URL); validated with `appOrigin`. */
   appUrl: string;
   secret: string;
@@ -92,23 +265,66 @@ export interface Ten98Auth {
     rotateVerifiedSession: ServerCall<{ verifiedUserId: string }>;
     /** Signs in a user the app's OIDC flow verified; an account with two-factor enabled gets the TOTP challenge instead. */
     completeOidcSession: ServerCall<{ oidcUserId: string }>;
+    /**
+     * Revokes the caller's other live sessions by id and keeps the current one (found from the cookie in `headers`).
+     * `revoked` counts the sessions it ended. The same endpoint serves POST /revoke-other-sessions.
+     */
+    revokeOtherSessions(input: { headers: HeadersInit }): Promise<{ status: true; revoked: number }>;
   };
   options: { readonly telemetry: { readonly enabled: false } };
+  /** The stored `verification.identifier` for a raw identifier; see the standalone `storedVerificationIdentifier`. */
+  storedVerificationIdentifier(identifier: string): string;
+  /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
+  sessionTokenKey(token: string): string;
+  /**
+   * Runs `run` in one transaction (`transaction` from ./db) whose first statement locks the user row FOR NO KEY UPDATE,
+   * with a better-auth instance bound to that transaction. A missing user throws LockedAuthUserNotFoundError (404). The
+   * callback runs its own statements on `tx` and may lock that user's session, credential and verification rows, in
+   * that order; tenancy helpers and workspace-level team operations refuse the transaction. When `run` throws, or the
+   * transaction fails, nothing it did persists and the error is rethrown; Set-Cookie headers from inside are lost with it.
+   */
+  withLockedAuth<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>) => Promise<T>): Promise<T>;
+  /**
+   * `withLockedAuth` for a flow that knows only an email (password sign-in, reset request): takes the email advisory
+   * lock (`pg_advisory_xact_lock(emailLockKey, hashtext(email))`, the team controller's `lockEmail`) first, then locks
+   * that account's user row if there is one. `userId` is undefined when no account has the email.
+   */
+  withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
 }
 
-type VerificationStore = {
+/** The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions. */
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail'> {
+  /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
+  readonly userId: string | undefined;
+  /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
+  revokeAllSessions(): Promise<void>;
+}
+
+type StoreContext = {
   adapter: { deleteMany(query: { model: string; where: { field: string; value: string; operator?: 'eq' | 'starts_with' }[] }): Promise<number> };
+  internalAdapter: { deleteUserSessions(userId: string): Promise<void> };
 };
+const storeOf = (auth: object) => (auth as { $context: Promise<StoreContext> }).$context;
+const INT32 = 2 ** 31;
 
 /**
  * A better-auth instance with the Ten98 policy. Sign-up stays closed: the first-boot claim creates the owner in the
  * app's own transaction (hash with `hashPassword` from 'better-auth/crypto') and then signs in. Origin and CSRF checks
- * are pinned on, so no environment variable can turn them off.
+ * are pinned on, so no environment variable can turn them off. Session tokens and verification identifiers are stored
+ * as keyed hashes; the cookie cache stays off and no secondary storage is used, so no token is kept anywhere else.
  */
-export function createTen98Auth({ database, appUrl, secret, appName, sendResetPassword, legacyPasswords = false, allowPasswordless = false, cookiePrefix }: Ten98AuthOptions): Ten98Auth {
+export function createTen98Auth(options: Ten98AuthOptions): Ten98Auth {
+  return build(options, deriveKeys(checkedSecret(options.secret)), true) as Ten98Auth;
+}
+
+function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Ten98Auth | LockedTen98Auth {
+  const { database, appUrl, secret, appName, sendResetPassword, legacyPasswords = false, allowPasswordless = false, cookiePrefix, transactionDatabase, emailLockKey = 109_859 } = options;
   const origin = appOrigin(appUrl);
-  if (typeof secret !== 'string' || secret.length < 32) throw new TypeError('The auth secret must be at least 32 characters.');
+  checkedSecret(secret);
   if (typeof appName !== 'string' || !appName.trim()) throw new TypeError('appName is required.');
+  if (typeof database !== 'function') throw new TypeError('database must be a better-auth adapter factory, such as drizzleAdapter(db, { provider: \'pg\', schema }), so tokens can be stored hashed.');
+  if (transactionDatabase !== undefined && typeof transactionDatabase !== 'function') throw new TypeError('transactionDatabase must be a function of the transaction.');
+  if (!Number.isInteger(emailLockKey) || emailLockKey < -INT32 || emailLockKey >= INT32) throw new TypeError('emailLockKey must be a 32-bit integer.');
   const prefix = cookiePrefix ?? `ten98-${createHash('sha256').update(origin).digest('hex').slice(0, 16)}`;
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(prefix)) throw new TypeError('cookiePrefix must be 1 to 64 letters, digits, hyphens or underscores.');
   const { twoFactor: factor, password, session, reset } = ten98AuthPolicy;
@@ -152,6 +368,24 @@ export function createTen98Auth({ database, appUrl, secret, appName, sendResetPa
       completeOidcSession: createAuthEndpoint.serverOnly({ method: 'POST' }, async context => issue(context, await verifiedUser(context, 'oidcUserId'))),
     },
   } as const;
+  // Replaces better-auth's /revoke-other-sessions (a plugin endpoint of the same name wins), which compares the caller's
+  // raw token with the listed handles. This one keeps the current session by id and deletes the user's other live
+  // sessions through the adapter, so inside withLockedAuth it runs in that transaction.
+  const sessionRevocation = {
+    id: 'ten98-session-revocation',
+    endpoints: {
+      revokeOtherSessions: createAuthEndpoint('/revoke-other-sessions', { method: 'POST', requireHeaders: true, use: [sensitiveSessionMiddleware] }, async context => {
+        const current = context.context.session.session;
+        const adapter = await getCurrentAdapter(context.context.adapter);
+        const revoked = await adapter.deleteMany({ model: 'session', where: [
+          { field: 'userId', value: current.userId },
+          { field: 'id', operator: 'ne', value: current.id },
+          { field: 'expiresAt', operator: 'gt', value: new Date() },
+        ] });
+        return context.json({ status: true as const, revoked });
+      }),
+    },
+  } as const;
 
   // With legacy hashes accepted, every password check runs one legacy derive and one current derive, whichever hash is
   // stored or none, so response time does not reveal which accounts are unmigrated.
@@ -169,9 +403,8 @@ export function createTen98Auth({ database, appUrl, secret, appName, sendResetPa
     },
   } : undefined;
 
-  let store: Promise<VerificationStore> | undefined;
   const auth = betterAuth({
-    database, baseURL: origin, secret, appName, trustedOrigins: [origin],
+    database: protectTokens(database as AdapterFactory, keys) as unknown as BetterAuthOptions['database'], baseURL: origin, secret, appName, trustedOrigins: [origin],
     // better-auth skips these checks when NODE_ENV=test or TEST is set unless they are pinned.
     advanced: { disableOriginCheck: false, disableCSRFCheck: false, cookiePrefix: prefix },
     // Self-hosted installs send no data to Ten98 or third parties.
@@ -181,7 +414,7 @@ export function createTen98Auth({ database, appUrl, secret, appName, sendResetPa
     logger: { disabled: true },
     onAPIError: { onError(error) { if (isAPIError(error)) throw error; throw APIError.fromStatus('INTERNAL_SERVER_ERROR'); } },
     session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false } },
-    plugins: [factors, oidcSessions],
+    plugins: [factors, oidcSessions, sessionRevocation],
     emailAndPassword: {
       enabled: true,
       disableSignUp: true,
@@ -194,7 +427,8 @@ export function createTen98Auth({ database, appUrl, secret, appName, sendResetPa
       onPasswordReset: async ({ user }: { user: { id: string } }) => {
         // deleteMany has no row cap (findMany defaults to 100). Challenge rows hold the user id; their attempt counters
         // ('2fa-attempts-…', value '0') expire with the challenge they belonged to.
-        const { adapter } = await (store ??= (auth as unknown as { $context: Promise<VerificationStore> }).$context);
+        // The prefixes are kept in storage, so these filters match the hashed rows.
+        const { adapter } = await storeOf(auth);
         for (const prefix of ['trust-device-', '2fa-']) {
           await adapter.deleteMany({ model: 'verification', where: [{ field: 'value', value: user.id }, { field: 'identifier', operator: 'starts_with', value: prefix }] });
         }
@@ -215,5 +449,52 @@ export function createTen98Auth({ database, appUrl, secret, appName, sendResetPa
       } catch { /* retried on the next successful sign-in */ }
     }) } } : {}),
   });
-  return auth as unknown as Ten98Auth;
+  const helpers = {
+    storedVerificationIdentifier: (identifier: string) => storedIdentifier(keys, raw(identifier)),
+    sessionTokenKey: (token: string) => tokenHandle(keys, raw(token)),
+  };
+  if (!locking) return Object.assign(auth, helpers) as unknown as LockedTen98Auth;
+
+  // Binds an instance to `tx` for `run` and marks the transaction, so tenancy and team operations refuse it.
+  const bind = async <TDatabase extends AnyDatabase, T>(tx: ScopedTransaction<TDatabase>, userId: string | undefined, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>) => Promise<T>) => {
+    const bound = build({ ...options, database: transactionDatabase!(tx as ScopedTransaction<AnyDatabase>) }, keys, false) as LockedTen98Auth;
+    Object.assign(bound, { userId, async revokeAllSessions() { if (userId !== undefined) await (await storeOf(bound)).internalAdapter.deleteUserSessions(userId); } });
+    const unmark = markLockedAuth(tx);
+    try { return await run(bound, tx); } finally { unmark(); }
+  };
+  // Refused before any statement: without the factory there is nothing to bind; a transaction as `db` would make the
+  // lock a savepoint's statement, not the transaction's first; inside a better-auth request or hook, better-auth's own
+  // adapter context would route the bound instance's queries away from `tx`, outside the lock.
+  const ready = async (db: unknown, run: unknown) => {
+    if (!transactionDatabase) throw new TypeError('withLockedAuth needs the transactionDatabase option of createTen98Auth.');
+    if (db instanceof PgTransaction) throw new TypeError('withLockedAuth opens its own transaction; pass the database, not a transaction.');
+    if (typeof run !== 'function') throw new TypeError('withLockedAuth needs a callback.');
+    const outside = {};
+    if (await getCurrentAdapter(outside as never) !== outside) throw new TypeError('withLockedAuth cannot run inside a better-auth request or hook.');
+  };
+  const locked: Pick<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail'> = {
+    async withLockedAuth(db, userId, run) {
+      await ready(db, run);
+      if (typeof userId !== 'string' || !userId) throw new TypeError('withLockedAuth needs a user id.');
+      return transaction(db, async tx => {
+        const [row] = await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, userId)).for('no key update');
+        if (!row) throw new LockedAuthUserNotFoundError();
+        return bind(tx, row.id, run);
+      });
+    },
+    async withLockedAuthByEmail(db, email, run) {
+      await ready(db, run);
+      if (typeof email !== 'string') throw new TypeError('withLockedAuthByEmail needs an email.');
+      // Normalised as the team controller's lockEmail does, so both take the same advisory lock.
+      const address = email.trim().toLowerCase();
+      return transaction(db, async tx => {
+        // Parameterised raw statement by necessity: Drizzle has no builder for advisory locks.
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(${emailLockKey}, hashtext(${address}))`);
+        // lower() on both sides, as user_email_normalized_idx is defined, whatever JavaScript's lowercasing did.
+        const [row] = await tx.select({ id: userTable.id }).from(userTable).where(sql`lower(${userTable.email}) = lower(${address})`).for('no key update');
+        return bind(tx, row?.id, (auth, bound) => run(auth, bound, row?.id));
+      });
+    },
+  };
+  return Object.assign(auth, helpers, locked) as unknown as Ten98Auth;
 }

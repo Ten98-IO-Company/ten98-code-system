@@ -6,10 +6,13 @@
 // TeamError becomes its response, and must roll back on any thrown error. Decisions read their rows under locks
 // (workspace FOR UPDATE, the caller's membership FOR SHARE, the target's and the owners' FOR UPDATE), so they hold at
 // READ COMMITTED, REPEATABLE READ and SERIALIZABLE; at the two stricter levels a conflicting concurrent change fails
-// with SQLSTATE 40001 and the caller retries. Lock order: workspace -> memberships -> invitation -> email.
+// with SQLSTATE 40001 and the caller retries. Lock order: workspace -> memberships -> invitation -> email. The
+// workspace-level methods refuse a transaction withLockedAuth (./auth) opened, which holds a user row; lockEmail and the
+// instance-operator methods do not.
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayGrantWorkspaceRole as mayGrant, mayManageWorkspaceMember, workspaceRoles } from './browser.mjs';
 import { isEmailAddress } from './email-message.mjs';
+import { refuseLockedAuth } from './locked-auth.mjs';
 /** Every refusal: `status` is the HTTP status that fits and `message` is safe to show. */
 export class TeamError extends Error {
     status;
@@ -126,6 +129,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
     return {
         lockEmail,
         async createWorkspace(client, userId, input) {
+            refuseLockedAuth(client, 'createWorkspace');
             const owner = id(userId), workspaceName = name(fields(input, ['name']).name);
             if (!(await client.query('SELECT id FROM "user" WHERE id=$1', [owner])).rowCount)
                 fail(401, 'SIGN_IN_REQUIRED', 'Sign in to continue.');
@@ -135,6 +139,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
             return { workspace, role: 'owner' };
         },
         async renameWorkspace(client, workspaceId, userId, input) {
+            refuseLockedAuth(client, 'renameWorkspace');
             const workspace = id(workspaceId), actor = id(userId), workspaceName = name(fields(input, ['name']).name);
             await lockWorkspace(client, workspace);
             const role = await managerRole(client, workspace, actor);
@@ -143,6 +148,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
         },
         /** Owners and administrators: members, and the invitations still pending (unexpired, inviter still able to grant). */
         async getTeam(client, workspaceId, userId) {
+            refuseLockedAuth(client, 'getTeam');
             const workspaceKey = id(workspaceId), actor = id(userId);
             const workspace = await lockWorkspace(client, workspaceKey);
             const role = await managerRole(client, workspaceKey, actor);
@@ -155,6 +161,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
         },
         /** Owner only: require or stop requiring a verified second factor for every member. The owner must have one first. */
         async setTwoFactorRequirement(client, workspaceId, userId, input) {
+            refuseLockedAuth(client, 'setTwoFactorRequirement');
             const workspace = id(workspaceId), actor = id(userId), { required } = fields(input, ['required']);
             if (typeof required !== 'boolean')
                 invalid();
@@ -174,6 +181,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
         },
         /** True when the workspace requires two-factor and this member has none; the app refuses its workspace routes then. */
         async memberNeedsFactor(client, workspaceId, userId) {
+            refuseLockedAuth(client, 'memberNeedsFactor');
             const locked = await client.query(`SELECT 1 FROM workspace_two_factor_requirement r JOIN membership m ON m.workspace_id=r.workspace_id AND m.user_id=$2
          JOIN "user" u ON u.id=m.user_id WHERE NOT u."twoFactorEnabled" AND r.workspace_id=$1`, [id(workspaceId), id(userId)]);
             return !!locked.rowCount;
@@ -184,6 +192,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
          * accepted only when an existing account already has it.
          */
         async inviteMember(client, workspaceId, userId, input) {
+            refuseLockedAuth(client, 'inviteMember');
             const workspace = id(workspaceId), actor = id(userId), details = fields(input, ['email', 'role']);
             const invitee = normalise(details.email);
             const role = details.role;
@@ -209,6 +218,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
         VALUES($1,$2,$3,$4,$5,$6,clock_timestamp()+interval '7 days') RETURNING id,email,role,expires_at AS "expiresAt"`, [randomUUID(), workspace, actor, invitee, role]);
         },
         async revokeInvitation(client, workspaceId, userId, invitationId) {
+            refuseLockedAuth(client, 'revokeInvitation');
             const workspace = id(workspaceId), actor = id(userId), invitationKey = id(invitationId);
             await lockWorkspace(client, workspace);
             const actorRole = await managerRole(client, workspace, actor);
@@ -223,6 +233,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
          * previous link stops working. `admit` runs after authorization and the pending check, inside the same transaction.
          */
         async rotateInvitation(client, workspaceId, userId, invitationId, admit) {
+            refuseLockedAuth(client, 'rotateInvitation');
             const workspace = id(workspaceId), actor = id(userId), invitationKey = id(invitationId);
             if (admit !== undefined && typeof admit !== 'function')
                 invalid();
@@ -233,6 +244,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
         },
         /** Needs authority over the saved and the requested role; keeps an owner; removes invitations the member can no longer grant. */
         async changeRole(client, workspaceId, userId, targetUserId, input) {
+            refuseLockedAuth(client, 'changeRole');
             const workspace = id(workspaceId), actor = id(userId), target = id(targetUserId), { role } = fields(input, ['role']);
             if (typeof role !== 'string' || !workspaceRoles.some(value => value === role))
                 invalid();
@@ -248,6 +260,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
         },
         /** An owner promotes another member, confirmed by that member's email, and becomes an administrator, in one step. */
         async transferOwnership(client, workspaceId, userId, input) {
+            refuseLockedAuth(client, 'transferOwnership');
             const workspace = id(workspaceId), actor = id(userId), details = fields(input, ['targetUserId', 'confirmationEmail']);
             const target = id(details.targetUserId), confirmation = normalise(details.confirmationEmail);
             if (!confirmation)
@@ -273,6 +286,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
          * invitations the member sent or received.
          */
         async removeMember(client, workspaceId, userId, targetUserId) {
+            refuseLockedAuth(client, 'removeMember');
             const workspace = id(workspaceId), actor = id(userId), target = id(targetUserId);
             await lockWorkspace(client, workspace);
             let saved;
@@ -291,6 +305,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
         },
         /** Public, for the token holder: what the invitation offers, and whether its email already has an account (so sign-in comes first). */
         async inspectInvitation(client, input) {
+            refuseLockedAuth(client, 'inspectInvitation');
             const value = token(fields(input, ['token']).token);
             const invitation = (await client.query(`SELECT w.id AS "workspaceId",w.name AS "workspaceName",i.email,i.role,i.expires_at AS "expiresAt",
            EXISTS(SELECT 1 FROM "user" u WHERE lower(u.email)=i.email) AS "accountExists"
@@ -306,6 +321,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
          * role is never replaced; `role` is the role it holds now.
          */
         async acceptInvitation(client, input, signedInUser) {
+            refuseLockedAuth(client, 'acceptInvitation');
             const details = fields(input, ['token', 'name', 'password']);
             const value = token(details.token);
             const newName = details.name === undefined ? undefined : name(details.name);
@@ -334,6 +350,7 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }) {
         },
         /** Server only: `identity` must be cryptographically verified OIDC claims. Creates the account; an existing one must link explicitly. */
         async acceptVerifiedOidcInvitation(client, tokenValue, identity, passwordHash) {
+            refuseLockedAuth(client, 'acceptVerifiedOidcInvitation');
             const claims = fields(identity, ['email', 'name']);
             const verified = { email: email(claims.email), name: name(claims.name) };
             if (passwordHash !== undefined && typeof passwordHash !== 'string')

@@ -1,4 +1,8 @@
 {
+  "src/auth.mts": {
+    "count": 1,
+    "reason": "withLockedAuthByEmail takes the team controller's email advisory lock (pg_advisory_xact_lock); Drizzle has no builder for advisory locks. Its user-row locks are typed Drizzle queries."
+  },
   "src/check.mts": {
     "count": 8,
     "reason": "Not statements: the raw-statement scanner's own comments and patterns name the forms it counts."
