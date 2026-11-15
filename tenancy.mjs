@@ -34,13 +34,6 @@ export class UnlockedScopeError extends Error {
     }
 }
 const writers = ['owner', 'admin', 'editor'];
-/**
- * The memberships, as user and workspace pairs, that a helper share-locked at the top level of a transaction it opened
- * itself. That check is the transaction's first statement, so no savepoint precedes it and nothing short of the
- * transaction's end releases those locks. Locks taken by nested calls are never recorded: a savepoint or a caller's
- * ROLLBACK TO can release them unseen. Keyed by the transaction objects the helpers hand out, the top-level one and the
- * savepoints helpers open inside it; any other transaction object has no record, so nesting there fails closed.
- */
 const held = new WeakMap();
 const pair = (userId, workspaceId) => `${userId}\u0000${workspaceId}`;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -104,21 +97,22 @@ export function createTenancy({ setting, column, tables }) {
         const ids = workspaceIds.filter(id => typeof id === 'string' && uuid.test(id)).map(id => id.toLowerCase());
         if (!ids.length || typeof userId !== 'string')
             return [];
-        const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role })
+        const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role, started: sql `transaction_timestamp()::text` })
             .from(membership).innerJoin(workspace, eq(workspace.id, membership.workspaceId))
             .where(and(eq(membership.userId, userId), inArray(membership.workspaceId, ids)))
             .orderBy(workspace.createdAt, workspace.id);
+        const rows = caller?.readOnly ? await query : await query.for('share', { of: membership });
         if (!caller?.readOnly) {
-            const access = await query.for('share', { of: membership });
-            if (record)
-                for (const item of access)
-                    record.add(pair(userId, item.workspaceId));
-            return access;
+            if (record) {
+                record.started = rows[0]?.started;
+                for (const item of rows)
+                    record.pairs.add(pair(userId, item.workspaceId));
+            }
         }
-        const access = await query;
-        if (access.some(item => !locked?.has(pair(userId, item.workspaceId))))
+        else if (rows.length && (!locked?.open || rows[0].started !== locked.started || rows.some(item => !locked.pairs.has(pair(userId, item.workspaceId))))) {
             throw new UnlockedScopeError();
-        return access;
+        }
+        return rows.map(({ workspaceId, name, role }) => ({ workspaceId, name, role }));
     }
     /**
      * Runs `body` in the transaction a helper call uses. A transaction of its own starts a fresh record of the
@@ -129,7 +123,13 @@ export function createTenancy({ setting, column, tables }) {
         if (outer)
             return body(outer, await readCaller(outer), undefined, held.get(outer));
         if (!(db instanceof PgTransaction)) {
-            return transaction(db, tx => { const record = new Set(); held.set(tx, record); return body(tx, undefined, record, record); });
+            const record = { pairs: new Set(), started: undefined, open: true };
+            try {
+                return await transaction(db, tx => { held.set(tx, record); return body(tx, undefined, record, record); });
+            }
+            finally {
+                record.open = false;
+            }
         }
         const locked = held.get(db);
         return transaction(db, async (tx) => { if (locked)

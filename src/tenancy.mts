@@ -64,8 +64,14 @@ const writers: readonly WorkspaceRole[] = ['owner', 'admin', 'editor'];
  * transaction's end releases those locks. Locks taken by nested calls are never recorded: a savepoint or a caller's
  * ROLLBACK TO can release them unseen. Keyed by the transaction objects the helpers hand out, the top-level one and the
  * savepoints helpers open inside it; any other transaction object has no record, so nesting there fails closed.
+ *
+ * A record is valid only for the transaction that made it: `open` turns false when that transaction ends, however it
+ * ends, so a transaction object used afterwards (an un-awaited nested call, say) is refused. `started` is that
+ * transaction's `transaction_timestamp()`, so a caller's own ROLLBACK and BEGIN inside it, which would start a new
+ * transaction on the same connection under the same objects, is refused too.
  */
-const held = new WeakMap<object, ReadonlySet<string>>();
+type LockRecord = { readonly pairs: Set<string>; started: string | undefined; open: boolean };
+const held = new WeakMap<object, LockRecord>();
 const pair = (userId: string, workspaceId: string) => `${userId}\u0000${workspaceId}`;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Lowercase names only: they go into SQL text unquoted, and PostgreSQL's stored policy then matches them verbatim.
@@ -119,21 +125,23 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
    * UnlockedScopeError rather than being read unlocked, where a removal could commit while the callback still reads.
    */
   async function memberships(tx: AnyDatabase, userId: string, workspaceIds: readonly string[], caller: Caller | undefined,
-    record: Set<string> | undefined, locked: ReadonlySet<string> | undefined): Promise<WorkspaceAccess[]> {
+    record: LockRecord | undefined, locked: LockRecord | undefined): Promise<WorkspaceAccess[]> {
     const ids = workspaceIds.filter(id => typeof id === 'string' && uuid.test(id)).map(id => id.toLowerCase());
     if (!ids.length || typeof userId !== 'string') return [];
-    const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role })
+    const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role, started: sql<string>`transaction_timestamp()::text` })
       .from(membership).innerJoin(workspace, eq(workspace.id, membership.workspaceId))
       .where(and(eq(membership.userId, userId), inArray(membership.workspaceId, ids)))
       .orderBy(workspace.createdAt, workspace.id);
+    const rows = caller?.readOnly ? await query : await query.for('share', { of: membership });
     if (!caller?.readOnly) {
-      const access = await query.for('share', { of: membership });
-      if (record) for (const item of access) record.add(pair(userId, item.workspaceId));
-      return access;
+      if (record) {
+        record.started = rows[0]?.started;
+        for (const item of rows) record.pairs.add(pair(userId, item.workspaceId));
+      }
+    } else if (rows.length && (!locked?.open || rows[0]!.started !== locked.started || rows.some(item => !locked.pairs.has(pair(userId, item.workspaceId))))) {
+      throw new UnlockedScopeError();
     }
-    const access = await query;
-    if (access.some(item => !locked?.has(pair(userId, item.workspaceId)))) throw new UnlockedScopeError();
-    return access;
+    return rows.map(({ workspaceId, name, role }) => ({ workspaceId, name, role }));
   }
 
   /**
@@ -142,10 +150,13 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
    * transaction) gets the caller's state and only reads the record; a savepoint a helper opens shares it.
    */
   async function scopedTransaction<TDatabase extends AnyDatabase, T>(db: TDatabase, outer: ScopedTransaction<TDatabase> | undefined,
-    body: (tx: ScopedTransaction<TDatabase>, caller: Caller | undefined, record: Set<string> | undefined, locked: ReadonlySet<string> | undefined) => Promise<T>): Promise<T> {
+    body: (tx: ScopedTransaction<TDatabase>, caller: Caller | undefined, record: LockRecord | undefined, locked: LockRecord | undefined) => Promise<T>): Promise<T> {
     if (outer) return body(outer, await readCaller(outer), undefined, held.get(outer));
     if (!(db instanceof PgTransaction)) {
-      return transaction(db, tx => { const record = new Set<string>(); held.set(tx, record); return body(tx, undefined, record, record); });
+      const record: LockRecord = { pairs: new Set(), started: undefined, open: true };
+      try {
+        return await transaction(db, tx => { held.set(tx, record); return body(tx, undefined, record, record); });
+      } finally { record.open = false; }
     }
     const locked = held.get(db);
     return transaction(db, async tx => { if (locked) held.set(tx, locked); return body(tx, await readCaller(tx), undefined, locked); });

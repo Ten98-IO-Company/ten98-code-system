@@ -78,11 +78,10 @@ type PooledDatabase = { dialect: PgDialect; _?: { session?: unknown }; $client: 
 
 const isPool = (client: unknown): client is pg.Pool => client instanceof pg.Pool
   || (client instanceof Object && typeof (client as pg.Pool).connect === 'function' && typeof (client as pg.Pool).totalCount === 'number');
-// A single connection: a pg Client (a pool's checked-out client is one), or a client-shaped object that can be released
-// as checked-out clients are. A wrapper with `query` and `connect` but no `release` may be a pool, whose statements can
-// run on different backends, so it is refused rather than given a transaction that is not one.
-const isClient = (client: unknown) => client instanceof pg.Client
-  || (client instanceof Object && typeof (client as pg.PoolClient).query === 'function' && typeof (client as pg.PoolClient).release === 'function');
+// A single connection is a pg Client from this copy of pg; a pool's checked-out client is one. No object shape can prove
+// that its statements share one backend (a wrapper with `query` and `release` around a pool does not), so anything
+// else is refused rather than given a transaction that is not one.
+const isClient = (client: unknown) => client instanceof pg.Client;
 // Drizzle writes `SET TRANSACTION` with nothing after it for a config that sets nothing, which PostgreSQL refuses.
 const setsSomething = (config: PgTransactionConfig | undefined): config is PgTransactionConfig =>
   config !== undefined && Object.values(config).some(value => value !== undefined);

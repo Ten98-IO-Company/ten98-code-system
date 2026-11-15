@@ -146,13 +146,15 @@ test('the exported transaction refuses a database it cannot run safely instead o
   const Minified = class a extends ScriptedPool {}, minified = new Minified({});
   assert.equal(await transaction(drizzle(minified as never), async () => 'done'), 'done');
   assert.deepEqual([minified.sent, minified.released], [['begin', 'commit'], [false]]);
-  // A checked-out client is Drizzle's own transaction on that client: nothing to check out or release.
+  // A pg Client (a checked-out client is one) is Drizzle's own transaction on that client: nothing to check out or release.
   const sent: string[] = [], query = async (config: string | { text: string }) => { sent.push(typeof config === 'string' ? config : config.text); return { rows: [], fields: [] }; };
-  assert.equal(await transaction(drizzle({ query, release: () => undefined } as never), async () => 'done'), 'done');
+  const client = Object.assign(new pg.Client(), { query });
+  assert.equal(await transaction(drizzle(client as never), async () => 'done'), 'done');
   assert.deepEqual(sent, ['begin', 'commit']);
-  // A wrapped pool (query and connect, no totalCount, no release) is refused: its statements could run on different backends.
-  await assert.rejects(transaction(drizzle({ query, connect: async () => ({ query, release: () => undefined }) } as never), async () => 'unreached'), refusedDatabase);
-  await assert.rejects(transaction(drizzle({ query } as never), async () => 'unreached'), refusedDatabase);
+  // Wrappers are refused, whatever their shape: statements through them could run on different backends.
+  for (const wrapped of [{ query, connect: async () => ({ query, release: () => undefined }) }, { query, release: () => undefined }, { query }]) {
+    await assert.rejects(transaction(drizzle(wrapped as never), async () => 'unreached'), refusedDatabase);
+  }
   assert.deepEqual(sent, ['begin', 'commit']);
 });
 
@@ -542,6 +544,35 @@ test('a REPEATABLE READ read-only transaction of the caller never admits a membe
   } finally {
     await root!.query("INSERT INTO membership(workspace_id, user_id, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING", [fixture.w2, fixture.a]);
   }
+});
+
+test('a lock record never outlives its transaction: a stale transaction object inside a later READ ONLY transaction is refused', { skip }, async () => {
+  // One connection, so the stale object's statements land in the later transaction on that same connection.
+  const single = createPool(urlFor(roles.app), { max: 1 });
+  pools.push(single);
+  const db = drizzle(single, { schema }), visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note)).map(row => row.id);
+  type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+  let stale: Tx | undefined;
+  const failure = new Error('the callback failed');
+  // Reused after the helper's transaction committed, and after it rolled back.
+  for (const end of ['commit', 'rollback'] as const) {
+    const finished = tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], async tx => { stale = tx as Tx; if (end === 'rollback') throw failure; });
+    if (end === 'rollback') await assert.rejects(finished, error => error === failure); else await finished;
+    await db.transaction(async () => {
+      await assert.rejects(tenancy.withWorkspace(stale!, fixture.a, fixture.w1, 'read', visible), unlocked, `${end}: as db`);
+      await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', visible, stale), unlocked, `${end}: as outer`);
+      await assert.rejects(tenancy.withWorkspaces(stale!, fixture.a, [fixture.w1], visible), unlocked, `${end}: withWorkspaces`);
+    }, { accessMode: 'read only' });
+  }
+  // A caller's own ROLLBACK and BEGIN READ ONLY inside a live helper transaction starts a transaction the record does not cover.
+  await tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], async tx => {
+    await tx.execute(sql`ROLLBACK`);
+    await tx.execute(sql`BEGIN READ ONLY`);
+    await assert.rejects(tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'read', visible), unlocked, 'after ROLLBACK and BEGIN');
+    await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', visible, tx), unlocked, 'as outer, after ROLLBACK and BEGIN');
+  });
+  // The live record still admits within its own transaction.
+  assert.deepEqual(await tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], tx => tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'read', visible)), [fixture.w1]);
 });
 
 // Last: this changes D's membership.

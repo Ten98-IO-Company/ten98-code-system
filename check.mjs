@@ -504,9 +504,8 @@ export function checkDeployment(directory, packageName) {
 // The index after an optional type argument starting at `index` (whitespace first), or `index` when there is none.
 // Brackets are balanced so object types with `;`, nested generics and `=>` arrows are skipped whole.
 function afterTypeArgument(text, index) {
-    let at = index;
-    while (/\s/u.test(text[at] ?? ''))
-        at++;
+    // Whitespace and comments may stand before the type argument, as in `pool.query/* note */<Row>(`.
+    let at = index + (/^(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*/u.exec(text.slice(index, index + 4000))?.[0].length ?? 0);
     if (text[at] !== '<')
         return index;
     for (let depth = 0, end = Math.min(text.length, at + 4000); at < end; at++) {

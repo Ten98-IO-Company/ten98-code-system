@@ -151,7 +151,9 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
       "import * as d from 'drizzle-orm';\nawait db.execute(d.sql`SELECT 1`)", "import * as d from 'drizzle-orm';\nd.sql.raw('now()')",
       // And those the check of 78f80fa found.
       "await pool.query?.<{ id: string }>('SELECT 1')", "await pool.query!<{ id: string }>('SELECT 1')", "await pool.query /* report */ ('SELECT 1')",
-      "await pool.query // report\n  ('SELECT 1')", "import d, * as ns from 'drizzle-orm';\nawait db.execute(ns.sql`SELECT 1`)"]) {
+      "await pool.query // report\n  ('SELECT 1')", "import d, * as ns from 'drizzle-orm';\nawait db.execute(ns.sql`SELECT 1`)",
+      // And the check of 08bb83e: a comment before the type argument.
+      "await pool.query/* report */<{ id: string }>('SELECT 1')"]) {
       writeFileSync(source, `${statement};\n`);
       const refused = run();
       assert.equal(refused.status, 1, statement);
