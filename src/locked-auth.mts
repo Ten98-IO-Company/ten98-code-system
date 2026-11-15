@@ -5,8 +5,11 @@
 //
 // The map lives on globalThis, so separate copies of these modules (bundlers load more than one) share it. It holds the
 // Drizzle transaction and its pg connection only while the callback runs; a transaction nobody marked is never refused.
-/** What a marked transaction already holds: `email` is the normalised email whose advisory lock it took first, if any. */
-export type LockedAuthHold = { readonly email: string | undefined };
+/**
+ * What a marked transaction already holds: `email` is the normalised email whose advisory lock it took first, if any;
+ * `userId` is the user row it locked, if any.
+ */
+export type LockedAuthHold = { readonly email: string | undefined; readonly userId: string | undefined };
 const key = Symbol.for('ten98.runtime.locked-auth-transactions.v2');
 const slot = globalThis as unknown as Record<symbol, WeakMap<object, LockedAuthHold> | undefined>;
 const marked = slot[key] ??= new WeakMap<object, LockedAuthHold>();
@@ -34,6 +37,15 @@ export function markLockedAuth(hold: LockedAuthHold, ...targets: object[]): () =
   const held = targets.flatMap(objects);
   for (const item of held) marked.set(item, hold);
   return () => { for (const item of held) marked.delete(item); };
+}
+
+/**
+ * The user row a by-id `withLockedAuth` transaction locked: undefined outside one, and for `withLockedAuthByEmail`,
+ * whose account is the one behind an email being signed in to, not a signed-in user.
+ */
+export function lockedAuthUser(client: unknown): string | undefined {
+  const hold = holdOf(client);
+  return hold?.email === undefined ? hold?.userId : undefined;
 }
 
 /** Throws LockedAuthTransactionError when `client` is, or runs on the connection of, a marked transaction. */

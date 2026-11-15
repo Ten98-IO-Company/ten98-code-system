@@ -8,7 +8,7 @@
 // better-auth on one transaction that holds the user row, so a password change and a sign-in or revocation cannot
 // interleave.
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash, createHmac, hkdfSync, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, hkdfSync, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { and, eq, getTableName, sql } from 'drizzle-orm';
 import { NodePgSession, NodePgTransaction } from 'drizzle-orm/node-postgres';
 import { PgTransaction } from 'drizzle-orm/pg-core';
@@ -17,10 +17,13 @@ import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, 
 import { setSessionCookie } from 'better-auth/cookies';
 import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import { twoFactor } from 'better-auth/plugins/two-factor';
-import { account as accountTable, transaction, TransactionRolledBackError, user as userTable } from './db.mjs';
+import { account as accountTable, session as sessionTable, transaction, TransactionRolledBackError, user as userTable } from './db.mjs';
+import { isEmailAddress } from './email-message.mjs';
 import { appOrigin } from './index.mjs';
-import { LockedAuthTransactionError, markLockedAuth, refuseLockedAuth } from './locked-auth.mjs';
+import { lockedAuthUser, LockedAuthTransactionError, markLockedAuth, refuseLockedAuth } from './locked-auth.mjs';
+import { oidcProviderId } from './workspace-team.mjs';
 export { LockedAuthTransactionError } from './locked-auth.mjs';
+export { normaliseOidcIssuer, normaliseOidcIssuerSql, oidcProviderId } from './workspace-team.mjs';
 /** The shared identity policy. Apps read it for forms and route limiters, so the numbers never drift between them. */
 export const ten98AuthPolicy = Object.freeze({
     password: Object.freeze({ minLength: 12, maxLength: 128 }),
@@ -84,15 +87,18 @@ const raw = (value) => {
 const handlePrefix = 'v1.';
 const isHandle = (value) => typeof value === 'string' && value.startsWith(handlePrefix);
 const tokenHandle = (keys, token) => handlePrefix + mac(keys.session, token);
-// The kept prefixes, longest first where they overlap. An attempt counter names its challenge, so its tail is stored
-// with this same rule and the stored counter is exactly '2fa-attempts-' || <stored challenge identifier>.
+// The kept prefixes, longest first where they overlap. An attempt counter and a challenge's provider binding name their
+// challenge, so their tails are stored with this same rule: the stored row is exactly '2fa-attempts-' (or
+// 'oidc-challenge:') || <stored challenge identifier>, which revokeProviderSessions joins on in SQL.
 const attemptsPrefix = '2fa-attempts-';
+const challengeProviderPrefix = 'oidc-challenge:';
+const namingPrefixes = [attemptsPrefix, challengeProviderPrefix];
 const keptPrefixes = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:', 'known-device-attempt:', 'known-device:'];
 function storedIdentifier(keys, identifier) {
     let head = '', rest = identifier;
-    while (rest.startsWith(attemptsPrefix)) {
-        head += attemptsPrefix;
-        rest = rest.slice(attemptsPrefix.length);
+    for (let naming = namingPrefixes.find(candidate => rest.startsWith(candidate)); naming; naming = namingPrefixes.find(candidate => rest.startsWith(candidate))) {
+        head += naming;
+        rest = rest.slice(naming.length);
     }
     const prefix = keptPrefixes.find(candidate => rest.startsWith(candidate));
     return head + (prefix ? prefix + mac(keys.verification, rest.slice(prefix.length)) : handlePrefix + mac(keys.verification, rest));
@@ -152,14 +158,33 @@ export function sessionTokenKey(secret, token) {
     return tokenHandle(deriveKeys(checkedSecret(secret)), raw(token));
 }
 /**
- * The statements every app's numbered migration runs once when it adopts hashed token storage, separated as drizzle-kit
- * separates statements. Rows stored in plain text before it would never match again: every session ends, and reset
- * links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go with them.
- * Rows an app writes with its own SQL are its own decision.
+ * The statements every app's numbered migration runs once when it adopts runtime 0.29.0's auth storage, separated as
+ * drizzle-kit separates statements. Rows stored in plain text before it would never match again: every session ends,
+ * and reset links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go
+ * with them. Then the session gains its provider binding, `oidcProvider`, and emails are stored lower-case
+ * (`user_email_lowercase`): the migration stops, listing the account ids and never an address, while two accounts share
+ * an email ignoring case, so an operator resolves them first. Rows an app writes with its own SQL are its own decision.
  */
 export const tokenStorageUpgradeStatements = [
     'DELETE FROM "session";',
     'DELETE FROM verification WHERE identifier LIKE \'reset-password:%\' OR identifier LIKE \'trust-device-%\' OR identifier LIKE \'2fa-%\';',
+    'ALTER TABLE "session" ADD COLUMN "oidcProvider" text;',
+    // #143, comment 6891409340, verbatim.
+    `DO $$
+DECLARE twins integer; listed text;
+BEGIN
+  SELECT count(*), string_agg(ids, ', ' ORDER BY first) FILTER (WHERE n <= 20)
+    INTO twins, listed
+    FROM (SELECT '[' || string_agg(id, ', ' ORDER BY id) || ']' AS ids, min(id) AS first, row_number() OVER (ORDER BY min(id)) AS n
+          FROM "user" GROUP BY lower(email) HAVING count(*) > 1) shared;
+  IF twins > 0 THEN
+    RAISE EXCEPTION 'user_email_lowercase: % email address(es) belong to more than one user when case is ignored (accounts: %); resolve them before this migration',
+      twins, listed || CASE WHEN twins > 20 THEN ', …' ELSE '' END;
+  END IF;
+END
+$$;`,
+    'UPDATE "user" SET email = lower(email) WHERE email <> lower(email);',
+    'ALTER TABLE "user" ADD CONSTRAINT user_email_lowercase CHECK (email = lower(email));',
 ].join('\n--> statement-breakpoint\n');
 // The adapter methods better-auth 1.7.7 defines. Any other function is refused rather than left unwrapped.
 const adapterMethods = new Set(['create', 'findOne', 'findMany', 'count', 'update', 'updateMany', 'delete', 'deleteMany', 'consumeOne', 'incrementOne', 'transaction', 'createSchema']);
@@ -307,8 +332,8 @@ function build(options, keys, locking, internal = {}) {
             throw APIError.fromStatus('UNAUTHORIZED');
         return user;
     };
-    const issue = async (context, user) => {
-        const created = await context.context.internalAdapter.createSession(user.id, false);
+    const issue = async (context, user, provider) => {
+        const created = await context.context.internalAdapter.createSession(user.id, false, provider === undefined ? undefined : { oidcProvider: provider });
         if (!created)
             throw APIError.fromStatus('INTERNAL_SERVER_ERROR');
         await setSessionCookie(context, { user, session: created });
@@ -319,16 +344,53 @@ function build(options, keys, locking, internal = {}) {
         endpoints: {
             rotateVerifiedSession: createAuthEndpoint.serverOnly({ method: 'POST' }, async (context) => {
                 const user = await verifiedUser(context, 'verifiedUserId');
-                // Only the account's own current session can be rotated; this never signs anyone in.
+                // Only the account's own current session can be rotated; this never signs anyone in. The new session keeps the
+                // provider binding, so rotation never takes a session out of reach of revokeProviderSessions.
                 const current = await getSessionFromCtx(context);
                 if (!current || current.user.id !== user.id)
                     throw APIError.fromStatus('UNAUTHORIZED');
-                const response = await issue(context, user);
+                const response = await issue(context, user, providerKey(current.session.oidcProvider));
                 await context.context.internalAdapter.deleteSession(current.session.token);
                 return response;
             }),
-            completeOidcSession: createAuthEndpoint.serverOnly({ method: 'POST' }, async (context) => issue(context, await verifiedUser(context, 'oidcUserId'))),
+            completeOidcSession: createAuthEndpoint.serverOnly({ method: 'POST' }, async (context) => {
+                const provider = providerKey(context.body?.provider);
+                if (provider === undefined)
+                    throw APIError.fromStatus('BAD_REQUEST');
+                return issue(context, await verifiedUser(context, 'oidcUserId'), provider);
+            }),
         },
+    };
+    const boundProvider = async (context) => {
+        const current = providerKey(context?.context.session?.session?.oidcProvider);
+        if (current !== undefined || !context || !twoFactorPaths.has(context.path ?? ''))
+            return current;
+        const challenge = await context.getSignedCookie(context.context.createAuthCookie('two_factor').name, context.context.secret);
+        if (typeof challenge !== 'string' || !challenge)
+            return undefined;
+        const binding = await context.context.internalAdapter.findVerificationValue(challengeProviderPrefix + challenge);
+        if (!binding)
+            return undefined;
+        await context.context.internalAdapter.deleteVerificationByIdentifier(challengeProviderPrefix + challenge);
+        return providerKey(binding.value);
+    };
+    const databaseHooks = {
+        session: { create: { async before(data, context) {
+                    if (providerKey(data.oidcProvider) !== undefined)
+                        return;
+                    const provider = await boundProvider(context);
+                    return provider === undefined ? undefined : { data: { ...data, oidcProvider: provider } };
+                } } },
+        verification: { create: { async before(data, context) {
+                    // The sign-in challenge the two-factor plugin opens for completeOidcSession (a server call, so no path): its
+                    // identifier is exactly '2fa-' and 20 characters of better-auth's generateRandomString (letters, digits, '-' and
+                    // '_'); its '2fa-attempts-' and '2fa-otp-' rows name the challenge and are always longer.
+                    const hook = context;
+                    const provider = providerKey(hook?.body?.provider);
+                    if (!hook || hook.path !== undefined || typeof hook.body?.oidcUserId !== 'string' || provider === undefined || !/^2fa-[A-Za-z0-9_-]{20}$/.test(data.identifier))
+                        return;
+                    await hook.context.internalAdapter.createVerificationValue({ identifier: challengeProviderPrefix + data.identifier, value: provider, expiresAt: data.expiresAt });
+                } } },
     };
     // Replaces better-auth's /revoke-other-sessions (a plugin endpoint of the same name wins), which compares the caller's
     // raw token with the listed handles. This one keeps the current session by id and deletes the user's other live
@@ -421,7 +483,10 @@ function build(options, keys, locking, internal = {}) {
         logger: { disabled: true },
         onAPIError: { onError(error) { if (isAPIError(error))
                 throw error; throw APIError.fromStatus('INTERNAL_SERVER_ERROR'); } },
-        session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false } },
+        // oidcProvider is server-set only (input: false): no request can bind or unbind a session.
+        session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false },
+            additionalFields: { oidcProvider: { type: 'string', required: false, input: false } } },
+        databaseHooks,
         plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
         emailAndPassword: {
             enabled: true,
@@ -570,7 +635,7 @@ function build(options, keys, locking, internal = {}) {
                 await forgetDevices(store.adapter, hold.userId);
             },
         });
-        const unmark = markLockedAuth({ email: hold.email }, callbackTx, connection);
+        const unmark = markLockedAuth({ email: hold.email, userId: hold.userId }, callbackTx, connection);
         try {
             return await lockedContext.run(true, () => run(bound, callbackTx));
         }
@@ -871,7 +936,7 @@ export class MissingEmailIndexError extends Error {
 const schemaTables = {
     user: [userTable.id.name, userTable.email.name, userTable.closedAt.name],
     account: [accountTable.userId.name, accountTable.providerId.name, accountTable.password.name, accountTable.updatedAt.name],
-    session: ['id', 'token', 'userId', 'expiresAt'],
+    session: [sessionTable.id.name, sessionTable.token.name, sessionTable.userId.name, sessionTable.expiresAt.name, sessionTable.oidcProvider.name],
     verification: ['id', 'identifier', 'value', 'expiresAt'],
 };
 /** The schema is not the one locked auth uses: the tables or columns it names are missing. */
@@ -934,6 +999,148 @@ function emailIndex(db) {
         emailIndexChecks.set(db, check);
     }
     return check;
+}
+/** An app's provider key: 1 to 256 characters with no control characters; undefined for anything else. */
+function providerKey(value) {
+    return typeof value === 'string' && value.length >= 1 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
+}
+const oidcRefusals = {
+    OIDC_EMAIL_UNVERIFIED: [403, 'This provider cannot create an account here: it did not confirm a verified email, or it is not trusted to.'],
+    OIDC_ACCOUNT_EXISTS: [409, 'An account already uses this email. Sign in to it, then link the provider in account settings.'],
+    OIDC_IDENTITY_IN_USE: [409, 'This provider identity is linked to another account.'],
+    OIDC_IDENTITY_NOT_FOUND: [404, 'This provider identity is not linked to the account.'],
+    OIDC_LAST_SIGN_IN_METHOD: [409, 'Set a password or link another provider before unlinking the last way to sign in.'],
+};
+/** A refusal of a linked-identity operation: `status` is the HTTP status that fits and `message` is safe to show. */
+export class OidcIdentityError extends Error {
+    status;
+    code;
+    constructor(code) {
+        const [status, message] = oidcRefusals[code];
+        super(message);
+        this.name = 'OidcIdentityError';
+        this.status = status;
+        this.code = code;
+    }
+}
+/** The account row key of an identity; TypeError for an issuer without a host or a `sub` that is not 1 to 255 characters. */
+function identityKey(issuer, subject) {
+    if (typeof subject !== 'string' || subject.length < 1 || subject.length > 255)
+        throw new TypeError('An OIDC subject is a string of 1 to 255 characters.');
+    return { providerId: oidcProviderId(issuer), accountId: subject };
+}
+/** The user a by-id withLockedAuth transaction holds; TypeError outside one (by email included), as a programming error. */
+function lockedUser(tx, operation) {
+    const userId = lockedAuthUser(tx);
+    if (userId === undefined)
+        throw new TypeError(`${operation} runs inside withLockedAuth, on its transaction, for the signed-in user it locked.`);
+    return userId;
+}
+const linkedUser = async (db, key) => (await db.select({ userId: accountTable.userId }).from(accountTable).where(and(eq(accountTable.providerId, key.providerId), eq(accountTable.accountId, key.accountId))).limit(1))[0]?.userId;
+const uniqueViolation = (error) => [error, error?.cause].some(item => item?.code === '23505');
+/**
+ * The provider sign-in (#143): the user linked to the identity in `claims` (`iss`, `sub`), or a new account for it.
+ * It never links to an existing account. With no identity linked, an account is created only when `claims` carry
+ * `email_verified === true` and an email, and `provider.trustVerifiedEmail` is true; otherwise OIDC_EMAIL_UNVERIFIED.
+ * The account is created under the shared email lock (`pg_advisory_xact_lock(emailLockKey, hashtext(email))`, the team
+ * controller's `lockEmail`), as every account-creation path is; an email that already has an account is refused with
+ * OIDC_ACCOUNT_EXISTS (the user signs in and links, or accepts an invitation). The new account has a verified email, no
+ * password and an account row with no provider tokens. `claims` must come from an ID token the app verified. The
+ * account's usability (`closed_at`) is the app's check before it signs the user in with `completeOidcSession`.
+ */
+export async function findOidcUser(db, claims, provider, { emailLockKey = 109_859 } = {}) {
+    refuseLockedAuth(db, 'findOidcUser');
+    if (!Number.isInteger(emailLockKey) || emailLockKey < -INT32 || emailLockKey >= INT32)
+        throw new TypeError('emailLockKey must be a 32-bit integer.');
+    const key = identityKey(claims?.iss, claims?.sub);
+    const found = await linkedUser(db, key);
+    if (found !== undefined)
+        return { userId: found, created: false };
+    const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : '';
+    // Checked before any account lookup, so an untrusted or unverified provider learns nothing about which emails exist.
+    if (claims.email_verified !== true || provider?.trustVerifiedEmail !== true || !isEmailAddress(email))
+        throw new OidcIdentityError('OIDC_EMAIL_UNVERIFIED');
+    const given = typeof claims.name === 'string' ? claims.name.trim() : '';
+    const name = given.length >= 1 && given.length <= 120 && !/[\u0000-\u001f\u007f]/.test(given) ? given : email;
+    try {
+        return await transaction(db, async (tx) => {
+            await tx.execute(sql `SELECT pg_advisory_xact_lock(${emailLockKey}, hashtext(${email}))`);
+            // A first sign-in of the same identity that held the lock first has linked it by now.
+            const raced = await linkedUser(tx, key);
+            if (raced !== undefined)
+                return { userId: raced, created: false };
+            if ((await tx.select({ id: userTable.id }).from(userTable).where(sql `lower(${userTable.email}) = lower(${email})`).limit(1)).length)
+                throw new OidcIdentityError('OIDC_ACCOUNT_EXISTS');
+            const userId = randomUUID();
+            await tx.insert(userTable).values({ id: userId, name, email, emailVerified: true });
+            await tx.insert(accountTable).values({ id: randomUUID(), userId, ...key });
+            return { userId, created: true };
+        });
+    }
+    catch (error) {
+        // The same identity created under another email's lock at the same moment: that account is the one it links to.
+        const raced = uniqueViolation(error) ? await linkedUser(db, key) : undefined;
+        if (raced !== undefined)
+            return { userId: raced, created: false };
+        throw error;
+    }
+}
+/**
+ * Links an identity to the signed-in user, the one `withLockedAuth` locked: call it inside that callback, on its `tx`,
+ * after the app verified an ID token the user obtained while signed in. `linked` is false when the identity already
+ * belongs to this user. An identity linked to another account is refused with OIDC_IDENTITY_IN_USE; nothing moves it.
+ */
+export async function linkOidcIdentity(tx, identity) {
+    const userId = lockedUser(tx, 'linkOidcIdentity');
+    const key = identityKey(identity?.issuer, identity?.subject);
+    const inserted = await tx.insert(accountTable).values({ id: randomUUID(), userId, ...key })
+        .onConflictDoNothing({ target: [accountTable.providerId, accountTable.accountId] }).returning({ id: accountTable.id });
+    if (inserted.length)
+        return { linked: true };
+    if (await linkedUser(tx, key) !== userId)
+        throw new OidcIdentityError('OIDC_IDENTITY_IN_USE');
+    return { linked: false };
+}
+/**
+ * Unlinks an identity from the user `withLockedAuth` locked (inside that callback, on its `tx`), deleting its account
+ * row. Refused with OIDC_LAST_SIGN_IN_METHOD when the user would be left with no way to sign in: no password and no
+ * other linked identity. The user's sessions are not ended; pair it with `revokeAllSessions()` where the app wants that.
+ */
+export async function unlinkOidcIdentity(tx, identity) {
+    const userId = lockedUser(tx, 'unlinkOidcIdentity');
+    const key = identityKey(identity?.issuer, identity?.subject);
+    // The user's credential rows, locked so the count below holds until COMMIT (locked auth's order: after the user row).
+    const rows = await tx.select({ id: accountTable.id, providerId: accountTable.providerId, accountId: accountTable.accountId, password: accountTable.password })
+        .from(accountTable).where(eq(accountTable.userId, userId)).for('update');
+    const target = rows.find(row => row.providerId === key.providerId && row.accountId === key.accountId);
+    if (!target)
+        throw new OidcIdentityError('OIDC_IDENTITY_NOT_FOUND');
+    const remaining = rows.filter(row => row !== target && (row.providerId !== 'credential' || (typeof row.password === 'string' && row.password !== '')));
+    if (!remaining.length)
+        throw new OidcIdentityError('OIDC_LAST_SIGN_IN_METHOD');
+    await tx.delete(accountTable).where(eq(accountTable.id, target.id));
+}
+/**
+ * Ends every session that began through `provider` (the key passed to `completeOidcSession`), when the app disables,
+ * deletes or reconfigures it, and the two-factor challenges such a sign-in opened, with their attempt counters, so none
+ * completes into a session later. Challenges go first, in one transaction, so a challenge completing concurrently fails,
+ * or commits a session the second statement deletes, or one of the two aborts on a deadlock (SQLSTATE 40P01; a failed
+ * revocation is retried). Resolves the number of sessions ended. Disable the provider first, so no new sign-in starts
+ * through it meanwhile.
+ */
+export async function revokeProviderSessions(db, provider) {
+    refuseLockedAuth(db, 'revokeProviderSessions');
+    const key = providerKey(provider);
+    if (key === undefined)
+        throw new TypeError('A provider key is 1 to 256 characters with no control characters.');
+    return transaction(db, async (tx) => {
+        // Parameterised raw statement by necessity: verification has no Drizzle table in the common schema.
+        await tx.execute(sql `WITH bound AS (SELECT identifier, substr(identifier, ${challengeProviderPrefix.length + 1}) AS challenge FROM verification
+        WHERE starts_with(identifier, ${challengeProviderPrefix}) AND value = ${key})
+      DELETE FROM verification WHERE identifier IN (SELECT identifier FROM bound UNION ALL SELECT challenge FROM bound UNION ALL SELECT ${attemptsPrefix} || challenge FROM bound)`);
+        const ended = await tx.delete(sessionTable).where(eq(sessionTable.oidcProvider, key));
+        return ended.rowCount ?? 0;
+    });
 }
 /** Both verifiers on every attempt, one of them against a dummy; true only for a stored hash the password matches. */
 async function verifyStoredPassword(hash, candidate, legacyAccepted) {

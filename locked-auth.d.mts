@@ -1,6 +1,10 @@
-/** What a marked transaction already holds: `email` is the normalised email whose advisory lock it took first, if any. */
+/**
+ * What a marked transaction already holds: `email` is the normalised email whose advisory lock it took first, if any;
+ * `userId` is the user row it locked, if any.
+ */
 export type LockedAuthHold = {
     readonly email: string | undefined;
+    readonly userId: string | undefined;
 };
 /** A tenancy helper, a team operation or a lock was called inside a `withLockedAuth` transaction that cannot take it. */
 export declare class LockedAuthTransactionError extends Error {
@@ -9,6 +13,11 @@ export declare class LockedAuthTransactionError extends Error {
 }
 /** Marks the given transactions and connections until the returned function is called. */
 export declare function markLockedAuth(hold: LockedAuthHold, ...targets: object[]): () => void;
+/**
+ * The user row a by-id `withLockedAuth` transaction locked: undefined outside one, and for `withLockedAuthByEmail`,
+ * whose account is the one behind an email being signed in to, not a signed-in user.
+ */
+export declare function lockedAuthUser(client: unknown): string | undefined;
 /** Throws LockedAuthTransactionError when `client` is, or runs on the connection of, a marked transaction. */
 export declare function refuseLockedAuth(client: unknown, operation: string): void;
 /**

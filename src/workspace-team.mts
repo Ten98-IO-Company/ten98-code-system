@@ -60,6 +60,41 @@ const fields = (input: unknown, allowed: readonly string[]): Record<string, unkn
   return input as Record<string, unknown>;
 };
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+
+// scheme :// [userinfo@] host[:port] path rest. One expression, the same in normaliseOidcIssuerSql, so both split alike.
+const ISSUER = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/((?:[^/?#]*@)?)([^/?#]*)([^?#]*)([\s\S]*)$/;
+// ASCII letters only, as SQL translate() does: lower() follows the database's collation, which could disagree.
+const asciiLower = (value: string) => value.replace(/[A-Z]+/g, letters => letters.toLowerCase());
+/**
+ * The issuer as the preset stores it in `account.providerId` ('oidc:' + this): the scheme and host lowercased (ASCII
+ * letters), a default port removed (:443 for https, :80 for http), and one trailing slash dropped from the path. Userinfo,
+ * the rest of the path and anything after it are kept as given. A value without a scheme and a host throws a TypeError.
+ */
+export function normaliseOidcIssuer(issuer: string): string {
+  const match = typeof issuer === 'string' ? ISSUER.exec(issuer) : null;
+  if (!match || !match[3] || match[3].startsWith(':')) throw new TypeError('An OIDC issuer is an absolute URL with a host, such as https://idp.example.com.');
+  const scheme = asciiLower(match[1]!), defaultPort = scheme === 'https' ? ':443' : scheme === 'http' ? ':80' : undefined;
+  const host = asciiLower(match[3]), path = match[4]!;
+  return `${scheme}://${match[2]}${defaultPort && host.endsWith(defaultPort) ? host.slice(0, -defaultPort.length) : host}${path.endsWith('/') ? path.slice(0, -1) : path}${match[5]}`;
+}
+/**
+ * normaliseOidcIssuer as SQL, for an app's migration that copies identities into account rows: it creates the
+ * session-scoped `pg_temp.ten98_normalise_oidc_issuer(text)`, which returns NULL where the function throws. Call it
+ * schema-qualified, as `pg_temp.ten98_normalise_oidc_issuer(issuer)`, on the connection that created it.
+ */
+export const normaliseOidcIssuerSql = `CREATE OR REPLACE FUNCTION pg_temp.ten98_normalise_oidc_issuer(issuer text) RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $normalise$
+  SELECT CASE WHEN m IS NULL OR m[3] = '' OR left(m[3], 1) = ':' THEN NULL ELSE s || '://' || m[2]
+    || CASE WHEN s = 'https' AND right(h, 4) = ':443' THEN left(h, -4) WHEN s = 'http' AND right(h, 3) = ':80' THEN left(h, -3) ELSE h END
+    || CASE WHEN right(m[4], 1) = '/' THEN left(m[4], -1) ELSE m[4] END || m[5] END
+  FROM regexp_match(issuer, '^([A-Za-z][A-Za-z0-9+.-]*)://((?:[^/?#]*@)?)([^/?#]*)([^?#]*)(.*)$') AS m,
+    LATERAL (SELECT translate(m[1], 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') AS s,
+                    translate(m[3], 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') AS h) AS v
+$normalise$;`;
+/** The account row's `providerId` for an issuer: identities are keyed by issuer, so providers on one issuer share them. */
+export const oidcProviderId = (issuer: string) => `oidc:${normaliseOidcIssuer(issuer)}`;
+/** An OIDC `sub`: a non-empty string of at most 255 characters (OpenID Connect Core 1.0, section 2). */
+const isOidcSubject = (value: unknown): value is string => typeof value === 'string' && value.length >= 1 && value.length <= 255;
+
 const pendingRole = "(m.role='owner' OR (m.role='admin' AND i.role IN ('editor','viewer')))";
 const INT32 = 2 ** 31;
 
@@ -355,19 +390,29 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }: { 
       return { workspaceId, userId: userId!, role, joined, created, email: invitation.email };
     },
 
-    /** Server only: `identity` must be cryptographically verified OIDC claims. Creates the account; an existing one must link explicitly. */
-    async acceptVerifiedOidcInvitation(client: TeamClient, tokenValue: unknown, identity: { email: string; name: string }, passwordHash?: string) {
+    /**
+     * Server only: `identity` must be cryptographically verified OIDC claims, and its email the invited one. Creates the
+     * account; an existing one must link explicitly. With `issuer` and `subject` (the token's `iss` and `sub`) it also
+     * links that identity to the new account, as an account row with no provider tokens, so the next sign-in through
+     * the provider finds it; an identity already linked to another account is refused as OIDC_ACCOUNT_EXISTS.
+     */
+    async acceptVerifiedOidcInvitation(client: TeamClient, tokenValue: unknown, identity: { email: string; name: string; issuer?: string; subject?: string }, passwordHash?: string) {
       refuseLockedAuth(client, 'acceptVerifiedOidcInvitation');
-      const claims = fields(identity, ['email', 'name']);
+      const claims = fields(identity, ['email', 'name', 'issuer', 'subject']);
       const verified = { email: email(claims.email), name: name(claims.name) };
       if (passwordHash !== undefined && typeof passwordHash !== 'string') invalid();
+      if ((claims.issuer === undefined) !== (claims.subject === undefined) || (claims.subject !== undefined && !isOidcSubject(claims.subject))) invalid();
+      let providerId: string | undefined;
+      try { providerId = claims.issuer === undefined ? undefined : oidcProviderId(claims.issuer as string); } catch { invalid(); }
       const { workspaceId, invitation } = await lockInvitation(client, digest(token(tokenValue)));
       if (invitation.email !== verified.email) fail(403, 'OIDC_INVITE_EMAIL_MISMATCH', 'The verified provider email does not match the invitation recipient.');
-      if ((await client.query('SELECT id FROM "user" WHERE lower(email)=$1', [verified.email])).rowCount) {
-        fail(409, 'OIDC_ACCOUNT_EXISTS', 'Sign in with the existing account before accepting this invitation. Link the provider explicitly in account settings.');
-      }
+      const existing = 'Sign in with the existing account before accepting this invitation. Link the provider explicitly in account settings.';
+      if ((await client.query('SELECT id FROM "user" WHERE lower(email)=$1', [verified.email])).rowCount) fail(409, 'OIDC_ACCOUNT_EXISTS', existing);
       const userId = randomUUID();
       await client.query('INSERT INTO "user"(id,name,email,"emailVerified") VALUES($1,$2,$3,true)', [userId, verified.name, verified.email]);
+      // An identity another account holds is refused; the caller rolls back, so the user row above goes with it.
+      if (providerId && (await client.query('INSERT INTO account(id,"accountId","providerId","userId") VALUES($1,$2,$3,$4) ON CONFLICT ("providerId","accountId") DO NOTHING',
+        [randomUUID(), claims.subject, providerId, userId])).rowCount !== 1) fail(409, 'OIDC_ACCOUNT_EXISTS', existing);
       if (passwordHash) await client.query('INSERT INTO account(id,"accountId","providerId","userId",password) VALUES($1,$2,\'credential\',$2,$3)', [randomUUID(), userId, passwordHash]);
       const { role } = await consumeInvitation(client, invitation, workspaceId, userId);
       return { userId, workspaceId, role };

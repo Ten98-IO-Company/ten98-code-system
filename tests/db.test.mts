@@ -67,6 +67,7 @@ test('the team schema names the tables and columns of workspace-team.sql', () =>
   }));
   assert.deepEqual(columns, {
     user: ['closed_at', 'createdAt', 'email', 'emailVerified', 'id', 'image', 'name', 'twoFactorEnabled', 'updatedAt'],
+    session: ['createdAt', 'expiresAt', 'id', 'ipAddress', 'oidcProvider', 'token', 'updatedAt', 'userAgent', 'userId'],
     account: ['accountId', 'createdAt', 'id', 'password', 'providerId', 'updatedAt', 'userId'],
     workspace: ['created_at', 'id', 'name'],
     membership: ['role', 'user_id', 'workspace_id'],
@@ -76,4 +77,5 @@ test('the team schema names the tables and columns of workspace-team.sql', () =>
     instance_operator_audit: ['action', 'created_at', 'id', 'scope', 'user_id'],
   });
   assert.deepEqual(getTableConfig(teamSchema.membership).primaryKeys.map(key => key.getName()), ['membership_pkey']);
+  assert.deepEqual(getTableConfig(teamSchema.user).checks.map(item => item.name), ['user_email_lowercase']);
 });

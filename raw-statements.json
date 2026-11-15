@@ -1,7 +1,7 @@
 {
   "src/auth.mts": {
-    "count": 4,
-    "reason": "Locked-auth transactions set their lock_timeout (set_config), withLockedAuthByEmail takes the team controller's email advisory lock (pg_advisory_xact_lock), and the start-up checks read pg_attribute for the tables and columns and pg_index for the unique index on lower(email); Drizzle has no builder for any of them. The user-row locks and the credential read are typed Drizzle queries."
+    "count": 6,
+    "reason": "Locked-auth transactions set their lock_timeout (set_config), withLockedAuthByEmail and findOidcUser take the team controller's email advisory lock (pg_advisory_xact_lock), and the start-up checks read pg_attribute for the tables and columns and pg_index for the unique index on lower(email); Drizzle has no builder for any of them. revokeProviderSessions deletes verification rows, which have no Drizzle table in the common schema. The user-row locks, the credential read, the identity rows and the session deletes are typed Drizzle queries."
   },
   "src/check.mts": {
     "count": 8,
@@ -24,7 +24,7 @@
     "reason": "The policy expression is DDL, which takes no bind parameters; set_config and current_setting have no Drizzle builder; the boot role check reads system catalogues on a pg pool."
   },
   "src/workspace-team.mts": {
-    "count": 51,
-    "reason": "The team controller predates the Drizzle team tables; part two of the framework moves it to typed Drizzle queries and lowers this entry."
+    "count": 52,
+    "reason": "The team controller predates the Drizzle team tables and takes a plain pg client (TeamClient); part two of the framework moves it to typed Drizzle queries and lowers this entry. acceptVerifiedOidcInvitation's identity row (#143) is one of them, in the same transaction as the account it links."
   }
 }
