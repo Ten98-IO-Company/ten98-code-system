@@ -1,18 +1,11 @@
-// The mark on the transactions `withLockedAuth` and `withLockedAuthByEmail` open (@ten98/runtime/auth), read by the
-// tenancy helpers and the workspace-level team operations, which refuse a marked transaction. A locked-auth transaction
-// holds a user row and must never wait on a workspace, membership or invitation lock, so no lock cycle can form between
-// it and a team or tenancy transaction. Internal: imported by auth, tenancy and workspace-team, not re-exported by index.
-//
-// The set lives on globalThis, so separate copies of these modules (bundlers load more than one) share it. It holds the
-// Drizzle transaction and its pg connection only while the callback runs; a transaction nobody marked is never refused.
-const key = Symbol.for('ten98.runtime.locked-auth-transactions');
+const key = Symbol.for('ten98.runtime.locked-auth-transactions.v2');
 const slot = globalThis;
-const marked = slot[key] ??= new WeakSet();
-/** A tenancy helper or a workspace-level team operation was called inside a `withLockedAuth` transaction. */
+const marked = slot[key] ??= new WeakMap();
+/** A tenancy helper, a team operation or a lock was called inside a `withLockedAuth` transaction that cannot take it. */
 export class LockedAuthTransactionError extends Error {
     code = 'LOCKED_AUTH_TRANSACTION';
     constructor(operation) {
-        super(`${operation} cannot run inside a withLockedAuth transaction: it holds a user row and must not wait on workspace, membership or invitation locks. Run it in its own transaction.`);
+        super(`${operation} cannot run inside a withLockedAuth transaction: it holds a user row, so it must not wait on a workspace, membership, invitation or other email lock. Run it in its own transaction.`);
         this.name = 'LockedAuthTransactionError';
     }
 }
@@ -24,16 +17,27 @@ const objects = (value) => {
     const connection = connectionOf(value);
     return connection !== null && typeof connection === 'object' ? [value, connection] : [value];
 };
-/** Marks a transaction and its connection until the returned function is called. */
-export function markLockedAuth(transaction) {
-    const held = objects(transaction);
+const holdOf = (value) => objects(value).map(item => marked.get(item)).find(hold => hold !== undefined);
+/** Marks the given transactions and connections until the returned function is called. */
+export function markLockedAuth(hold, ...targets) {
+    const held = targets.flatMap(objects);
     for (const item of held)
-        marked.add(item);
+        marked.set(item, hold);
     return () => { for (const item of held)
         marked.delete(item); };
 }
 /** Throws LockedAuthTransactionError when `client` is, or runs on the connection of, a marked transaction. */
 export function refuseLockedAuth(client, operation) {
-    if (objects(client).some(item => marked.has(item)))
+    if (holdOf(client))
         throw new LockedAuthTransactionError(operation);
+}
+/**
+ * The email lock is allowed in a marked transaction only for the email it already holds (taken first, by
+ * `withLockedAuthByEmail`), where taking it again changes nothing. After a user row (`withLockedAuth`), or for another
+ * email, it would reverse the global lock order and can deadlock against a sign-in by email.
+ */
+export function refuseLockedEmail(client, email) {
+    const hold = holdOf(client);
+    if (hold && hold.email !== email)
+        throw new LockedAuthTransactionError('lockEmail');
 }

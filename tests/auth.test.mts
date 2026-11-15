@@ -326,6 +326,46 @@ test('every better-auth 1.7.7 session-token path is one the storage wrapper was 
     for (let at = 0; at < found; at++) places.push(file);
   }
   assert.deepEqual(places, Array(5).fill('db/internal-adapter.mjs'));
+  // Every "session" literal in dist, file by file, whatever the method is called: a session path routed through
+  // deleteManyWithHooks(…, "session") or any other helper changes these counts. The non-adapter ones are schema field
+  // filters and client events.
+  const literals: Record<string, number> = {};
+  for (const path of readdirSync(dist, { recursive: true, encoding: 'utf8' })) {
+    if (!path.endsWith('.mjs')) continue;
+    const file = path.replaceAll('\\', '/'), found = readFileSync(new URL(file, dist), 'utf8').split('"session"').length - 1;
+    if (found) literals[file] = found;
+  }
+  assert.deepEqual(literals, {
+    'api/routes/session.mjs': 1, 'client/broadcast-channel.mjs': 1, 'client/session-refresh.mjs': 1, 'client/vue/index.mjs': 1,
+    'db/internal-adapter.mjs': 12, 'db/schema.mjs': 4, 'plugins/two-factor/backup-codes/index.mjs': 1,
+  });
+  // The hook-routed session writes the wrapper was reviewed for (create, update, delete, deleteMany), with their callers.
+  assert.equal(internal.split(/WithHooks\((?:[^()]|\([^()]*\))*?, "session"/).length - 1, 7);
+});
+
+test('only the reviewed plugins run: no multi-session (its deleteSessions deletes by a listed handle) and no admin', () => {
+  const { auth } = setup();
+  const ids = (auth as unknown as { options: { plugins: { id: string }[] } }).options.plugins.map(plugin => plugin.id);
+  assert.deepEqual(ids, ['two-factor', 'ten98-oidc-session', 'ten98-session-revocation']);
+});
+
+test('revoke-other ends only the caller\'s own other sessions, and count and deleteMany by token hash the token', async () => {
+  const env = setup();
+  const a = await env.user('a@example.com', await hashPassword(PASSWORD));
+  const b = await env.user('b@example.com', await hashPassword(PASSWORD));
+  const [a1] = [cookieOf(await env.signIn('a@example.com')), cookieOf(await env.signIn('a@example.com'))];
+  const bs = [await env.signIn('b@example.com'), await env.signIn('b@example.com')];
+  const { adapter } = await env.context as unknown as { adapter: { count(query: unknown): Promise<number>; deleteMany(query: unknown): Promise<number> } };
+  const live = (userId: string) => adapter.count({ model: 'session', where: [{ field: 'userId', value: userId }] });
+  assert.deepEqual(await (await env.post('/revoke-other-sessions', {}, a1!)).json(), { status: true, revoked: 1 });
+  assert.deepEqual([await live(a), await live(b)], [1, 2]);
+  for (const response of bs) assert.ok(await env.auth.api.getSession({ headers: { cookie: cookieOf(response) } }));
+  // By raw token, as better-auth's own calls give it: both find the stored handle.
+  const token = cookieValue(bs[0]!, '.session_token');
+  assert.equal(await adapter.count({ model: 'session', where: [{ field: 'token', value: token }] }), 1);
+  assert.equal(await adapter.deleteMany({ model: 'session', where: [{ field: 'token', value: token }] }), 1);
+  assert.equal(await env.auth.api.getSession({ headers: { cookie: cookieOf(bs[0]!) } }), null);
+  assert.equal(await live(b), 1);
 });
 
 test('sessions are stored as keyed handles while the cookie, lookups and refreshes keep the raw token', async () => {

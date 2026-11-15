@@ -7,12 +7,12 @@
 // (workspace FOR UPDATE, the caller's membership FOR SHARE, the target's and the owners' FOR UPDATE), so they hold at
 // READ COMMITTED, REPEATABLE READ and SERIALIZABLE; at the two stricter levels a conflicting concurrent change fails
 // with SQLSTATE 40001 and the caller retries. Lock order: workspace -> memberships -> invitation -> email. The
-// workspace-level methods refuse a transaction withLockedAuth (./auth) opened, which holds a user row; lockEmail and the
-// instance-operator methods do not.
+// workspace-level methods refuse a transaction withLockedAuth (./auth) opened, which holds a user row. lockEmail there
+// is allowed only for the email withLockedAuthByEmail already locked; the instance-operator methods are not refused.
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayGrantWorkspaceRole as mayGrant, mayManageWorkspaceMember, workspaceRoles, type WorkspaceRole as Role } from './browser.mjs';
 import { isEmailAddress } from './email-message.mjs';
-import { refuseLockedAuth } from './locked-auth.mjs';
+import { refuseLockedAuth, refuseLockedEmail } from './locked-auth.mjs';
 
 /** The subset of a `pg` client (or pool, for the read-only calls) that the controller uses. */
 export interface TeamClient {
@@ -75,7 +75,9 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }: { 
 
   /** Serialises account creation for one normalised email: pg_advisory_xact_lock(emailLockKey, hashtext(email)). */
   async function lockEmail(client: TeamClient, address: unknown): Promise<void> {
-    await client.query('SELECT pg_advisory_xact_lock($1,hashtext($2))', [emailLockKey, normalise(address)]);
+    const email = normalise(address);
+    refuseLockedEmail(client, email);
+    await client.query('SELECT pg_advisory_xact_lock($1,hashtext($2))', [emailLockKey, email]);
   }
   async function lockWorkspace(client: TeamClient, workspaceId: string) {
     return (await client.query<{ id: string; name: string }>('SELECT id,name FROM workspace WHERE id=$1 FOR UPDATE', [workspaceId])).rows[0] ?? notFound();

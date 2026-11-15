@@ -7,17 +7,20 @@
 // secret, so reading the database yields no live session or reset link. Locked auth (#132): `withLockedAuth` runs
 // better-auth on one transaction that holds the user row, so a password change and a sign-in or revocation cannot
 // interleave.
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, createHmac, hkdfSync, scrypt, timingSafeEqual } from 'node:crypto';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
+import { NodePgSession, NodePgTransaction } from 'drizzle-orm/node-postgres';
 import { PgTransaction } from 'drizzle-orm/pg-core';
+import type pg from 'pg';
 import { betterAuth, getCurrentAdapter, type BetterAuthOptions } from 'better-auth';
 import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, isAPIError, sensitiveSessionMiddleware } from 'better-auth/api';
 import { setSessionCookie } from 'better-auth/cookies';
 import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import { twoFactor } from 'better-auth/plugins/two-factor';
-import { transaction, user as userTable, type AnyDatabase, type ScopedTransaction } from './db.mjs';
+import { account as accountTable, transaction, user as userTable, type AnyDatabase, type ScopedTransaction } from './db.mjs';
 import { appOrigin } from './index.mjs';
-import { markLockedAuth } from './locked-auth.mjs';
+import { LockedAuthTransactionError, markLockedAuth, refuseLockedAuth } from './locked-auth.mjs';
 
 export { LockedAuthTransactionError } from './locked-auth.mjs';
 
@@ -219,6 +222,15 @@ export class LockedAuthUserNotFoundError extends Error {
   constructor() { super('User not found.'); this.name = 'LockedAuthUserNotFoundError'; }
 }
 
+/**
+ * A locked-auth instance or transaction was used after its callback returned (an un-awaited call, say), or a second
+ * locked-auth transaction was opened inside one. Either would run outside, or wait on, the lock: a programming error.
+ */
+export class LockedAuthClosedError extends Error {
+  readonly code = 'LOCKED_AUTH_CLOSED' as const;
+  constructor(message = 'This locked-auth transaction has ended; await every call inside its callback.') { super(message); this.name = 'LockedAuthClosedError'; }
+}
+
 export interface Ten98AuthOptions {
   /** The app's better-auth adapter factory, such as `drizzleAdapter(db, { provider: 'pg', schema })`. */
   database: BetterAuthOptions['database'];
@@ -229,6 +241,17 @@ export interface Ten98AuthOptions {
   transactionDatabase?(tx: ScopedTransaction<AnyDatabase>): BetterAuthOptions['database'];
   /** The first key of the email advisory lock; the team controller's `emailLockKey`, 109859 by default. */
   emailLockKey?: number;
+  /**
+   * `lock_timeout` for a locked-auth transaction (SET LOCAL, in milliseconds, 5000 by default), so a wait on a lock it
+   * cannot get fails with SQLSTATE 55P03 instead of hanging.
+   */
+  lockTimeoutMs?: number;
+  /**
+   * The bound on concurrent `signInWithPassword` verifications in this process: `concurrency` at once (2 by default,
+   * each running two scrypt derivations, which together fill libuv's default four threads), at most `queue` waiting
+   * (100), each for at most `waitMs` (15000). Past either bound the attempt is answered 503, never left waiting.
+   */
+  passwordVerification?: { concurrency?: number; queue?: number; waitMs?: number };
   /** The app's public URL (APP_URL); validated with `appOrigin`. */
   appUrl: string;
   secret: string;
@@ -277,11 +300,13 @@ export interface Ten98Auth {
   /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
   sessionTokenKey(token: string): string;
   /**
-   * Runs `run` in one transaction (`transaction` from ./db) whose first statement locks the user row FOR NO KEY UPDATE,
-   * with a better-auth instance bound to that transaction. A missing user throws LockedAuthUserNotFoundError (404). The
-   * callback runs its own statements on `tx` and may lock that user's session, credential and verification rows, in
-   * that order; tenancy helpers and workspace-level team operations refuse the transaction. When `run` throws, or the
-   * transaction fails, nothing it did persists and the error is rethrown; Set-Cookie headers from inside are lost with it.
+   * Runs `run` in one transaction (`transaction` from ./db) that sets its `lock_timeout` and then locks the user row
+   * FOR NO KEY UPDATE, with a better-auth instance bound to that transaction. A missing user throws
+   * LockedAuthUserNotFoundError (404). The callback runs its own statements on `tx` and may lock that user's session,
+   * credential and verification rows, in that order. Tenancy helpers, workspace-level team operations, `lockEmail`
+   * (except for the email `withLockedAuthByEmail` holds) and a nested locked-auth call refuse the transaction. When `run`
+   * throws, or the transaction fails, nothing it did persists and the error is rethrown; Set-Cookie headers from inside
+   * are lost with it. Once `run` settles, `tx` and the instance throw LockedAuthClosedError.
    */
   withLockedAuth<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>) => Promise<T>): Promise<T>;
   /**
@@ -290,10 +315,28 @@ export interface Ten98Auth {
    * that account's user row if there is one. `userId` is undefined when no account has the email.
    */
   withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
+  /**
+   * The supported password sign-in. A browser request from another site (an Origin other than `appUrl`'s, or a
+   * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: `limit` (the app's per-source and per-account limits, evaluated and counted
+   * before anything else; anything but `true` answers 429); a slot among the bounded verifications (503 when none is
+   * free in time); one short pool read of the credential, its connection released; both the modern and the legacy
+   * verifier, one of them against a fixed dummy, outside any transaction. A wrong password, an unknown email and an
+   * account without a password all get the same 401. Only a correct password enters `withLockedAuthByEmail`, where
+   * better-auth verifies again under the lock and creates the session (a legacy hash is replaced there once); if the
+   * password changed in between, the answer is the same 401 and no session is created. The response carries the
+   * session cookie, or the two-factor challenge, as `/sign-in/email` does.
+   */
+  signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: { email: string }) => boolean | Promise<boolean>): Promise<Response>;
 }
 
-/** The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions. */
-export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail'> {
+/** `signInWithPassword`'s input; `headers` are the request's, for the session's user agent and address. */
+export type PasswordSignIn = { email: string; password: string; rememberMe?: boolean; headers?: HeadersInit };
+
+/**
+ * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
+ * in with a password (use `signInWithPassword`), and throws LockedAuthClosedError once the callback has returned.
+ */
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword'> {
   /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
   readonly userId: string | undefined;
   /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
@@ -389,8 +432,6 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
 
   // With legacy hashes accepted, every password check runs one legacy derive and one current derive, whichever hash is
   // stored or none, so response time does not reveal which accounts are unmigrated.
-  let dummyModern: Promise<string> | undefined;
-  const modernDummy = () => (dummyModern ??= hashPassword('ten98-timing-equaliser'));
   const legacyPassword = legacyPasswords ? {
     hash: async (candidate: string) => (await Promise.all([hashPassword(candidate), verifyLegacyScryptHash(DUMMY_LEGACY_HASH, candidate)]))[0],
     verify: async ({ hash, password: candidate }: { hash: string; password: string }) => {
@@ -454,47 +495,177 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean): Te
     sessionTokenKey: (token: string) => tokenHandle(keys, raw(token)),
   };
   if (!locking) return Object.assign(auth, helpers) as unknown as LockedTen98Auth;
+  const { lockTimeoutMs = 5000 } = options;
+  if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000) throw new TypeError('lockTimeoutMs must be an integer from 1 to 600000.');
+  const slots = boundedSlots(options.passwordVerification);
+  void modernDummy();
 
-  // Binds an instance to `tx` for `run` and marks the transaction, so tenancy and team operations refuse it.
-  const bind = async <TDatabase extends AnyDatabase, T>(tx: ScopedTransaction<TDatabase>, userId: string | undefined, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>) => Promise<T>) => {
-    const bound = build({ ...options, database: transactionDatabase!(tx as ScopedTransaction<AnyDatabase>) }, keys, false) as LockedTen98Auth;
-    Object.assign(bound, { userId, async revokeAllSessions() { if (userId !== undefined) await (await storeOf(bound)).internalAdapter.deleteUserSessions(userId); } });
-    const unmark = markLockedAuth(tx);
-    try { return await run(bound, tx); } finally { unmark(); }
+  /**
+   * Binds an instance to the transaction for `run`. The callback gets its own transaction object over a guarded view of
+   * the connection, and both are marked (tenancy and team operations refuse them; `hold.email` is the email lock already
+   * held). When `run` settles, before COMMIT, the view and the instance close: a later or un-awaited call throws
+   * LockedAuthClosedError instead of running outside the lock on a connection back in the pool.
+   */
+  const bind = async <TDatabase extends AnyDatabase, T>(tx: ScopedTransaction<TDatabase>, hold: { userId: string | undefined; email: string | undefined },
+    run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>) => Promise<T>, passwordSignIn = false) => {
+    // drizzle-orm internals, as transaction() in ./db reads them; drizzle-orm is pinned exactly for this reason.
+    const { dialect, _: { session: inner } } = tx as unknown as { dialect: never; _: { session: { client: pg.PoolClient; schema: never; options: never } } };
+    const connection = inner.client;
+    let open = true;
+    const closed = () => new LockedAuthClosedError();
+    const guarded = new Proxy(connection, {
+      get(target, key) {
+        const value: unknown = Reflect.get(target, key, target);
+        if (typeof value !== 'function') return value;
+        if (key === 'query') return (...args: unknown[]) => open ? (value as (...input: unknown[]) => unknown).apply(target, args) : Promise.reject(closed());
+        return (value as (...input: unknown[]) => unknown).bind(target);
+      },
+    });
+    const callbackTx = new NodePgTransaction(dialect, new NodePgSession(guarded, dialect, inner.schema, inner.options), inner.schema) as unknown as ScopedTransaction<TDatabase>;
+    const bound = build({ ...options, database: transactionDatabase!(callbackTx as ScopedTransaction<AnyDatabase>) }, keys, false) as LockedTen98Auth;
+    // signInEmail holds this transaction's connection and lock while it hashes; only signInWithPassword, after its own
+    // check outside any transaction, may call it here.
+    const stalls = 'Password sign-in inside a locked-auth transaction holds a pool connection while it hashes; use signInWithPassword.';
+    const check = (signIn: boolean) => {
+      if (!open) throw closed();
+      if (signIn && !passwordSignIn) throw new TypeError(stalls);
+    };
+    const api = bound.api as unknown as Record<PropertyKey, unknown>;
+    const handler = bound.handler.bind(bound);
+    Object.assign(bound, {
+      userId: hold.userId,
+      api: new Proxy(api, { get(target, key) {
+        const value = target[key];
+        return typeof value === 'function' ? (...args: unknown[]) => { check(key === 'signInEmail'); return (value as (...input: unknown[]) => unknown).apply(target, args); } : value;
+      } }),
+      handler(request: Request) { check(/\/sign-in\/email\/*$/i.test(new URL(request.url).pathname)); return handler(request); },
+      async revokeAllSessions() { check(false); if (hold.userId !== undefined) await (await storeOf(bound)).internalAdapter.deleteUserSessions(hold.userId); },
+    });
+    const unmark = markLockedAuth({ email: hold.email }, callbackTx, connection);
+    try { return await lockedContext.run(true, () => run(bound, callbackTx)); } finally { open = false; unmark(); }
   };
-  // Refused before any statement: without the factory there is nothing to bind; a transaction as `db` would make the
-  // lock a savepoint's statement, not the transaction's first; inside a better-auth request or hook, better-auth's own
-  // adapter context would route the bound instance's queries away from `tx`, outside the lock.
+  // Refused before any statement: without the factory there is nothing to bind; a transaction as `db`, or a database on
+  // a locked-auth connection, would put the lock inside another transaction; a second locked-auth transaction opened in
+  // a callback would wait on the first's locks (one user per transaction); inside a better-auth request or hook,
+  // better-auth's own adapter context would route the bound instance's queries away from `tx`, outside the lock.
   const ready = async (db: unknown, run: unknown) => {
     if (!transactionDatabase) throw new TypeError('withLockedAuth needs the transactionDatabase option of createTen98Auth.');
     if (db instanceof PgTransaction) throw new TypeError('withLockedAuth opens its own transaction; pass the database, not a transaction.');
     if (typeof run !== 'function') throw new TypeError('withLockedAuth needs a callback.');
+    if (lockedContext.getStore()) throw new LockedAuthTransactionError('withLockedAuth');
+    refuseLockedAuth(db, 'withLockedAuth');
     const outside = {};
     if (await getCurrentAdapter(outside as never) !== outside) throw new TypeError('withLockedAuth cannot run inside a better-auth request or hook.');
   };
-  const locked: Pick<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail'> = {
+  // Parameterised raw statements by necessity: Drizzle has no builder for set_config or advisory locks. The timeout comes
+  // first, so the lock statements that follow cannot wait forever.
+  const limitLockWaits = (tx: AnyDatabase) => tx.execute(sql`SELECT set_config('lock_timeout', ${`${lockTimeoutMs}ms`}, true)`);
+  const byEmail = <TDatabase extends AnyDatabase, T>(db: TDatabase, address: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>, passwordSignIn: boolean) =>
+    transaction(db, async tx => {
+      await limitLockWaits(tx);
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(${emailLockKey}, hashtext(${address}))`);
+      // lower() on both sides, as user_email_normalized_idx is defined, whatever JavaScript's lowercasing did.
+      const [row] = await tx.select({ id: userTable.id }).from(userTable).where(sql`lower(${userTable.email}) = lower(${address})`).for('no key update');
+      return bind(tx, { userId: row?.id, email: address }, (auth, bound) => run(auth, bound, row?.id), passwordSignIn);
+    });
+  const locked: Pick<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword'> = {
     async withLockedAuth(db, userId, run) {
       await ready(db, run);
       if (typeof userId !== 'string' || !userId) throw new TypeError('withLockedAuth needs a user id.');
       return transaction(db, async tx => {
+        await limitLockWaits(tx);
         const [row] = await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, userId)).for('no key update');
         if (!row) throw new LockedAuthUserNotFoundError();
-        return bind(tx, row.id, run);
+        return bind(tx, { userId: row.id, email: undefined }, run);
       });
     },
     async withLockedAuthByEmail(db, email, run) {
       await ready(db, run);
       if (typeof email !== 'string') throw new TypeError('withLockedAuthByEmail needs an email.');
       // Normalised as the team controller's lockEmail does, so both take the same advisory lock.
+      return byEmail(db, email.trim().toLowerCase(), run, false);
+    },
+    async signInWithPassword(db, input, limit) {
+      if (typeof limit !== 'function') throw new TypeError('signInWithPassword needs the app\'s rate limit.');
+      await ready(db, limit);
+      const { email, password, rememberMe, headers } = (input ?? {}) as Partial<PasswordSignIn>;
+      if (typeof email !== 'string' || typeof password !== 'string' || (rememberMe !== undefined && typeof rememberMe !== 'boolean')) return refusal(400, 'INVALID_INPUT', 'Enter an email and a password.');
+      // better-auth checks the origin only for a request it routes itself, not for this server call, so the browser's
+      // Origin and Sec-Fetch-Site are checked here: a cross-site form cannot sign a victim in to another account.
+      if (crossSite(headers, origin)) return refusal(403, 'CROSS_SITE_SIGN_IN', 'Sign in from this site.');
       const address = email.trim().toLowerCase();
-      return transaction(db, async tx => {
-        // Parameterised raw statement by necessity: Drizzle has no builder for advisory locks.
-        await tx.execute(sql`SELECT pg_advisory_xact_lock(${emailLockKey}, hashtext(${address}))`);
-        // lower() on both sides, as user_email_normalized_idx is defined, whatever JavaScript's lowercasing did.
-        const [row] = await tx.select({ id: userTable.id }).from(userTable).where(sql`lower(${userTable.email}) = lower(${address})`).for('no key update');
-        return bind(tx, row?.id, (auth, bound) => run(auth, bound, row?.id));
-      });
+      // 1. The app's limits, counted before any read or hash: a flood of guesses costs a counter, not a derivation.
+      if (await limit({ email: address }) !== true) return refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+      // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
+      if (password.length > ten98AuthPolicy.password.maxLength) return refused();
+      // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads.
+      const release = await slots();
+      if (!release) return refusal(503, 'SIGN_IN_BUSY', 'Sign-in is busy. Try again shortly.', { 'retry-after': '1' });
+      let verified: boolean;
+      try {
+        // 3. One short pool read; its connection is back in the pool before any hashing starts.
+        const [stored] = await db.select({ password: accountTable.password }).from(userTable)
+          .leftJoin(accountTable, and(eq(accountTable.userId, userTable.id), eq(accountTable.providerId, 'credential')))
+          .where(sql`lower(${userTable.email}) = lower(${address})`).limit(1);
+        verified = await verifyStoredPassword(stored?.password, password, legacyPasswords);
+      } finally { release(); }
+      if (!verified) return refused();
+      // 4. Only a correct password takes the lock; better-auth verifies again there and creates the session.
+      const response = await byEmail(db, address, auth => auth.api.signInEmail({ body: { email: address, password, ...(rememberMe === undefined ? {} : { rememberMe }) }, ...(headers === undefined ? {} : { headers }), asResponse: true }), true);
+      return response.status === 401 ? refused() : response;
     },
   };
   return Object.assign(auth, helpers, locked) as unknown as Ten98Auth;
+}
+
+// Shared by every instance in the process: the fixed hashes a check runs against when an account has no hash of that
+// kind, so unknown, passwordless, legacy and current accounts all cost one legacy and one current derivation.
+let dummyModernHash: Promise<string> | undefined;
+const modernDummy = () => (dummyModernHash ??= hashPassword('ten98-timing-equaliser'));
+const lockedContext = new AsyncLocalStorage<true>();
+
+/** Both verifiers on every attempt, one of them against a dummy; true only for a stored hash the password matches. */
+async function verifyStoredPassword(hash: string | null | undefined, candidate: string, legacyAccepted: boolean): Promise<boolean> {
+  const present = typeof hash === 'string' && hash !== '', legacy = present && isLegacyHash(hash);
+  const [legacyOk, modernOk] = await Promise.all([
+    verifyLegacyScryptHash(legacy ? hash : DUMMY_LEGACY_HASH, candidate),
+    modernDummy().then(dummy => verifyPassword({ hash: present && !legacy ? hash : dummy, password: candidate })).catch(() => false),
+  ]);
+  return present && (legacy ? legacyAccepted && legacyOk : modernOk);
+}
+
+/** A browser request from another site: an Origin other than the app's, or Sec-Fetch-Site cross-site or same-site. */
+function crossSite(headers: HeadersInit | undefined, origin: string): boolean {
+  if (headers === undefined) return false;
+  const given = new Headers(headers), from = given.get('origin'), site = given.get('sec-fetch-site');
+  return (from !== null && from !== origin) || site === 'cross-site' || site === 'same-site';
+}
+
+const refusal = (status: number, code: string, message: string, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify({ code, message }), { status, headers: { 'content-type': 'application/json', ...headers } });
+/** One answer for an unknown email, a wrong password and an account without a password. */
+const refused = () => refusal(401, 'INVALID_EMAIL_OR_PASSWORD', 'Invalid email or password');
+
+/**
+ * At most `concurrency` holders at once and `queue` waiting, each for at most `waitMs`. Resolves a release function, or
+ * undefined when no slot came in time or the queue is full, so a caller is answered instead of left waiting.
+ */
+function boundedSlots({ concurrency = 2, queue = 100, waitMs = 15_000 }: NonNullable<Ten98AuthOptions['passwordVerification']> = {}) {
+  for (const [name, value] of Object.entries({ concurrency, queue, waitMs })) {
+    if (!Number.isInteger(value) || value < (name === 'concurrency' ? 1 : 0)) throw new TypeError(`passwordVerification.${name} must be a whole number${name === 'concurrency' ? ' of at least 1' : ''}.`);
+  }
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  const handOver = () => { const next = waiting.shift(); if (next) next(); else active--; };
+  const once = () => { let done = false; return () => { if (!done) { done = true; handOver(); } }; };
+  return (): Promise<(() => void) | undefined> => {
+    if (active < concurrency) { active++; return Promise.resolve(once()); }
+    if (waiting.length >= queue) return Promise.resolve(undefined);
+    return new Promise(resolve => {
+      const take = () => { clearTimeout(timer); resolve(once()); };
+      const timer = setTimeout(() => { waiting.splice(waiting.indexOf(take), 1); resolve(undefined); }, waitMs);
+      timer.unref();
+      waiting.push(take);
+    });
+  };
 }

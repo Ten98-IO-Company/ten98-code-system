@@ -81,6 +81,14 @@ export declare class LockedAuthUserNotFoundError extends Error {
     readonly code: 'USER_NOT_FOUND';
     constructor();
 }
+/**
+ * A locked-auth instance or transaction was used after its callback returned (an un-awaited call, say), or a second
+ * locked-auth transaction was opened inside one. Either would run outside, or wait on, the lock: a programming error.
+ */
+export declare class LockedAuthClosedError extends Error {
+    readonly code: 'LOCKED_AUTH_CLOSED';
+    constructor(message?: string);
+}
 export interface Ten98AuthOptions {
     /** The app's better-auth adapter factory, such as `drizzleAdapter(db, { provider: 'pg', schema })`. */
     database: BetterAuthOptions['database'];
@@ -91,6 +99,21 @@ export interface Ten98AuthOptions {
     transactionDatabase?(tx: ScopedTransaction<AnyDatabase>): BetterAuthOptions['database'];
     /** The first key of the email advisory lock; the team controller's `emailLockKey`, 109859 by default. */
     emailLockKey?: number;
+    /**
+     * `lock_timeout` for a locked-auth transaction (SET LOCAL, in milliseconds, 5000 by default), so a wait on a lock it
+     * cannot get fails with SQLSTATE 55P03 instead of hanging.
+     */
+    lockTimeoutMs?: number;
+    /**
+     * The bound on concurrent `signInWithPassword` verifications in this process: `concurrency` at once (2 by default,
+     * each running two scrypt derivations, which together fill libuv's default four threads), at most `queue` waiting
+     * (100), each for at most `waitMs` (15000). Past either bound the attempt is answered 503, never left waiting.
+     */
+    passwordVerification?: {
+        concurrency?: number;
+        queue?: number;
+        waitMs?: number;
+    };
     /** The app's public URL (APP_URL); validated with `appOrigin`. */
     appUrl: string;
     secret: string;
@@ -177,11 +200,13 @@ export interface Ten98Auth {
     /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
     sessionTokenKey(token: string): string;
     /**
-     * Runs `run` in one transaction (`transaction` from ./db) whose first statement locks the user row FOR NO KEY UPDATE,
-     * with a better-auth instance bound to that transaction. A missing user throws LockedAuthUserNotFoundError (404). The
-     * callback runs its own statements on `tx` and may lock that user's session, credential and verification rows, in
-     * that order; tenancy helpers and workspace-level team operations refuse the transaction. When `run` throws, or the
-     * transaction fails, nothing it did persists and the error is rethrown; Set-Cookie headers from inside are lost with it.
+     * Runs `run` in one transaction (`transaction` from ./db) that sets its `lock_timeout` and then locks the user row
+     * FOR NO KEY UPDATE, with a better-auth instance bound to that transaction. A missing user throws
+     * LockedAuthUserNotFoundError (404). The callback runs its own statements on `tx` and may lock that user's session,
+     * credential and verification rows, in that order. Tenancy helpers, workspace-level team operations, `lockEmail`
+     * (except for the email `withLockedAuthByEmail` holds) and a nested locked-auth call refuse the transaction. When `run`
+     * throws, or the transaction fails, nothing it did persists and the error is rethrown; Set-Cookie headers from inside
+     * are lost with it. Once `run` settles, `tx` and the instance throw LockedAuthClosedError.
      */
     withLockedAuth<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>) => Promise<T>): Promise<T>;
     /**
@@ -190,9 +215,33 @@ export interface Ten98Auth {
      * that account's user row if there is one. `userId` is undefined when no account has the email.
      */
     withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
+    /**
+     * The supported password sign-in. A browser request from another site (an Origin other than `appUrl`'s, or a
+     * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: `limit` (the app's per-source and per-account limits, evaluated and counted
+     * before anything else; anything but `true` answers 429); a slot among the bounded verifications (503 when none is
+     * free in time); one short pool read of the credential, its connection released; both the modern and the legacy
+     * verifier, one of them against a fixed dummy, outside any transaction. A wrong password, an unknown email and an
+     * account without a password all get the same 401. Only a correct password enters `withLockedAuthByEmail`, where
+     * better-auth verifies again under the lock and creates the session (a legacy hash is replaced there once); if the
+     * password changed in between, the answer is the same 401 and no session is created. The response carries the
+     * session cookie, or the two-factor challenge, as `/sign-in/email` does.
+     */
+    signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: {
+        email: string;
+    }) => boolean | Promise<boolean>): Promise<Response>;
 }
-/** The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions. */
-export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail'> {
+/** `signInWithPassword`'s input; `headers` are the request's, for the session's user agent and address. */
+export type PasswordSignIn = {
+    email: string;
+    password: string;
+    rememberMe?: boolean;
+    headers?: HeadersInit;
+};
+/**
+ * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
+ * in with a password (use `signInWithPassword`), and throws LockedAuthClosedError once the callback has returned.
+ */
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword'> {
     /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
     readonly userId: string | undefined;
     /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
