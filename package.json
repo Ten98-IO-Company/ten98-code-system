@@ -39,6 +39,10 @@
     "./tenancy/testing": {
       "types": "./tenancy-testing.d.mts",
       "import": "./tenancy-testing.mjs"
+    },
+    "./config": {
+      "types": "./config.d.mts",
+      "import": "./config.mjs"
     }
   },
   "files": [
@@ -139,7 +143,10 @@
     "src/tenancy.mts",
     "tenancy-testing.mjs",
     "tenancy-testing.d.mts",
-    "src/tenancy-testing.mts"
+    "src/tenancy-testing.mts",
+    "config.mjs",
+    "config.d.mts",
+    "src/config.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
@@ -161,12 +168,14 @@
     "better-auth": "1.7.7",
     "drizzle-orm": "0.45.2",
     "pg": "8.23.0",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "zod": "4.6.6"
   },
   "peerDependencies": {
     "better-auth": "1.7.7",
     "drizzle-orm": "0.45.2",
-    "pg": "8.23.0"
+    "pg": "8.23.0",
+    "zod": "4.6.6"
   },
   "peerDependenciesMeta": {
     "better-auth": {
@@ -176,6 +185,9 @@
       "optional": true
     },
     "pg": {
+      "optional": true
+    },
+    "zod": {
       "optional": true
     }
   }
