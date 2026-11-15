@@ -622,13 +622,17 @@
       }
     },
     "@ten98/runtime": {
-      "boundary": "The shared framework for ten98 Node applications: Node standard library and web platform primitives in the root entry, and optional entries (./auth, ./db, ./tenancy) whose libraries are exact optional peers. Entries provide mechanisms; apps keep their routes, authorization decisions, storage controllers and paid-work accounting.",
+      "boundary": "The shared framework for ten98 Node applications: Node standard library and web platform primitives in the root entry, and optional entries (./auth, ./db, ./tenancy, ./start) whose libraries are exact optional peers. Entries provide mechanisms; apps keep their routes, authorization decisions, storage controllers and paid-work accounting.",
       "dependencies": {},
       "devDependencies": {
+        "@tanstack/react-router": "1.170.42",
+        "@tanstack/react-start": "1.168.61",
         "@types/node": "24.10.1",
         "@types/pg": "8.15.6",
+        "@vitejs/plugin-react": "6.1.1",
         "better-auth": "1.7.7",
         "drizzle-orm": "0.45.2",
+        "nitro": "3.0.260903-beta",
         "nodemailer": "10.1.4",
         "pg": "8.23.0",
         "zod": "4.6.6"
@@ -636,13 +640,21 @@
       "sharedDependencies": [],
       "sharedDevDependencies": [
         "typescript",
-        "vite"
+        "vite",
+        "react",
+        "react-dom",
+        "@types/react",
+        "@types/react-dom"
       ],
       "peerDependencies": {
+        "@tanstack/react-router": "1.170.42",
+        "@tanstack/react-start": "1.168.61",
         "better-auth": "1.7.7",
         "drizzle-orm": "0.45.2",
         "nodemailer": "10.1.4",
         "pg": "8.23.0",
+        "react": "19.2.8",
+        "react-dom": "19.2.8",
         "zod": "4.6.6"
       },
       "checkScripts": [
@@ -731,7 +743,9 @@
           "config.mjs": "Generated environment and secret reader from src/config.mts, exported as ./config only; loadConfig needs the optional zod peer.",
           "config.d.mts": "Generated declarations from src/config.mts.",
           "email.mjs": "Generated transactional email sender from src/email.mts, exported as ./email only; needs the optional zod peer, and the optional nodemailer peer for SMTP, imported on first SMTP send.",
-          "email.d.mts": "Generated declarations from src/email.mts."
+          "email.d.mts": "Generated declarations from src/email.mts.",
+          "start.mjs": "Generated TanStack Start error and CSRF defaults from src/start.mts, exported as ./start only; needs the optional @tanstack/react-start, @tanstack/react-router, react and react-dom peers.",
+          "start.d.mts": "Generated declarations from src/start.mts."
         },
         "compilerProjects": [
           "tsconfig.json",

@@ -1,5 +1,5 @@
 import { inspectDatabasePolicy } from './database-policy.mjs';
-import { readFileSync, writeFileSync, realpathSync, existsSync, readdirSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, realpathSync, existsSync, readdirSync, lstatSync, statSync } from 'node:fs';
 import { resolve, relative, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -444,6 +444,295 @@ export function updatePresentationBaseline(directory, name, options = {}) {
     writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1)), null, 2)}\n`);
     return [];
 }
+const START = '@tanstack/react-start', START_ENTRY = '@ten98/runtime/start';
+const START_FILE = 'src/start.ts', CLIENT_FILE = 'src/client.tsx';
+// Start resolves its start and client entries as `./start` and `./client` from src (start-plugin-core 1.171.50
+// planning.js resolveStartEntryPlan, through resolve-entries.js resolveEntry): exsolve takes the first file among the
+// bare name, then .ts, .js, .mts, .mjs, .tsx and .jsx; a folder never resolves. So the checked file is the one Start runs
+// only when no other file carries the entry's name. .cts and .cjs are refused as well, and names are compared without
+// case, as a case-insensitive file system resolves them.
+const ENTRY_NAME = /^(start|client)(?:\.(?:[cm]?[jt]s|[jt]sx))?$/iu;
+// Local names bound by value imports of `name` from `source`; type-only imports bind nothing at run time.
+function importedAs(body, source, name) {
+    const locals = new Set();
+    for (const node of body) {
+        if (node.type !== 'ImportDeclaration' || node.source.value !== source || node.importKind === 'type')
+            continue;
+        for (const specifier of node.specifiers) {
+            if (specifier.type === 'ImportSpecifier' && specifier.importKind !== 'type' && (specifier.imported.name ?? specifier.imported.value) === name)
+                locals.add(specifier.local.name);
+        }
+    }
+    return locals;
+}
+const keyName = (node) => node?.type === 'Identifier' ? node.name : typeof node?.value === 'string' ? node.value : undefined;
+// An expression without its parentheses, TypeScript assertions and optional chain.
+const bare = (node) => node && ['ParenthesizedExpression', 'TSAsExpression', 'TSSatisfiesExpression', 'TSNonNullExpression', 'TSTypeAssertion', 'ChainExpression'].includes(node.type) ? bare(node.expression) : node;
+// The createStart references in one file: value imports and re-exports of that name, calls to a function of that name
+// or of one of `aliases`, and calls to a method of that name on a TanStack module: a name imported from one, or an
+// `import()` or `require()` of one. A method of that name on any other object is not Start's.
+function createStartUses(program, aliases = new Set()) {
+    const uses = { specifiers: 0, calls: 0 };
+    const tanstack = (source) => typeof source?.value === 'string' && source.value.startsWith('@tanstack/');
+    const modules = new Set(program.flatMap(node => node.type === 'ImportDeclaration' && tanstack(node.source) ? node.specifiers.map((specifier) => specifier.local.name) : []));
+    const isModule = (node) => {
+        const object = bare(node?.type === 'AwaitExpression' ? node.argument : node);
+        return object?.type === 'Identifier' ? modules.has(object.name)
+            : object?.type === 'ImportExpression' ? tanstack(object.source)
+                : object?.type === 'CallExpression' && object.callee.type === 'Identifier' && object.callee.name === 'require' && tanstack(object.arguments[0]);
+    };
+    const visit = (node) => {
+        if (Array.isArray(node))
+            return node.forEach(visit);
+        if (!node || typeof node.type !== 'string' || node.importKind === 'type' || node.exportKind === 'type')
+            return;
+        if (node.type === 'ImportSpecifier' || node.type === 'ExportSpecifier') {
+            const name = node.type === 'ImportSpecifier' ? node.imported : node.local;
+            if ((name?.name ?? name?.value) === 'createStart')
+                uses.specifiers++;
+        }
+        else if (node.type === 'CallExpression') {
+            const callee = bare(node.callee);
+            if (callee?.type === 'Identifier' ? callee.name === 'createStart' || aliases.has(callee.name) : callee?.type === 'MemberExpression' && keyName(callee.property) === 'createStart' && isModule(bare(callee.object)))
+                uses.calls++;
+        }
+        for (const value of Object.values(node))
+            if (value && typeof value === 'object')
+                visit(value);
+    };
+    visit(program);
+    return uses;
+}
+const ERROR_COMPONENT_KEYS = new Set(['errorComponent', 'defaultErrorComponent']);
+const ERROR_TEXT = new Set(['message', 'stack', 'cause', 'name', 'toString']);
+const isFunction = (node) => node?.type === 'ArrowFunctionExpression' || node?.type === 'FunctionExpression' || node?.type === 'FunctionDeclaration';
+// Where a function passed as errorComponent or defaultErrorComponent, in any object literal, reads its error's text:
+// .message, .stack, .cause, .name or .toString, destructured or not, a spread of it, or a String() or template literal of
+// it. The error is the `error` prop, taken in the parameter or from the props object in the body. The function is
+// written inline or named from a top-level declaration in the same file. Each finding is `<line>: <what>`.
+function errorComponentReads(program, text) {
+    const declared = new Map();
+    for (const statement of program) {
+        const node = statement.type === 'ExportNamedDeclaration' || statement.type === 'ExportDefaultDeclaration' ? statement.declaration : statement;
+        if (node?.type === 'FunctionDeclaration' && node.id)
+            declared.set(node.id.name, node);
+        if (node?.type === 'VariableDeclaration')
+            for (const declarator of node.declarations)
+                if (declarator.id.type === 'Identifier' && isFunction(bare(declarator.init)))
+                    declared.set(declarator.id.name, bare(declarator.init));
+    }
+    const findings = [];
+    const at = (node, what) => { findings.push(`line ${text.slice(0, node.start).split('\n').length}: ${what}`); };
+    const walk = (node, visit) => {
+        if (Array.isArray(node))
+            return node.forEach(child => walk(child, visit));
+        if (!node || typeof node !== 'object' || typeof node.type !== 'string')
+            return;
+        visit(node);
+        for (const value of Object.values(node))
+            if (value && typeof value === 'object')
+                walk(value, visit);
+    };
+    const inspect = (component) => {
+        const errors = new Set(), props = new Set();
+        // `{ error }`, `{ error: e }` or `{ error: { message } }` from the props; the rest of the props under another name.
+        const fromProps = (pattern) => {
+            for (const property of pattern.properties) {
+                if (property.type === 'RestElement') {
+                    if (property.argument.type === 'Identifier')
+                        props.add(property.argument.name);
+                    continue;
+                }
+                if (keyName(property.key) !== 'error')
+                    continue;
+                const value = property.value.type === 'AssignmentPattern' ? property.value.left : property.value;
+                if (value.type === 'Identifier')
+                    errors.add(value.name);
+                else if (value.type === 'ObjectPattern')
+                    destructured(value);
+            }
+        };
+        const destructured = (pattern) => {
+            for (const property of pattern.properties) {
+                if (property.type === 'RestElement')
+                    at(property, 'copies the rest of the error');
+                else if (ERROR_TEXT.has(keyName(property.key) ?? ''))
+                    at(property, `reads error.${keyName(property.key)}`);
+            }
+        };
+        const parameter = component.params[0]?.type === 'AssignmentPattern' ? component.params[0].left : component.params[0];
+        if (parameter?.type === 'ObjectPattern')
+            fromProps(parameter);
+        else if (parameter?.type === 'Identifier')
+            props.add(parameter.name);
+        const isError = (node) => {
+            const expression = bare(node);
+            return expression?.type === 'Identifier' ? errors.has(expression.name)
+                : expression?.type === 'MemberExpression' && !expression.computed && bare(expression.object)?.type === 'Identifier' && props.has(bare(expression.object).name) && keyName(expression.property) === 'error';
+        };
+        // `const { error } = props` names the error before it is used.
+        walk(component.body, node => {
+            if (node.type === 'VariableDeclarator' && node.id.type === 'ObjectPattern' && bare(node.init)?.type === 'Identifier' && props.has(bare(node.init).name))
+                fromProps(node.id);
+        });
+        walk(component.body, node => {
+            const member = node.type === 'MemberExpression' ? (node.computed ? node.property.type === 'Literal' : node.property.type === 'Identifier') && keyName(node.property) : undefined;
+            if (member && ERROR_TEXT.has(member) && isError(node.object))
+                at(node, `reads error.${member}`);
+            else if (node.type === 'VariableDeclarator' && node.id.type === 'ObjectPattern' && isError(node.init))
+                destructured(node.id);
+            else if ((node.type === 'SpreadElement' || node.type === 'JSXSpreadAttribute') && isError(node.argument))
+                at(node, 'spreads the error');
+            else if (node.type === 'TemplateLiteral' && node.expressions.some(isError))
+                at(node, 'puts the error in a template literal');
+            else if (node.type === 'CallExpression' && bare(node.callee)?.type === 'Identifier' && bare(node.callee).name === 'String' && isError(node.arguments[0]))
+                at(node, 'converts the error with String()');
+        });
+    };
+    walk(program, node => {
+        if (node.type !== 'Property' || !ERROR_COMPONENT_KEYS.has(keyName(node.key) ?? '') || node.computed)
+            return;
+        const value = bare(node.value);
+        const component = isFunction(value) ? value : value?.type === 'Identifier' ? declared.get(value.name) : undefined;
+        if (component)
+            inspect(component);
+    });
+    return [...new Set(findings)];
+}
+// The app's source files outside artifact folders, as forward-slash paths from the app.
+function appSources(directory, roots, skip) {
+    const files = [];
+    const walk = (folder) => {
+        if (!existsSync(folder))
+            return;
+        for (const entry of readdirSync(folder, { withFileTypes: true })) {
+            const file = resolve(folder, entry.name), name = relative(directory, file).replaceAll('\\', '/');
+            if (skip.has(name) || entry.name === 'node_modules')
+                continue;
+            if (entry.isDirectory())
+                walk(file);
+            else if (entry.isFile() && /\.(?:[cm]?[jt]s|[jt]sx)$/u.test(entry.name) && !/\.d\.[cm]?ts$/u.test(entry.name))
+                files.push(name);
+        }
+    };
+    for (const root of roots)
+        walk(resolve(directory, root));
+    return files;
+}
+/**
+ * A TanStack Start app takes its error and CSRF defaults from @ten98/runtime/start: src/start.ts exports
+ * `startInstance = createStart(() => ten98StartOptions(...))`, src/client.tsx calls `hydrateTen98Start(...)` at its
+ * top level, no other source file uses createStart, and no errorComponent reads its error's text. It applies when the
+ * manifest's dependencies list Start, or the profile requires it and no open transition waives it. Parser-backed; the
+ * adoption guide lists what it does not see.
+ */
+export function checkStartEntry(directory, manifest, { parseAst = resolveParseAst(directory) } = {}) {
+    const resolved = resolveProfile(String(manifest.name));
+    const waived = resolved !== undefined && transitionsFor(resolved.name, 'appStack').some(entry => entry.items?.includes(START));
+    if (manifest.dependencies?.[START] === undefined && (resolved?.profile.dependencies[START] === undefined || waived))
+        return [];
+    if (typeof parseAst !== 'function')
+        return ['Cannot resolve rolldown/parseAst from the consumer; install the pinned build tooling to check the Start entry.'];
+    directory = resolve(directory);
+    const errors = [];
+    const parse = (name) => {
+        try {
+            return parseAst(readFileSync(resolve(directory, name), 'utf8'), { lang: /\.[jt]sx$/u.test(name) ? name.slice(-3) : /\.[cm]?js$/u.test(name) ? 'js' : 'ts' }).body;
+        }
+        catch (error) {
+            errors.push(`${name}: cannot parse for the Start entry check: ${messageOf(error)}`);
+            return undefined;
+        }
+    };
+    const start = existsSync(resolve(directory, START_FILE)) ? parse(START_FILE) : undefined;
+    if (!existsSync(resolve(directory, START_FILE)))
+        errors.push(`${START_FILE} is missing: a Start app exports startInstance = createStart(() => ten98StartOptions(...)) there, with ten98StartOptions from ${START_ENTRY}.`);
+    else if (start) {
+        const createStart = importedAs(start, START, 'createStart'), options = importedAs(start, START_ENTRY, 'ten98StartOptions');
+        // Each callee must be bound by exactly one import, and the callback takes no parameters, so neither name can be
+        // shadowed: the file holds no other declarations.
+        const imported = start.flatMap(node => node.type === 'ImportDeclaration' ? node.specifiers.map((specifier) => specifier.local.name) : []);
+        const importedOnce = (locals, name) => locals.has(name) && imported.filter(local => local === name).length === 1;
+        // What the callback returns: its expression body, or the argument of the one return statement its block holds. An
+        // unnamed, non-generator function expression is accepted like an arrow; a named one would bind its own name.
+        const returned = (callback) => {
+            if (!(callback?.type === 'ArrowFunctionExpression' || callback?.type === 'FunctionExpression' && !callback.id && !callback.generator) || callback.params.length)
+                return undefined;
+            if (callback.body.type !== 'BlockStatement')
+                return bare(callback.body);
+            const [only, ...rest] = callback.body.body;
+            return only?.type === 'ReturnStatement' && !rest.length ? bare(only.argument) : undefined;
+        };
+        const isInstance = (declaration) => declaration?.type === 'VariableDeclaration' && declaration.kind === 'const'
+            && declaration.declarations.every((declarator) => {
+                const init = declarator.init, body = returned(init?.arguments?.[0]);
+                return declarator.id.type === 'Identifier' && declarator.id.name === 'startInstance' && init?.type === 'CallExpression' && init.callee.type === 'Identifier' && importedOnce(createStart, init.callee.name)
+                    && init.arguments.length === 1 && body?.type === 'CallExpression' && body.callee.type === 'Identifier' && importedOnce(options, body.callee.name);
+            });
+        const declared = start.find(node => isInstance(node.type === 'ExportNamedDeclaration' ? node.declaration : node));
+        // `export { startInstance }` may stand in for the inline export.
+        const exportLists = start.filter(node => node.type === 'ExportNamedDeclaration' && !node.declaration && !node.source && node.exportKind !== 'type' && node.specifiers.length === 1
+            && keyName(node.specifiers[0].local) === 'startInstance' && keyName(node.specifiers[0].exported) === 'startInstance');
+        const exported = declared && (declared.type === 'ExportNamedDeclaration' ? !exportLists.length : exportLists.length === 1);
+        let instanceNames = 0;
+        const countInstanceNames = (node) => {
+            if (Array.isArray(node))
+                return node.forEach(countInstanceNames);
+            if (!node || typeof node !== 'object')
+                return;
+            if (node.type === 'Identifier' && node.name === 'startInstance')
+                instanceNames++;
+            for (const value of Object.values(node))
+                if (value && typeof value === 'object')
+                    countInstanceNames(value);
+        };
+        countInstanceNames(start.filter(node => !exportLists.includes(node)));
+        if (!exported)
+            errors.push(`${START_FILE} must export const startInstance = createStart(() => ten98StartOptions(...)), returning ten98StartOptions from ${START_ENTRY} directly, so the shared error serialisation and CSRF middleware cannot be dropped.`);
+        else if (start.some(node => node !== declared && !exportLists.includes(node) && node.type !== 'ImportDeclaration') || instanceNames !== 1) {
+            errors.push(`${START_FILE} must hold only its imports and the startInstance export, and name startInstance nowhere else, so nothing else can change the start instance.`);
+        }
+        else if (createStartUses(start, createStart).calls !== 1)
+            errors.push(`${START_FILE} must call createStart only once, for startInstance.`);
+    }
+    const client = existsSync(resolve(directory, CLIENT_FILE)) ? parse(CLIENT_FILE) : undefined;
+    if (!existsSync(resolve(directory, CLIENT_FILE)))
+        errors.push(`${CLIENT_FILE} is missing: a Start app calls hydrateTen98Start() from ${START_ENTRY} there.`);
+    else if (client) {
+        const hydrate = importedAs(client, START_ENTRY, 'hydrateTen98Start');
+        // `hydrateTen98Start(...)` or `void hydrateTen98Start(...)` as a statement of its own.
+        const called = (statement) => {
+            const expression = statement.type === 'ExpressionStatement' ? bare(statement.expression) : undefined;
+            return expression?.type === 'UnaryExpression' && expression.operator === 'void' ? bare(expression.argument) : expression;
+        };
+        if (!client.some(node => { const call = called(node); return call?.type === 'CallExpression' && call.callee.type === 'Identifier' && hydrate.has(call.callee.name); })) {
+            errors.push(`${CLIENT_FILE} must call hydrateTen98Start(...) from ${START_ENTRY} at its top level.`);
+        }
+    }
+    const src = resolve(directory, 'src');
+    for (const entry of existsSync(src) ? readdirSync(src) : []) {
+        const name = `src/${entry}`, kind = ENTRY_NAME.exec(entry)?.[1]?.toLowerCase();
+        if (!kind || name === START_FILE || name === CLIENT_FILE || !statSync(resolve(src, entry), { throwIfNoEntry: false })?.isFile())
+            continue;
+        const checked = kind === 'start' ? START_FILE : CLIENT_FILE;
+        errors.push(`${name}: Start can take its ${kind} entry from this file instead of ${checked}; keep ${checked} as the only src/${kind} file.`);
+    }
+    const policy = resolved?.profile.sourceLanguage;
+    for (const name of appSources(directory, policy?.roots ?? ['src'], new Set([START_FILE, ...policy?.artifactDirectories ?? []]))) {
+        // Every form either rule counts contains its name, so files without one need no parse.
+        const text = readFileSync(resolve(directory, name), 'utf8');
+        const program = /createStart|rrorComponent/u.test(text) ? parse(name) : undefined;
+        if (!program)
+            continue;
+        const uses = createStartUses(program);
+        if (uses.specifiers + uses.calls)
+            errors.push(`${name}: createStart belongs in ${START_FILE} only, as createStart(() => ten98StartOptions(...)).`);
+        for (const finding of errorComponentReads(program, text)) {
+            errors.push(`${name} ${finding}: an errorComponent also renders on the server with the original error, so it shows publicErrorMessage(error) and reads nothing else of the error.`);
+        }
+    }
+    return errors;
+}
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 // Container files at the app root and one folder below it (deploy/, docker/), skipping installed and built output.
 function containerFiles(directory, pattern) {
@@ -794,6 +1083,8 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
                 errors.push(...checkSourceLanguage(directory, String(manifest.name)));
             if (!errors.length)
                 errors.push(...(update ? updatePresentationBaseline : checkPresentation)(directory, String(manifest.name)));
+            if (!errors.length)
+                errors.push(...checkStartEntry(directory, manifest));
             for (const error of errors)
                 console.error(`${directory}: ${error}`);
             failures += errors.length;
