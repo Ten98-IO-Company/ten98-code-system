@@ -634,7 +634,8 @@
       },
       "sharedDependencies": [],
       "sharedDevDependencies": [
-        "typescript"
+        "typescript",
+        "vite"
       ],
       "peerDependencies": {
         "better-auth": "1.7.7",
