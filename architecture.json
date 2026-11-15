@@ -284,6 +284,7 @@
       "stack": "app",
       "boundary": "TanStack Start and Nitro, PostgreSQL, Drizzle and Better Auth; application owns sessions, workspace authorization and provider ledger.",
       "dependencies": {
+        "@csstools/css-tokenizer": "4.0.2",
         "@modelcontextprotocol/server": "2.3.1",
         "detect-browser": "5.3.0",
         "mmdb-lib": "3.0.3",
