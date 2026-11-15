@@ -76,7 +76,9 @@ const tenancy = createTenancy({ setting: 'app.workspace_ids', column: 'workspace
 const adapterOver = (client: unknown) => drizzleAdapter(client as Database, { provider: 'pg', schema });
 const authOver = (target: Database, options: Partial<Ten98AuthOptions> = {}) =>
   createTen98Auth({ database: adapterOver(target), transactionDatabase: adapterOver, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test', ...options });
-const allow = () => true;
+// The two-step limiter with the source step allowing everything and the given account step.
+const accountStep = (account: (attempt: PasswordAttempt) => unknown) => ({ source: () => true, account: account as (attempt: PasswordAttempt) => boolean });
+const allow = accountStep(() => true);
 
 test.before(async () => {
   if (!admin) return;
@@ -463,12 +465,12 @@ test('signInWithPassword: limit first, one uniform failure, and a session only f
   // The limit runs before the credential read (and so before any hash); refused, nothing is read.
   const order: string[] = [];
   const watched = new Proxy(db, { get(target, key, receiver) { if (key === 'select') order.push('read'); return Reflect.get(target, key, receiver); } });
-  const limited = await auth.signInWithPassword(watched, { source: SOURCE, email, password: PASSWORD }, attempt => { order.push(`limit:${attempt.email}`); return false; });
-  assert.deepEqual([limited.status, order], [429, [`limit:${email}`]]);
-  assert.equal((await auth.signInWithPassword(watched, { source: SOURCE, email: ` ${email.toUpperCase()} `, password: 'wrong password guess' }, attempt => { order.push(`limit:${attempt.email}`); return true; })).status, 401);
-  assert.deepEqual(order.slice(1), [`limit:${email}`, 'read']);
+  const limited = await auth.signInWithPassword(watched, { source: SOURCE, email, password: PASSWORD }, { source: attempt => { order.push(`source:${attempt.email}`); return false; }, account: () => { order.push('account'); return true; } });
+  assert.deepEqual([limited.status, order], [429, [`source:${email}`]]);
+  assert.equal((await auth.signInWithPassword(watched, { source: SOURCE, email: ` ${email.toUpperCase()} `, password: 'wrong password guess' }, { source: attempt => { order.push(`source:${attempt.email}`); return true; }, account: attempt => { order.push(`account:${attempt.email}`); return true; } })).status, 401);
+  assert.deepEqual(order.slice(1), [`source:${email}`, `account:${email}`, 'read']);
   // Anything but true refuses: a limiter that forgets to return is not an allowance.
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, (() => undefined) as unknown as () => boolean)).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, accountStep((() => undefined) as unknown as () => boolean))).status, 429);
   // Unknown email, wrong password and an account without a password answer identically.
   const unknown = await answer(await auth.signInWithPassword(db, { source: SOURCE, email: address('nobody'), password: PASSWORD }, allow));
   assert.equal(unknown.status, 401);
@@ -484,10 +486,10 @@ test('signInWithPassword: limit first, one uniform failure, and a session only f
   let counted = 0;
   const counting = () => { counted++; return true; };
   for (const headers of [{ origin: 'https://evil.example' }, { 'sec-fetch-site': 'cross-site' }, { 'sec-fetch-site': 'CROSS-SITE' }, { origin: ORIGIN, 'sec-fetch-site': 'Same-Site' }] as Record<string, string>[]) {
-    assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers }, counting)).status, 403, JSON.stringify(headers));
+    assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers }, accountStep(counting))).status, 403, JSON.stringify(headers));
   }
   assert.equal(counted, 0);
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { origin: ORIGIN, 'sec-fetch-site': 'same-origin' } }, counting)).status, 200);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { origin: ORIGIN, 'sec-fetch-site': 'same-origin' } }, accountStep(counting))).status, 200);
   // A password over the policy's maximum is wrong for every account: the same 401, without a derivation.
   const started = performance.now();
   assert.deepEqual(await answer(await auth.signInWithPassword(db, { source: SOURCE, email, password: 'x'.repeat(129) }, allow)), unknown);
@@ -560,7 +562,7 @@ test('60 parallel wrong passwords at one account on a pool of 10: 50 × 401, 10 
     // Campaign's limiter shape: one conditional upsert per attempt, 50 per account.
     const limit = async ({ email: account }: { email: string }) => (await flood.query(
       'INSERT INTO login_limits VALUES ($1, 1) ON CONFLICT (key) DO UPDATE SET count = login_limits.count + 1 WHERE login_limits.count < 50', [`email:${account}`])).rowCount === 1;
-    const attempts = Array.from({ length: 60 }, () => floodAuth.signInWithPassword(floodDb, { source: SOURCE, email, password: 'wrong password guess' }, limit)
+    const attempts = Array.from({ length: 60 }, () => floodAuth.signInWithPassword(floodDb, { source: SOURCE, email, password: 'wrong password guess' }, accountStep(limit))
       .then(response => String(response.status), (error: Error) => `error: ${error.message}`));
     await delay(300);
     const started = performance.now();
@@ -615,7 +617,7 @@ const deviceRows = async (userId: string) => (await pool!.query<{ identifier: st
 const attempts = async (userId: string) => (await deviceRows(userId)).filter(identifier => identifier.startsWith('known-device-attempt:')).length;
 const knownAs = async (browser: ReturnType<typeof jar>, email: string, password = PASSWORD) => {
   let known: boolean | undefined;
-  const response = await auth.signInWithPassword(db, { source: SOURCE, email, password, headers: { cookie: browser.header() } }, attempt => { known = attempt.knownDevice; return true; });
+  const response = await auth.signInWithPassword(db, { source: SOURCE, email, password, headers: { cookie: browser.header() } }, accountStep(attempt => { known = attempt.knownDevice; return true; }));
   return { known, status: response.status, response };
 };
 
@@ -636,24 +638,24 @@ test('a known device signs in while the account-wide bucket is full; an unknown 
   assert.match(cookie, /HttpOnly/i);
   assert.match(cookie, /SameSite=Lax/i);
   assert.match(cookie, /Max-Age=7776000/);
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header() } }, accountFull)).status, 200);
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, accountFull)).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header() } }, accountStep(accountFull))).status, 200);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, accountStep(accountFull))).status, 429);
   // A forged tag, another account's entry, and a case variant of the right email (the same account) normalised alike.
   const forged = jar(); forged.with(`${'A'.repeat(32)}.${'B'.repeat(43)}`);
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: forged.header() } }, accountFull)).status, 429);
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: other, password: PASSWORD, headers: { cookie: browser.header() } }, accountFull)).status, 429);
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: ` ${email.toUpperCase()} `, password: PASSWORD, headers: { cookie: browser.header() } }, accountFull)).status, 429, 'the entry rotated on the last success');
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: forged.header() } }, accountStep(accountFull))).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: other, password: PASSWORD, headers: { cookie: browser.header() } }, accountStep(accountFull))).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: ` ${email.toUpperCase()} `, password: PASSWORD, headers: { cookie: browser.header() } }, accountStep(accountFull))).status, 429, 'the entry rotated on the last success');
   // A correct tag for the other account on a live device id of this account: the tag verifies, but the row belongs to
   // this account, so the other account is not spared.
   const current = jar().take(await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
   const live = current.device()!.split('.')[0]!;
   // A live device id of this very account with a forged tag: only the tag check refuses it.
   const tampered = jar(); tampered.with(`${live}.${tagFor(otherId, live)}`);
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: tampered.header() } }, accountFull)).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: tampered.header() } }, accountStep(accountFull))).status, 429);
   const relabelled = jar(); relabelled.with(`${live}.${tagFor(otherId, live)}`);
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: other, password: PASSWORD, headers: { cookie: relabelled.header() } }, accountFull)).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: other, password: PASSWORD, headers: { cookie: relabelled.header() } }, accountStep(accountFull))).status, 429);
   // The live entry, under a case variant of the email: the same account, so it is known.
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: ` ${email.toUpperCase()} `, password: PASSWORD, headers: { cookie: current.header() } }, accountFull)).status, 200);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: ` ${email.toUpperCase()} `, password: PASSWORD, headers: { cookie: current.header() } }, accountStep(accountFull))).status, 200);
 });
 
 test('a known device never authenticates: the password is always checked, and it shortens no other account\'s lockout', { skip }, async () => {
@@ -661,12 +663,12 @@ test('a known device never authenticates: the password is always checked, and it
   const id = await account_(email);
   await account_(other);
   const browser = jar().take(await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
-  const wrong = await auth.signInWithPassword(db, { source: SOURCE, email, password: 'wrong password guess', headers: { cookie: browser.header() } }, accountFull);
+  const wrong = await auth.signInWithPassword(db, { source: SOURCE, email, password: 'wrong password guess', headers: { cookie: browser.header() } }, accountStep(accountFull));
   assert.equal(wrong.status, 401);
   assert.equal(issued(wrong), false);
   assert.equal(await sessions(id), 1);
   // The other account's lockout stands for this browser, with the right password for that account too.
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: other, password: PASSWORD, headers: { cookie: browser.header() } }, accountFull)).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email: other, password: PASSWORD, headers: { cookie: browser.header() } }, accountStep(accountFull))).status, 429);
 });
 
 test('a known device is forgotten on a password change, a reset, revoke-all, revoke-other, sign-out everywhere and an expired row', { skip }, async () => {
@@ -756,7 +758,7 @@ test('concurrent failures from one known device claim exactly its five attempts;
   const id = await account_(email);
   const browser = jar().take(await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
   // Refused by the limiter or the verification bound, the attempt never checked a password: its claim is returned.
-  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header() } }, () => false)).status, 429);
+  assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header() } }, accountStep(() => false))).status, 429);
   const full = authOver(db, { passwordVerification: { concurrency: 1, queue: 0, knownDevices: { concurrency: 1, queue: 0 } } });
   const holder = address('concurrent');
   await account_(holder);
@@ -778,7 +780,7 @@ test('no cookie on a failure, a refusal or a pending second factor; malformed an
   await account_(email);
   for (const response of [
     await auth.signInWithPassword(db, { source: SOURCE, email, password: 'wrong password guess' }, allow),
-    await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, () => false),
+    await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, accountStep(() => false)),
     await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { origin: 'https://evil.example' } }, allow),
   ]) assert.equal(issued(response), false);
   const factor = address('factor');
@@ -931,11 +933,11 @@ test('a flood of distinct emails from one source is cut by its per-source limit 
   const email = address('real');
   await account_(email);
   const counts = new Map<string, number>();
-  const perSource = ({ source }: PasswordAttempt) => { const seen = (counts.get(source) ?? 0) + 1; counts.set(source, seen); return seen <= 10; };
-  const flood = Array.from({ length: 60 }, (_, at) => auth.signInWithPassword(db, { source: 'ip:flood', email: address(`flood${at}`), password: 'wrong password guess' }, perSource).then(response => response.status));
+  const perSource = ({ source }: { source: string }) => { const seen = (counts.get(source) ?? 0) + 1; counts.set(source, seen); return seen <= 10; };
+  const flood = Array.from({ length: 60 }, (_, at) => auth.signInWithPassword(db, { source: 'ip:flood', email: address(`flood${at}`), password: 'wrong password guess' }, { source: perSource, account: () => true }).then(response => response.status));
   await delay(50);
   const started = performance.now();
-  const real = await auth.signInWithPassword(db, { source: 'ip:real', email, password: PASSWORD }, perSource);
+  const real = await auth.signInWithPassword(db, { source: 'ip:real', email, password: PASSWORD }, { source: perSource, account: () => true });
   const waited = performance.now() - started;
   assert.equal(real.status, 200);
   assert.ok(waited < 5000, `the real user waited ${waited.toFixed(0)} ms`);
@@ -1119,7 +1121,7 @@ test('the limiter runs before the verification queue: a refused attempt gets 429
   const busy = full.signInWithPassword(db, { source: SOURCE, email: address('busy'), password: 'wrong password guess' }, allow);
   await delay(80);
   let asked = 0;
-  const response = await full.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, () => { asked++; return false; });
+  const response = await full.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, accountStep(() => { asked++; return false; }));
   assert.deepEqual([response.status, asked], [429, 1]);
   // Negative control: an allowed attempt in the same moment finds the queue full.
   assert.equal((await full.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).status, 503);
@@ -1160,8 +1162,8 @@ async function holdShared(target: Ten98Auth) {
   await delay(40);
   return held;
 }
-const attempt = (target: Ten98Auth, email: string, password: string, cookie = '', limit: (attempt: PasswordAttempt) => boolean = allow) =>
-  target.signInWithPassword(db, { source: `ip:${randomUUID()}`, email, password, headers: cookie ? { cookie } : {} }, limit);
+const attempt = (target: Ten98Auth, email: string, password: string, cookie = '', limit: (attempt: PasswordAttempt) => boolean = () => true) =>
+  target.signInWithPassword(db, { source: `ip:${randomUUID()}`, email, password, headers: cookie ? { cookie } : {} }, accountStep(limit));
 
 test('a distributed flood fills the shared queue; a known device still signs in through its lane', { skip }, async () => {
   const flooded = authOver(db, narrow);
@@ -1245,4 +1247,153 @@ test('the limiter runs before the lane too: a refused known device gets 429 whil
   assert.deepEqual([refused.status, asked], [429, 1]);
   assert.equal(await attempts(id), 0);
   await laneHolder;
+});
+
+test('a flood the source step refuses never touches the pool: no cookie, a forged cookie or a valid one', { skip }, async () => {
+  const email = address('refused-flood'), bystander = address('refused-flood');
+  await account_(email);
+  await account_(bystander);
+  const flood = new pg.Pool({ connectionString: url, max: 10 });
+  try {
+    const floodDb = drizzle(flood, { schema });
+    const floodAuth = authOver(floodDb);
+    await floodAuth.assertSchema(floodDb);
+    const valid = jar().take(await floodAuth.signInWithPassword(floodDb, { source: SOURCE, email, password: PASSWORD }, allow)).header();
+    const forged = jar(); forged.with(`${'A'.repeat(32)}.${'B'.repeat(43)}`);
+    let accountAsked = 0;
+    const refuseEverySource = { source: () => false, account: () => { accountAsked++; return true; } };
+    for (const [name, cookie] of [['no cookie', ''], ['forged', forged.header()], ['valid', valid]] as const) {
+      let waiters = 0;
+      const sampler = setInterval(() => { waiters = Math.max(waiters, flood.waitingCount); }, 2);
+      const until = performance.now() + 1500;
+      const statuses = new Set<number>();
+      // 200 requests in flight; each yields to the event loop between attempts, as requests arriving over a socket do.
+      const workers = Array.from({ length: 200 }, async () => {
+        while (performance.now() < until) {
+          statuses.add((await floodAuth.signInWithPassword(floodDb, { source: `ip:${randomUUID()}`, email, password: PASSWORD, headers: cookie ? { cookie } : {} }, refuseEverySource)).status);
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      });
+      await delay(200);
+      const started = performance.now();
+      const other = await floodAuth.signInWithPassword(floodDb, { source: `ip:${randomUUID()}`, email: bystander, password: PASSWORD }, allow);
+      const waited = performance.now() - started;
+      await Promise.all(workers);
+      clearInterval(sampler);
+      assert.deepEqual([name, [...statuses], waiters, other.status], [name, [429], 0, 200]);
+      assert.ok(waited < 2500, `${name}: another user's sign-in took ${waited.toFixed(0)} ms`);
+    }
+    assert.equal(accountAsked, 0);
+  } finally { await flood.end(); }
+});
+
+test('the limiter needs both steps; a source refusal asks nothing else and leaves the device claim alone', { skip }, async () => {
+  const email = address('steps');
+  const id = await account_(email);
+  for (const limits of [undefined, () => true, { source: () => true }, { account: () => true }]) {
+    await assert.rejects(auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, limits as never), /rate limits: \{ source, account \}/);
+  }
+  const browser = jar().take(await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
+  const seen: unknown[] = [];
+  const refused = await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header() } },
+    { source: attempt => { seen.push(attempt); return false; }, account: attempt => { seen.push(attempt); return true; } });
+  assert.deepEqual([refused.status, seen, await attempts(id)], [429, [{ email, source: SOURCE }], 0]);
+  // The account step refusing gives the claim back; the device then counts as known again.
+  const known: boolean[] = [];
+  for (let round = 0; round < 2; round++) {
+    await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header() } }, accountStep(attempt => { known.push(attempt.knownDevice); return false; }));
+  }
+  assert.deepEqual([known, await attempts(id)], [[true, true], 0]);
+});
+
+// A reset request through the handler, as a browser sends it.
+const resetRequest = (target: Ten98Auth, path: string, body: unknown) => target.handler(new Request(`${ORIGIN}/api/auth${path}`, {
+  method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify(body),
+}));
+const resetRows = async (userId: string) => (await pool!.query<{ n: number }>("SELECT count(*)::int AS n FROM verification WHERE value=$1 AND identifier LIKE 'reset-password:%'", [userId])).rows[0]!.n;
+const storedHash = async (userId: string) => (await pool!.query<{ password: string }>('SELECT password FROM account WHERE "userId"=$1', [userId])).rows[0]!.password;
+
+test('a closed account gets no reset: the request answers as for an unknown email, and an earlier token is refused', { skip }, async () => {
+  const sent: string[] = [];
+  const resetting = authOver(db, { sendResetPassword: ({ token }) => { sent.push(token); } });
+  const email = address('reset-closed');
+  const id = await account_(email);
+  // A token issued while the account was open, then the account closed.
+  assert.equal((await resetRequest(resetting, '/request-password-reset', { email, redirectTo: '/' })).status, 200);
+  assert.deepEqual([sent.length, await resetRows(id)], [1, 1]);
+  await pool!.query('UPDATE "user" SET closed_at = now() WHERE id = $1', [id]);
+  const before = await storedHash(id);
+  const unknownToken = await answer(await resetRequest(resetting, '/reset-password', { token: 'x'.repeat(24), newPassword: NEW_PASSWORD }));
+  assert.equal(unknownToken.status, 400);
+  assert.deepEqual(await answer(await resetRequest(resetting, '/reset-password', { token: sent[0], newPassword: NEW_PASSWORD })), unknownToken);
+  assert.equal(await storedHash(id), before);
+  // A new request: the same answer as an unknown email, no token stored, nothing sent; a foreign redirect is refused alike.
+  const unknown = await answer(await resetRequest(resetting, '/request-password-reset', { email: address('nobody'), redirectTo: '/' }));
+  assert.deepEqual(await answer(await resetRequest(resetting, '/request-password-reset', { email: email.toUpperCase(), redirectTo: '/' })), unknown);
+  const foreign = await answer(await resetRequest(resetting, '/request-password-reset', { email: address('nobody'), redirectTo: 'https://evil.example/' }));
+  assert.notEqual(foreign.status, 200);
+  assert.deepEqual(await answer(await resetRequest(resetting, '/request-password-reset', { email, redirectTo: 'https://evil.example/' })), foreign);
+  // A stored email the route's schema rejects gets the route's own 400, as an unknown one does.
+  const odd = `ü${randomUUID()}@example.com`;
+  await pool!.query('UPDATE "user" SET closed_at = now() WHERE id = $1', [await account_(odd)]);
+  const oddUnknown = await answer(await resetRequest(resetting, '/request-password-reset', { email: `ü${randomUUID()}@example.com`, redirectTo: '/' }));
+  assert.equal(oddUnknown.status, 400);
+  assert.deepEqual(await answer(await resetRequest(resetting, '/request-password-reset', { email: odd, redirectTo: '/' })), oddUnknown);
+  assert.deepEqual([sent.length, await resetRows(id)], [1, 1]);
+  // Negative control: an app that allows the account resets it.
+  const lenient = authOver(db, { sendResetPassword: ({ token }) => { sent.push(token); }, isAccountUsable: () => true });
+  assert.equal((await resetRequest(lenient, '/request-password-reset', { email, redirectTo: '/' })).status, 200);
+  assert.equal(sent.length, 2);
+  assert.equal((await resetRequest(lenient, '/reset-password', { token: sent[1], newPassword: NEW_PASSWORD })).status, 200);
+  assert.notEqual(await storedHash(id), before);
+});
+
+test('the guide closure checklist leaves no session, no known device and no reset', { skip }, async () => {
+  const sent: string[] = [];
+  const closing = authOver(db, { sendResetPassword: ({ token }) => { sent.push(token); } });
+  const email = address('closure');
+  const id = await account_(email);
+  const browser = jar().take(await closing.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
+  assert.equal((await resetRequest(closing, '/request-password-reset', { email, redirectTo: '/' })).status, 200);
+  const known = async () => {
+    let seen: boolean | undefined;
+    await closing.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header() } }, accountStep(attempt => { seen = attempt.knownDevice; return false; }));
+    return seen;
+  };
+  assert.equal(await known(), true);
+  // The guide's checklist, as written: closed_at set, then the user's sessions and every verification row it owns deleted,
+  // in the app's closure transaction.
+  await transaction(db, async tx => {
+    await tx.execute(sql`UPDATE "user" SET closed_at = now() WHERE id = ${id}`);
+    await tx.execute(sql`DELETE FROM session WHERE "userId" = ${id}`);
+    await tx.execute(sql`DELETE FROM verification WHERE value = ${id}`);
+  });
+  assert.equal(await closing.api.getSession({ headers: { cookie: browser.header() } }), null);
+  assert.equal(await known(), false);
+  assert.equal((await resetRequest(closing, '/reset-password', { token: sent[0], newPassword: NEW_PASSWORD })).status, 400);
+  assert.equal((await resetRequest(closing, '/request-password-reset', { email, redirectTo: '/' })).status, 200);
+  assert.deepEqual([sent.length, await resetRows(id), await sessions(id)], [1, 0, 0]);
+});
+
+test('a right password on a closed account is refused before the lock: it never waits on the email lock', { skip }, async () => {
+  const closed = address('prelock'), open = address('prelock');
+  const id = await account_(closed);
+  await account_(open);
+  await pool!.query('UPDATE "user" SET closed_at = now() WHERE id = $1', [id]);
+  const holder = await pool!.connect();
+  try {
+    for (const email of [closed, open]) await holder.query('SELECT pg_advisory_lock(109859, hashtext($1))', [email]);
+    // Negative control: a usable account's sign-in reaches the lock and waits there.
+    let openSettled = false;
+    const openSignIn = signIn(open).then(response => { openSettled = true; return response; });
+    const started = performance.now();
+    const refused = await signIn(closed);
+    const waited = performance.now() - started;
+    assert.equal(refused.status, 401);
+    assert.ok(waited < 3000, `the closed account waited ${waited.toFixed(0)} ms`);
+    assert.equal(openSettled, false);
+    await holder.query('SELECT pg_advisory_unlock_all()');
+    assert.equal((await openSignIn).status, 200);
+    assert.equal(await sessions(id), 0);
+  } finally { await holder.query('SELECT pg_advisory_unlock_all()'); holder.release(); }
 });

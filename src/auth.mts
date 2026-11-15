@@ -312,8 +312,10 @@ export interface Ten98AuthOptions {
   /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
   cookiePrefix?: string;
   /**
-   * Whether an account may sign in with its password, asked under the account's lock in `signInWithPassword`; anything
-   * but `true` gets the uniform 401. Defaults to refusing a closed account (`closedAt` set).
+   * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
+   * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
+   * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
+   * Defaults to refusing a closed account (`closedAt` set).
    */
   isAccountUsable?(account: { id: string; email: string; closedAt: Date | null }): boolean | Promise<boolean>;
   /**
@@ -370,18 +372,19 @@ export interface Ten98Auth {
   withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
   /**
    * The supported password sign-in. A browser request from another site (an Origin other than `appUrl`'s, or a
-   * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: whether the browser's known-device
-   * cookie holds a live device of the account behind `email` (`knownDevice`; see the guide); `limit` (the app's
-   * per-source and per-account limits, evaluated and counted before any hash; anything but `true` answers 429; with
-   * `knownDevice` the app may skip only its account-wide bucket); a slot among the bounded verifications (503 when none is
-   * free in time); one short pool read of the credential, its connection released; both the modern and the legacy
+   * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: `limits.source` (the app's per-source
+   * and per-pair limits, before anything touches the database); whether the browser's known-device cookie holds a live
+   * device of the account behind `email` (`knownDevice`; see the guide); `limits.account` (the app's account-wide limit,
+   * which may skip its bucket for a known device); anything but `true` at either step answers 429; a slot among the
+   * bounded verifications (503 when none is free in time); one short pool read of the credential, its connection
+   * released; both the modern and the legacy
    * verifier, one of them against a fixed dummy, outside any transaction. A wrong password, an unknown email and an
    * account without a password all get the same 401. Only a correct password enters `withLockedAuthByEmail`, where
    * better-auth verifies again under the lock and creates the session (a legacy hash is replaced there once); if the
    * password changed in between, the answer is the same 401 and no session is created. The response carries the
    * session cookie, or the two-factor challenge, as `/sign-in/email` does.
    */
-  signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: PasswordAttempt) => boolean | Promise<boolean>): Promise<Response>;
+  signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limits: PasswordSignInLimits): Promise<Response>;
   /**
    * Resolves when the user table has the unique index on `lower(email)` that the locked lookups rely on, and rejects
    * otherwise. Call it at start-up; every locked call also checks it once per database and refuses to run without it.
@@ -407,12 +410,21 @@ export interface Ten98Auth {
 /** `signInWithPassword`'s input; `headers` are the request's: its origin, its cookies, its user agent and address. */
 export type PasswordSignIn = { email: string; password: string; source: string; rememberMe?: boolean; headers?: HeadersInit };
 /**
- * What `signInWithPassword` gives the app's limiter, before any hash and before the verification queue: the normalised
- * email; `source`, the client address the app derived for the request (`clientLimitKey` of its trusted address), so it
- * counts per source as well as per account; and `knownDevice`, whether this browser is a known device of that account.
- * A known device may skip only the account-wide bucket: never the per-source or per-pair limits, and never the password.
+ * What `signInWithPassword` gives the app's limiter: the normalised email; `source`, the client address the app derived
+ * for the request (`clientLimitKey` of its trusted address); and, at the account step, `knownDevice`, whether this
+ * browser is a known device of that account.
  */
 export type PasswordAttempt = { email: string; source: string; knownDevice: boolean };
+/**
+ * The app's limiter for `signInWithPassword`, asked in two steps; each counts the attempt and answers anything but `true`
+ * with 429. `source` comes first, before anything touches the database: the per-source and per-pair (source and email)
+ * limits, so a flood the app refuses costs a counter and nothing else. Only an attempt it allows has its known-device
+ * cookie checked; `account` then gets `knownDevice` and may skip the account-wide bucket for it, and only that bucket.
+ */
+export type PasswordSignInLimits = {
+  source(attempt: Omit<PasswordAttempt, 'knownDevice'>): boolean | Promise<boolean>;
+  account(attempt: PasswordAttempt): boolean | Promise<boolean>;
+};
 
 /**
  * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
@@ -595,6 +607,10 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     },
   } : undefined;
 
+  /** The isAccountUsable hook, refusing a closed account by default. */
+  const usable = (account: { id: string; email: string; closedAt: Date | null }) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
+  const usableUser = (user: { id: string; email: string; closedAt?: Date | null }) => usable({ id: user.id, email: user.email, closedAt: user.closedAt ?? null });
+
   const auth = betterAuth({
     database: protectTokens(database as AdapterFactory, keys) as unknown as BetterAuthOptions['database'], baseURL: origin, secret, appName, trustedOrigins: [origin],
     // better-auth skips these checks when NODE_ENV=test or TEST is set unless they are pinned.
@@ -605,6 +621,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     // so every unexpected error becomes a bare 500 before it can expose SQL, hashes or tokens.
     logger: { disabled: true },
     onAPIError: { onError(error) { if (isAPIError(error)) throw error; throw APIError.fromStatus('INTERNAL_SERVER_ERROR'); } },
+    user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false } } },
     session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false } },
     plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
     emailAndPassword: {
@@ -629,7 +646,30 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       ...(legacyPassword ? { password: legacyPassword } : {}),
     },
     rateLimit: { enabled: false },
-    hooks: { after: createAuthMiddleware(async context => {
+    hooks: { before: createAuthMiddleware(async context => {
+      // An account isAccountUsable refuses (by default a closed one) gets no reset. The request is handed to better-auth's
+      // route with an address no account has (a reset token no row has), so it takes the route's own unknown-email (invalid
+      // token) path, after the same validation and origin checks: the same answer, no token, nothing sent.
+      const { internalAdapter } = context.context;
+      const body = (context.body ?? {}) as { email?: unknown; token?: unknown };
+      // A body the route's own schema rejects is left to the route, so its 400 stays the same for every account.
+      if (context.path === '/request-password-reset' && sendResetPassword && typeof body.email === 'string' && resetBody.safeParse(body).success) {
+        // Every request makes this lookup, so a refused account costs what an unknown email does.
+        const found = await internalAdapter.findUserByEmail(body.email, { includeAccounts: true });
+        if (found && await usableUser(found.user as { id: string; email: string; closedAt?: Date | null }) !== true) {
+          return { context: { body: { ...body, email: `${randomBytes(12).toString('hex')}@unusable-account.invalid` } } };
+        }
+      }
+      if (context.path === '/reset-password') {
+        const token = body.token || (context.query as { token?: unknown } | undefined)?.token;
+        if (typeof token !== 'string' || !token) return;
+        const row = await internalAdapter.findVerificationValue(`reset-password:${token}`);
+        const user = row ? await internalAdapter.findUserById(row.value) : null;
+        if (user && await usableUser(user as { id: string; email: string; closedAt?: Date | null }) !== true) {
+          return { context: { body: { ...body, token: randomBytes(18).toString('base64url') } } };
+        }
+      }
+    }), after: createAuthMiddleware(async context => {
       const path = context.path ?? '';
       if ((path !== '/sign-in/email' && !twoFactorPaths.has(path)) || isAPIError(context.context.returned)) return;
       // The account this sign-in (or completed challenge) created a session (or a two-factor challenge) for, read before
@@ -649,6 +689,8 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       } catch { /* retried on the next successful sign-in */ }
     }) },
   });
+  // The request-reset route's body schema, as better-auth validates it after the before hooks; read before any wrapping.
+  const resetBody = (auth.api as unknown as { requestPasswordReset: { options: { body: { safeParse(input: unknown): { success: boolean } } } } }).requestPasswordReset.options.body;
   const helpers = {
     storedVerificationIdentifier: (identifier: string) => storedIdentifier(keys, raw(identifier)),
     sessionTokenKey: (token: string) => tokenHandle(keys, raw(token)),
@@ -816,9 +858,10 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // Normalised as the team controller's lockEmail does, so both take the same advisory lock.
       return byEmail(db, email.trim().toLowerCase(), run);
     },
-    async signInWithPassword(db, input, limit) {
-      if (typeof limit !== 'function') throw new TypeError('signInWithPassword needs the app\'s rate limit.');
-      await ready(db, limit);
+    async signInWithPassword(db, input, limits) {
+      const { source: sourceLimit, account: accountLimit } = (limits ?? {}) as Partial<PasswordSignInLimits>;
+      if (typeof sourceLimit !== 'function' || typeof accountLimit !== 'function') throw new TypeError('signInWithPassword needs the app\'s rate limits: { source, account }.');
+      await ready(db, accountLimit);
       const { email, password, source, rememberMe, headers } = (input ?? {}) as Partial<PasswordSignIn>;
       if (typeof source !== 'string' || !source) throw new TypeError('signInWithPassword needs the request\'s source (the client address the app derived).');
       if (typeof email !== 'string' || typeof password !== 'string' || (rememberMe !== undefined && typeof rememberMe !== 'boolean')) return refusal(400, 'INVALID_INPUT', 'Enter an email and a password.');
@@ -826,18 +869,21 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // Origin and Sec-Fetch-Site are checked here: a cross-site form cannot sign a victim in to another account.
       if (crossSite(headers, origin)) return refusal(403, 'CROSS_SITE_SIGN_IN', 'Sign in from this site.');
       const address = email.trim().toLowerCase();
-      // 0. Whether this browser is a known device of the account behind this email: it then claims one of the device's
+      const tooMany = () => refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+      // 1. The app's per-source limits, counted before anything touches the database: a flood the app refuses costs a
+      // counter, never a pool connection, and one source cannot fill the verification queue.
+      if (await sourceLimit({ email: address, source }) !== true) return tooMany();
+      // 2. Whether this browser is a known device of the account behind this email: it then claims one of the device's
       // attempts (released again below unless the password was checked). It never authenticates; it only tells the app.
       const claim = await claimDevice(db, address, headers);
       const unclaim = async () => { if (claim) await (await storeOf(auth)).adapter.delete({ model: 'verification', where: [{ field: 'id', value: claim }] }); };
-      // 1. The app's limits, per source and per account, counted before any read, hash or queue: a flood of guesses costs
-      // a counter, and one source cannot fill the verification queue.
+      // 3. The app's account-wide limit, which may spare a known device its bucket, still before any hash or queue.
       let allowed: unknown;
-      try { allowed = await limit({ email: address, source, knownDevice: claim !== undefined }); } catch (error) { await unclaim(); throw error; }
-      if (allowed !== true) { await unclaim(); return refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.'); }
+      try { allowed = await accountLimit({ email: address, source, knownDevice: claim !== undefined }); } catch (error) { await unclaim(); throw error; }
+      if (allowed !== true) { await unclaim(); return tooMany(); }
       // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
       if (password.length > ten98AuthPolicy.password.maxLength) return refused();
-      // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
+      // 4. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
       // known-device claim was verified above (a database read, before anything that differs between a real and an
       // unknown account) takes the reserved lane and only the lane, so a flood cannot crowd it out and many valid
       // cookies cannot take shared capacity. Every other attempt (an unknown email, an account without a cookie, a
@@ -846,7 +892,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       if (!release) { await unclaim(); return refusal(503, 'SIGN_IN_BUSY', 'Sign-in is busy. Try again shortly.', { 'retry-after': '1' }); }
       let verified: boolean, stored: { id: string; email: string; closedAt: Date | null; password: string | null } | undefined;
       try {
-        // 3. One short pool read; its connection is back in the pool before any hashing starts.
+        // 5. One short pool read; its connection is back in the pool before any hashing starts.
         [stored] = await db.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt, password: accountTable.password }).from(userTable)
           .leftJoin(accountTable, and(eq(accountTable.userId, userTable.id), eq(accountTable.providerId, 'credential')))
           .where(sql`lower(${userTable.email}) = lower(${address})`).limit(1);
@@ -856,7 +902,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // An account that may not sign in is refused here, at a wrong password's cost, rather than after the lock; the lock
       // asks again, for an account closed in between.
       if (await usable({ id: stored!.id, email: stored!.email, closedAt: stored!.closedAt }) !== true) return refused();
-      // 4. Only a correct password takes the lock; better-auth verifies again there and creates the session, for the
+      // 6. Only a correct password takes the lock; better-auth verifies again there and creates the session, for the
       // locked account only.
       let response: Response;
       try {
@@ -914,8 +960,6 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       return response.status === 401 ? challengeRefused() : response;
     },
   };
-  /** The isAccountUsable hook, refusing a closed account by default. */
-  const usable = (account: { id: string; email: string; closedAt: Date | null }) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
   /**
    * Replaces a legacy hash once, under the lock, in a savepoint: a failure (a trigger, a constraint) rolls back the
    * savepoint only, so the sign-in stands and the next one retries.
