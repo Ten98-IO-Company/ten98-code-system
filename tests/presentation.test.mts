@@ -10,11 +10,19 @@ const fixtures = new URL('./fixtures/presentation/', import.meta.url);
 const profile = 'ten98-campaign';
 const baselineName = 'presentation-baseline.json';
 
-// rolldown is not a dependency of this package; borrow it from a checkout that has it installed.
-const parseAst = ['..', '../../ten98-campaign', '../../../../../ten98-campaign', '../../ten98-design-system', '../../../../../ten98-design-system'].map(folder => {
-  try { return createRequire(new URL(`${folder}/package.json`, import.meta.url))('rolldown/parseAst').parseAst; } catch { /* not installed here */ }
+// rolldown arrives through this package's pinned vite devDependency, resolved the way the checker resolves it in a
+// consumer: from the package itself, then from vite's own scope (pnpm's strict layout).
+const runtime = createRequire(new URL('../package.json', import.meta.url));
+const parserPath = [() => runtime.resolve('rolldown/parseAst'), () => createRequire(runtime.resolve('vite/package.json')).resolve('rolldown/parseAst')].map(find => {
+  try { return find(); } catch { return undefined; }
 }).find(Boolean);
-const needsParser = { skip: parseAst ? false : 'rolldown/parseAst is not installed in any known checkout' };
+const parseAst = parserPath ? runtime(parserPath).parseAst : undefined;
+// CI never skips: a missing parser fails these tests there instead of passing them silently.
+const needsParser = { skip: parseAst || process.env.CI ? false : 'rolldown/parseAst is not installed; run pnpm install' };
+
+test('the parser resolves through the pinned vite whenever CI is set', { skip: process.env.CI ? false : 'only enforced when CI is set' }, () => {
+  assert.equal(typeof parseAst, 'function', 'rolldown/parseAst must resolve through the vite devDependency in CI');
+});
 
 function consumer(files: string[], baseline: Record<string, Record<string, number>> | undefined, run: (root: string) => void) {
   const root = mkdtempSync(join(tmpdir(), 'ten98-presentation-'));
