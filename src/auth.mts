@@ -73,7 +73,7 @@ export function verifyLegacyScryptHash(hash: string, password: string): Promise<
 // Keys for tokens at rest: HKDF-SHA256 over the secret, one label per use, so neither equals the secret or any other key
 // an app derives from it. Rotating the secret ends every session, reset link and trusted device, and makes enrolled
 // second factors (encrypted with the secret itself) unreadable: it is a re-enrolment event.
-const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1', knownDevice: 'ten98-auth:known-device:v1' } as const;
+const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1', knownDevice: 'ten98-auth:known-device:v1', challengeLimit: 'ten98-auth:two-factor-limit:v1' } as const;
 type TokenKeys = Record<keyof typeof keyLabels, Buffer>;
 const checkedSecret = (secret: unknown): string => {
   if (typeof secret !== 'string' || secret.length < 32) throw new TypeError('The auth secret must be at least 32 characters.');
@@ -83,6 +83,7 @@ const deriveKeys = (secret: string): TokenKeys => ({
   verification: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.verification, 32)),
   session: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.session, 32)),
   knownDevice: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.knownDevice, 32)),
+  challengeLimit: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.challengeLimit, 32)),
 });
 const mac = (key: Buffer, value: string) => createHmac('sha256', key).update(value).digest('base64url');
 const raw = (value: unknown): string => {
@@ -150,6 +151,23 @@ function deviceFor(keys: TokenKeys, userId: string, entries: readonly DeviceEntr
     if (timingSafeEqual(Buffer.from(entry.tag), Buffer.from(deviceTag(keys, userId, entry.deviceId))) && !found) found = entry;
   }
   return found;
+}
+/** Every name=value pair of a Cookie header, in order; a pair without a name is skipped. */
+function cookiePairs(headers: HeadersInit | undefined): [string, string][] {
+  const header = headers === undefined ? null : new Headers(headers).get('cookie');
+  return (header?.split(';') ?? []).flatMap(pair => {
+    const at = pair.indexOf('=');
+    return at > 0 ? [[pair.slice(0, at).trim(), pair.slice(at + 1).trim()] as [string, string]] : [];
+  });
+}
+/**
+ * The value of the one pair named exactly `name`, or undefined when there is none or more than one. Only the exact name
+ * the library reads counts: other prefixes, and the other scheme's or separator's forms of this one, are never read by
+ * better-auth, so they are ignored rather than refused.
+ */
+function singleCookie(headers: HeadersInit | undefined, name: string): string | undefined {
+  const values = cookiePairs(headers).filter(([key]) => key === name).map(([, value]) => value);
+  return values.length === 1 ? values[0] : undefined;
 }
 /** One cookie from a Cookie header; undefined when absent. */
 function cookieFrom(headers: HeadersInit | undefined, name: string): string | undefined {
@@ -359,6 +377,12 @@ export interface Ten98AuthOptions {
   /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
   cookiePrefix?: string;
   /**
+   * Paths and domains the app's auth cookies were once set with, besides the current `Path=/` with no Domain. A request
+   * carrying an auth cookie twice is refused and every copy is expired, in each of these scopes too, so a cookie left from
+   * an old path or domain cannot strand a user.
+   */
+  legacyCookieScopes?: readonly { path?: string; domain?: string }[];
+  /**
    * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
    * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
    * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
@@ -405,6 +429,24 @@ export interface Ten98Auth {
   options: { readonly telemetry: { readonly enabled: false } };
   /** The stored `verification.identifier` for a raw identifier; see the standalone `storedVerificationIdentifier`. */
   storedVerificationIdentifier(identifier: string): string;
+  /**
+   * The exact name of one of the auth cookies (`two_factor`, `session_token`, `known_device`, …) for this instance:
+   * `__Host-<prefix>.<name>` on https, `<prefix>.<name>` on plain-http development.
+   */
+  cookieName(name: string): string;
+  /**
+   * The sign-in challenge a request's `two_factor` cookie names, or null when the cookie is absent, sent more than once,
+   * malformed, unsigned, forged, under another prefix, or names no live challenge of an existing account. `limitKey` is
+   * a stable HMAC of the challenge under its own derived key, never empty: key the app's per-challenge limiter with it.
+   */
+  readTwoFactorChallenge(request: Request): Promise<{ identifier: string; userId: string; limitKey: string } | null>;
+  /**
+   * The Set-Cookie values that expire an auth cookie a request carries more than once (session, challenge or known
+   * device), or none: at `/`, on every prefix of the auth routes and of `path` (the request's own, when given), and in
+   * each `legacyCookieScopes` entry. An app guard that calls `api.getSession` itself appends them
+   * to its response; `handler`, `signInWithPassword` and `verifyTwoFactor` add them on their own.
+   */
+  expiredAuthCookies(headers: HeadersInit, path?: string): string[];
   /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
   sessionTokenKey(token: string): string;
   /**
@@ -538,6 +580,54 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   if (!Number.isInteger(emailLockKey) || emailLockKey < -INT32 || emailLockKey >= INT32) throw new TypeError('emailLockKey must be a 32-bit integer.');
   const prefix = cookiePrefix ?? `ten98-${createHash('sha256').update(origin).digest('hex').slice(0, 16)}`;
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(prefix)) throw new TypeError('cookiePrefix must be 1 to 64 letters, digits, hyphens or underscores.');
+  const scopes = [{ path: '/', domain: undefined as string | undefined }, ...(options.legacyCookieScopes ?? []).map(scope => {
+    const { path = '/', domain } = scope ?? {};
+    if (typeof path !== 'string' || !/^\/[\x21-\x3a\x3c-\x7e]*$/.test(path)) throw new TypeError('legacyCookieScopes: a path starts with / and has no spaces, semicolons or control characters.');
+    if (domain !== undefined && (typeof domain !== 'string' || !/^\.?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/.test(domain))) throw new TypeError('legacyCookieScopes: a domain is a host name.');
+    return { path, domain };
+  })];
+  const secureCookies = origin.startsWith('https:');
+  /** better-auth's routes live under this path (its default); a cookie copy can sit on any prefix of it. */
+  const basePath = '/api/auth';
+  /** The exact name of one of the auth cookies on this instance: __Host-<prefix>.<name> on https, <prefix>.<name> on http. */
+  const cookieName = (name: string) => `${secureCookies ? '__Host-' : ''}${prefix}.${name}`;
+  /** The auth cookies the single-copy rule covers: what the library reads for the session, a challenge and a known device. */
+  const guardedCookies = () => [cookieName('session_token'), cookieName('two_factor'), cookieName(device.cookie)];
+  const duplicated = (headers: HeadersInit | undefined, name: string) => cookiePairs(headers).filter(([key]) => key === name).length > 1;
+  /**
+   * The scopes a copy of an auth cookie can live in, so a refused duplicate is expired in each: `/`, every prefix of the
+   * auth routes' base path and of the request's own path, and each legacy scope (a parent Domain among them). A __Host-
+   * name exists only at Path=/ with no Domain, so it is expired there alone.
+   */
+  const expiryScopes = (name: string, path: string | undefined) => {
+    if (name.startsWith('__Host-')) return [{ path: '/', domain: undefined as string | undefined }];
+    const prefixes = (value: string) => value.split('/').filter(Boolean).map((_, at, parts) => `/${parts.slice(0, at + 1).join('/')}`);
+    const paths = new Set(['/', ...prefixes(basePath), ...(path ? prefixes(path) : [])]);
+    const all = [...[...paths].map(value => ({ path: value, domain: undefined as string | undefined })), ...scopes.slice(1)];
+    return all.filter((scope, at) => all.findIndex(other => other.path === scope.path && other.domain === scope.domain) === at);
+  };
+  const expiry = (name: string, path: string | undefined) => expiryScopes(name, path).map(({ path: scope, domain }) =>
+    `${name}=; Max-Age=0; Path=${scope}${domain ? `; Domain=${domain}` : ''}; HttpOnly; SameSite=Lax${secureCookies ? '; Secure' : ''}`);
+  const expiredAuthCookies = (headers: HeadersInit | undefined, path?: string) => guardedCookies().filter(name => duplicated(headers, name)).flatMap(name => expiry(name, path));
+  /** `response` with the expiring Set-Cookie values first, so a cookie the response itself sets after them stands. */
+  const withExpired = (response: Response, headers: HeadersInit | undefined, path?: string) => {
+    const expired = expiredAuthCookies(headers, path);
+    if (!expired.length) return response;
+    const merged = new Headers();
+    for (const value of expired) merged.append('set-cookie', value);
+    for (const [key, value] of response.headers) if (key.toLowerCase() !== 'set-cookie') merged.append(key, value);
+    for (const value of response.headers.getSetCookie()) merged.append('set-cookie', value);
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: merged });
+  };
+  /** Headers without the session cookie when it is sent more than once: the request is then answered as signed out. */
+  const withoutDuplicateSession = (headers: HeadersInit | undefined): HeadersInit | undefined => {
+    const name = cookieName('session_token');
+    if (!duplicated(headers, name)) return headers;
+    const kept = new Headers(headers);
+    const pairs = cookiePairs(headers).filter(([key]) => key !== name).map(([key, value]) => `${key}=${value}`);
+    if (pairs.length) kept.set('cookie', pairs.join('; ')); else kept.delete('cookie');
+    return kept;
+  };
   const { twoFactor: factor, password, session, reset } = ten98AuthPolicy;
   const factors = twoFactor({
     issuer: appName,
@@ -659,7 +749,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   };
   const issueDevice = async (context: DeviceHook, userId: string) => {
     const cookie = context.context.createAuthCookie(device.cookie, { maxAge: device.lifetimeSeconds });
-    const entries = deviceEntries(context.getCookie(cookie.name));
+    const entries = deviceEntries(singleCookie((context as unknown as { headers?: Headers }).headers, cookie.name));
     const previous = deviceFor(keys, userId, entries);
     const adapter = await getCurrentAdapter(context.context.adapter as never) as unknown as StoreAdapterSurface;
     if (previous) {
@@ -745,7 +835,12 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   const auth = betterAuth({
     database: protectTokens(database as AdapterFactory, keys) as unknown as BetterAuthOptions['database'], baseURL: origin, secret, appName, trustedOrigins: [origin],
     // better-auth skips these checks when NODE_ENV=test or TEST is set unless they are pinned.
-    advanced: { disableOriginCheck: false, disableCSRFCheck: false, cookiePrefix: prefix },
+    // On https every auth cookie is named __Host-<prefix>.<name> (Secure, Path=/, no Domain), better-auth's and the
+    // preset's alike, so no sibling subdomain or other path can set one the preset reads. better-auth would prefix
+    // __Secure- itself; that is turned off and each name given in full, with Secure on every cookie.
+    advanced: { disableOriginCheck: false, disableCSRFCheck: false, cookiePrefix: prefix,
+      ...(secureCookies ? { useSecureCookies: false, defaultCookieAttributes: { secure: true },
+        cookies: Object.fromEntries(authCookieNames.map(name => [name, { name: cookieName(name), attributes: { secure: true, path: '/' } }])) } : {}) },
     // Self-hosted installs send no data to Ten98 or third parties.
     telemetry: { enabled: false },
     // Adapter failures can contain query parameters, and better-call logs non-API exceptions even with the logger off,
@@ -837,7 +932,45 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     const message = `auth.api.${name} (${path}) is off in the preset: ${disabledRoutes[path]}.`;
     Object.assign(auth.api, { [name]() { throw new TypeError(message); } });
   }
+  /** The challenge a request's single, signed two_factor cookie names: a live '2fa-' challenge row of an existing account. */
+  const readChallenge = async (instance: object, headers: HeadersInit | undefined) => {
+    const cookie = singleCookie(headers, cookieName('two_factor'));
+    if (cookie === undefined || cookie.startsWith('"')) return null;
+    const identifier = signedValue(cookie, secret);
+    if (identifier === undefined || !challengeIdentifier.test(identifier)) return null;
+    const { adapter } = await storeOf(instance);
+    const row = await adapter.findOne<{ value: string; expiresAt: Date | string }>({ model: 'verification', where: [{ field: 'identifier', value: identifier }] });
+    if (!row || !(new Date(row.expiresAt).getTime() > Date.now()) || typeof row.value !== 'string' || !row.value) return null;
+    const user = await adapter.findOne<{ id: string }>({ model: 'user', where: [{ field: 'id', value: row.value }] });
+    if (!user) return null;
+    return { identifier, userId: user.id, limitKey: `v1.${mac(keys.challengeLimit, identifier)}` };
+  };
+  {
+    const route = auth.handler.bind(auth);
+    const guarded = async (request: Request) => {
+      const headers = withoutDuplicateSession(request.headers);
+      return withExpired(await route(headers === request.headers ? request : new Request(request, { headers })), request.headers, new URL(request.url).pathname);
+    };
+    Object.assign(auth, { handler: guarded, fetch: guarded });
+    const api = auth.api as unknown as Record<string, unknown>;
+    for (const [name, call] of Object.entries(api)) {
+      if (typeof call !== 'function') continue;
+      api[name] = Object.assign((input?: { headers?: HeadersInit }) => {
+        const headers = withoutDuplicateSession(input?.headers);
+        return (call as (input?: unknown) => unknown)(headers === input?.headers ? input : { ...input, headers });
+      }, call);
+    }
+  }
   const helpers = {
+    cookieName: (name: string) => {
+      if (typeof name !== 'string' || !/^[a-z_]{1,64}$/.test(name)) throw new TypeError('cookieName takes a cookie name such as two_factor or session_token.');
+      return cookieName(name);
+    },
+    readTwoFactorChallenge: (request: Request) => {
+      if (!(request instanceof Request)) throw new TypeError('readTwoFactorChallenge takes the request.');
+      return readChallenge(auth, request.headers);
+    },
+    expiredAuthCookies: (headers: HeadersInit, path?: string) => expiredAuthCookies(headers, typeof path === 'string' ? path : undefined),
     storedVerificationIdentifier: (identifier: string) => storedIdentifier(keys, raw(identifier)),
     sessionTokenKey: (token: string) => tokenHandle(keys, raw(token)),
   };
@@ -993,8 +1126,9 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
    */
   const claimDevice = async (db: AnyDatabase, address: string, headers: HeadersInit | undefined): Promise<string | undefined> => {
     const store = await storeOf(auth);
-    // Only entries whose device id carries its own MAC: forged cookies never reach the database or a claim slot.
-    const entries = deviceEntries(cookieFrom(headers, store.createAuthCookie(device.cookie).name)).filter(entry => deviceIdSigned(keys, entry.deviceId));
+    // Only one exact copy, and only entries whose device id carries its own MAC: forged cookies never reach the database
+    // or a claim slot.
+    const entries = deviceEntries(singleCookie(headers, store.createAuthCookie(device.cookie).name)).filter(entry => deviceIdSigned(keys, entry.deviceId));
     if (!entries.length) return undefined;
     // At most `device.claims` claims at once in this process (each one pool read, then one short locked transaction)
     // and a few waiting; past that the browser counts as not known, so its cookie never holds more of the pool than that.
@@ -1109,11 +1243,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     async verifyTwoFactor(db, request) {
       await ready(db, () => undefined);
       if (!(request instanceof Request) || !challengeRoute.test(new URL(request.url).pathname)) throw new TypeError('verifyTwoFactor completes a request to /two-factor/verify-totp, -backup-code or -otp.');
-      // The challenge the signed two_factor cookie names, and the account it was issued for.
-      const identifier = signedValue(cookieFrom(request.headers, challengeCookie), secret);
-      const challenge = identifier === undefined ? null
-        : await (await storeOf(auth)).adapter.findOne<{ value: string; expiresAt: Date | string }>({ model: 'verification', where: [{ field: 'identifier', value: identifier }] });
-      if (!challenge || !(new Date(challenge.expiresAt).getTime() > Date.now())) return challengeRefused();
+      // The challenge the one signed two_factor cookie names, and the account it was issued for; a cookie sent twice is
+      // refused, and expired so the next sign-in starts clean.
+      const read = await readChallenge(auth, request.headers);
+      if (!read) return challengeRefused();
+      const challenge = { value: read.userId };
       let response: Response, interrupted = false;
       try {
         response = await transaction(db, async tx => {
@@ -1155,6 +1289,12 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       });
     } catch (error) { if (error instanceof LockedAuthClosedError) throw error; }
   };
+  // A sign-in from a browser that sends an auth cookie twice also expires every copy, before the cookies it sets.
+  const { signInWithPassword: signInOnce, verifyTwoFactor: verifyOnce } = locked;
+  Object.assign(locked, {
+    signInWithPassword: async (db: AnyDatabase, input: PasswordSignIn, limits: PasswordSignInLimits) => withExpired(await signInOnce(db, input, limits), (input as Partial<PasswordSignIn> | undefined)?.headers),
+    verifyTwoFactor: async (db: AnyDatabase, request: Request) => withExpired(await verifyOnce(db, request), request?.headers, request instanceof Request ? new URL(request.url).pathname : undefined),
+  });
   return Object.assign(auth, helpers, locked) as unknown as Ten98Auth;
 }
 
@@ -1173,6 +1313,10 @@ const passwordRoute = /\/sign-in\/email\/*$/i;
 /** The two-factor routes that complete a sign-in's challenge, in any case and with any trailing slash. */
 const challengeRoute = /\/two-factor\/verify-(?:totp|backup-code|otp)\/*$/i;
 const twoFactorPaths = new Set(['/two-factor/verify-totp', '/two-factor/verify-backup-code', '/two-factor/verify-otp']);
+/** Every cookie better-auth and the preset set, named in full on https so each carries the __Host- prefix. */
+const authCookieNames = ['session_token', 'session_data', 'dont_remember', 'account_data', 'two_factor', 'trust_device', 'known_device'] as const;
+/** A sign-in challenge the two-factor plugin opens: '2fa-' and 20 characters of better-auth's generateRandomString. */
+const challengeIdentifier = /^2fa-[A-Za-z0-9_-]{20}$/;
 /** The two-factor plugin's server calls for those routes. */
 const twoFactorEndpoints = ['verifyTOTP', 'verifyBackupCode', 'verifyTwoFactorOTP'] as const;
 /** The value of a cookie better-call signed with `secret`, or undefined when it is missing, malformed or forged. */

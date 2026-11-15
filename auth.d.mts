@@ -143,6 +143,15 @@ export interface Ten98AuthOptions {
     /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
     cookiePrefix?: string;
     /**
+     * Paths and domains the app's auth cookies were once set with, besides the current `Path=/` with no Domain. A request
+     * carrying an auth cookie twice is refused and every copy is expired, in each of these scopes too, so a cookie left from
+     * an old path or domain cannot strand a user.
+     */
+    legacyCookieScopes?: readonly {
+        path?: string;
+        domain?: string;
+    }[];
+    /**
      * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
      * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
      * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
@@ -233,6 +242,28 @@ export interface Ten98Auth {
     };
     /** The stored `verification.identifier` for a raw identifier; see the standalone `storedVerificationIdentifier`. */
     storedVerificationIdentifier(identifier: string): string;
+    /**
+     * The exact name of one of the auth cookies (`two_factor`, `session_token`, `known_device`, …) for this instance:
+     * `__Host-<prefix>.<name>` on https, `<prefix>.<name>` on plain-http development.
+     */
+    cookieName(name: string): string;
+    /**
+     * The sign-in challenge a request's `two_factor` cookie names, or null when the cookie is absent, sent more than once,
+     * malformed, unsigned, forged, under another prefix, or names no live challenge of an existing account. `limitKey` is
+     * a stable HMAC of the challenge under its own derived key, never empty: key the app's per-challenge limiter with it.
+     */
+    readTwoFactorChallenge(request: Request): Promise<{
+        identifier: string;
+        userId: string;
+        limitKey: string;
+    } | null>;
+    /**
+     * The Set-Cookie values that expire an auth cookie a request carries more than once (session, challenge or known
+     * device), or none: at `/`, on every prefix of the auth routes and of `path` (the request's own, when given), and in
+     * each `legacyCookieScopes` entry. An app guard that calls `api.getSession` itself appends them
+     * to its response; `handler`, `signInWithPassword` and `verifyTwoFactor` add them on their own.
+     */
+    expiredAuthCookies(headers: HeadersInit, path?: string): string[];
     /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
     sessionTokenKey(token: string): string;
     /**

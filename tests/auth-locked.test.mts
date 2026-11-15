@@ -2364,3 +2364,214 @@ test('a start-up check that fails for another reason reports that failure, not a
   const target = createTen98Auth({ database: failing(db), transactionDatabase: failing, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test' });
   await assert.rejects(target.assertSchema(db), (error: unknown) => error === outage);
 });
+
+// ---- One copy of each auth cookie (single-copy rule) and the challenge helper ----
+// A value signed as better-call signs a cookie with the app's secret.
+const signed = (value: string) => encodeURIComponent(`${value}.${createHmac('sha256', SECRET).update(value).digest('base64')}`);
+// The name=value pair of one cookie in a Cookie header.
+const pairOf = (cookie: string, name: string) => cookie.split('; ').find(item => item.split('=')[0] === name)!;
+// The cookie prefix of the shared test instance, and planted cookies the library never reads: the other scheme's and the
+// hyphen form of this prefix, and another app's prefix on the same host.
+const prefixOf = (target: Ten98Auth) => target.cookieName('two_factor').replace(/\.two_factor$/, '');
+const planted = (target: Ten98Auth) => ['two_factor', 'session_token', 'known_device'].flatMap(name =>
+  [`__Secure-${prefixOf(target)}.${name}=planted`, `${prefixOf(target)}-${name}=planted`, `other-app.${name}=planted`, `__Secure-other-app.${name}=planted`]).join('; ');
+// The Set-Cookie values that expire `name`.
+const expiring = (response: Response, name: string) => response.headers.getSetCookie().filter(value => value.startsWith(`${name}=;`) && /Max-Age=0/.test(value));
+
+test('readTwoFactorChallenge reads the one signed challenge cookie, with a stable limit key that is never the HMAC of nothing', { skip }, async () => {
+  const name = auth.cookieName('two_factor');
+  assert.equal(name, `${prefixOf(auth)}.two_factor`);
+  assert.throws(() => auth.cookieName('Two Factor'), TypeError);
+  const mine = await challenged('read-mine'), theirs = await challenged('read-theirs');
+  const read = (cookie: string) => auth.readTwoFactorChallenge(post('/two-factor/verify-totp', cookie, { code: '000000' }));
+  const first = await read(mine.challenge);
+  assert.ok(first);
+  assert.deepEqual([first.userId, first.identifier], [mine.id, challengeOf(mine.challenge)]);
+  const limitKey = (value: string) => `v1.${createHmac('sha256', Buffer.from(hkdfSync('sha256', SECRET, '', 'ten98-auth:two-factor-limit:v1', 32))).update(value).digest('base64url')}`;
+  assert.equal(first.limitKey, limitKey(first.identifier));
+  assert.notEqual(first.limitKey, limitKey(''));
+  assert.equal((await read(mine.challenge))!.limitKey, first.limitKey);
+  assert.notEqual((await read(theirs.challenge))!.limitKey, first.limitKey);
+  // A planted variant or another app's cookie beside it changes nothing.
+  assert.equal((await read(`${planted(auth)}; ${mine.challenge}`))!.identifier, first.identifier);
+  // Absent, under another prefix, in another form, unsigned, forged, quoted, or naming a row that is not a challenge.
+  const value = pairOf(mine.challenge, name).slice(name.length + 1);
+  const deviceEmail = address('read-device');
+  await account_(deviceEmail);
+  const device = jar().take(await signIn(deviceEmail)).device()!;
+  for (const cookie of ['', `other-app.two_factor=${value}`, `${prefixOf(auth)}-two_factor=${value}`, `__Secure-${name}=${value}`,
+    `${name}=${encodeURIComponent(first.identifier)}`, `${name}=${signed('2fa-AAAAAAAAAAAAAAAAAAAA').slice(0, -6)}abcdef`, `${name}="${value}"`,
+    `${name}=${signed(`2fa-attempts-${first.identifier}`)}`, `${name}=${signed(`known-device:${device.split('.')[0]}`)}`]) {
+    assert.equal(await read(cookie), null, cookie);
+  }
+  // Sent twice, in either order, even with another account's challenge as the second copy.
+  const other = pairOf(theirs.challenge, name);
+  for (const cookie of [`${mine.challenge}; ${other}`, `${other}; ${mine.challenge}`, `${mine.challenge}; ${mine.challenge}`]) assert.equal(await read(cookie), null, cookie);
+  // Expired.
+  await pool!.query('UPDATE verification SET "expiresAt" = now() - interval \'1 second\' WHERE identifier = $1', [auth.storedVerificationIdentifier(first.identifier)]);
+  assert.equal(await read(mine.challenge), null);
+});
+
+test('verifyTwoFactor refuses a challenge cookie sent twice, in either order, and expires it; the next sign-in completes', { skip }, async () => {
+  const name = auth.cookieName('two_factor');
+  const mine = await challenged('twice-mine'), theirs = await challenged('twice-theirs');
+  const other = pairOf(theirs.challenge, name);
+  for (const cookie of [`${mine.challenge}; ${other}`, `${other}; ${mine.challenge}`]) {
+    const refused = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', cookie, { code: totp(mine.uri, 1) }));
+    assert.equal(refused.status, 401, cookie);
+    assert.ok(expiring(refused, name).some(value => /Path=\//.test(value)), refused.headers.getSetCookie().join(' | '));
+  }
+  for (const cookie of [`${name}=${signed(`2fa-attempts-${challengeOf(mine.challenge)}`)}`, `${name}=${encodeURIComponent(challengeOf(mine.challenge))}`]) {
+    assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', cookie, { code: totp(mine.uri, 1) }))).status, 401);
+  }
+  assert.equal(await sessions(mine.id), 1);
+  // The browser dropped both copies; a fresh sign-in opens a new challenge, which completes, planted variants and all.
+  const fresh = cookieOf(await signIn(mine.email));
+  const completed = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', `${planted(auth)}; ${fresh}`, { code: totp(mine.uri, 1) }));
+  assert.equal(completed.status, 200);
+  assert.deepEqual(expiring(completed, name).filter(value => !/two_factor=;.*Max-Age=0/.test(value)), []);
+});
+
+// A browser's cookie store, keyed as browsers key it: name, domain and path. Set-Cookie with an empty value or Max-Age=0
+// deletes the cookie of that name, domain and path; a request carries every cookie whose domain and path match it.
+function browserJar(host = 'localhost') {
+  type Stored = { name: string; value: string; domain: string; hostOnly: boolean; path: string };
+  const cookies = new Map<string, Stored>();
+  // A host-only cookie and a Domain cookie for the same host are different cookies.
+  const key = (name: string, domain: string | undefined, path: string) => `${name}|${domain === undefined ? `host:${host}` : `domain:${domain}`}|${path}`;
+  return {
+    take(response: Response) {
+      for (const line of response.headers.getSetCookie()) {
+        const [pair, ...attributes] = line.split(';').map(part => part.trim());
+        const name = pair!.slice(0, pair!.indexOf('=')), value = pair!.slice(pair!.indexOf('=') + 1);
+        const attribute = (label: string) => attributes.find(item => item.toLowerCase().startsWith(`${label}=`))?.slice(label.length + 1);
+        const domain = attribute('domain')?.replace(/^\./, '').toLowerCase();
+        const path = attribute('path') ?? '/';
+        const at = key(name, domain, path);
+        if (!value || attributes.some(item => /^max-age=0$/i.test(item))) cookies.delete(at);
+        else cookies.set(at, { name, value, domain: domain ?? host, hostOnly: domain === undefined, path });
+      }
+      return this;
+    },
+    plant(name: string, value: string, { path = '/', domain }: { path?: string; domain?: string } = {}) {
+      cookies.set(key(name, domain, path), { name, value, domain: domain ?? host, hostOnly: domain === undefined, path });
+    },
+    // Longer paths first, as browsers send them.
+    header(url: string) {
+      const target = new URL(url);
+      return [...cookies.values()].filter(cookie => (cookie.hostOnly ? target.hostname === cookie.domain : target.hostname === cookie.domain || target.hostname.endsWith(`.${cookie.domain}`))
+        && (cookie.path === '/' || target.pathname === cookie.path || target.pathname.startsWith(`${cookie.path}/`)))
+        .sort((a, b) => b.path.length - a.path.length).map(({ name, value }) => `${name}=${value}`).join('; ');
+    },
+    count: (name: string) => [...cookies.values()].filter(cookie => cookie.name === name).length,
+  };
+}
+
+test('a session cookie sent twice is answered as signed out and expired on every auth path and scope; the next sign-in works', { skip }, async () => {
+  // Plain-http development: copies can differ by path, or be set for a Domain (here the host itself, as a domain cookie).
+  const site = ORIGIN;
+  const scoped = authOver(db, { legacyCookieScopes: [{ domain: 'localhost' }] });
+  const name = scoped.cookieName('session_token');
+  const email = address('session-twice');
+  const id = await account_(email);
+  const signInto = async (browser: ReturnType<typeof browserJar>) =>
+    browser.take(await scoped.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header(`${site}/api/auth/sign-in/email`) } }, allow));
+  const getSession = (browser: ReturnType<typeof browserJar>, path = '/api/auth/get-session') =>
+    scoped.handler(new Request(`${site}${path}`, { headers: { cookie: browser.header(`${site}${path}`) } }));
+  // A copy planted under a path of the auth routes, or for the parent domain: each round is refused once, then recovers.
+  for (const plant of [{ path: '/api' }, { path: '/api/auth' }, { domain: 'localhost' }]) {
+    const browser = browserJar('localhost');
+    await signInto(browser);
+    const other = pairOf(cookieOf(await scoped.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)), name);
+    browser.plant(name, other.slice(name.length + 1), plant);
+    const refused = await getSession(browser);
+    assert.equal(await refused.clone().json(), null, JSON.stringify(plant));
+    assert.equal(await scoped.api.getSession({ headers: { cookie: browser.header(`${site}/api/auth/get-session`) } }), null);
+    assert.ok(scoped.expiredAuthCookies({ cookie: browser.header(`${site}/api/auth/get-session`) }, '/api/auth/get-session').length > 0);
+    browser.take(refused);
+    assert.equal(browser.count(name), 0, JSON.stringify(plant));
+    await signInto(browser);
+    assert.equal(((await (await getSession(browser)).json()) as { user: { id: string } }).user.id, id, JSON.stringify(plant));
+  }
+  // The scopes expired: / and every prefix of the request's path, and the legacy parent domain.
+  const twice = { cookie: `${name}=a; ${name}=b` };
+  const expired = scoped.expiredAuthCookies(twice, '/api/auth/get-session');
+  assert.deepEqual(expired.map(value => /Path=([^;]+)/.exec(value)![1]! + (/Domain=([^;]+)/.exec(value)?.[1] ?? '')).sort(),
+    ['/', '/api', '/api/auth', '/api/auth/get-session', '/localhost'].sort());
+  assert.deepEqual(scoped.expiredAuthCookies({ cookie: `${name}=a` }), []);
+});
+
+test('a challenge cookie planted under the two-factor path is refused once and expired; a fresh sign-in completes', { skip }, async () => {
+  const site = ORIGIN;
+  const scoped = auth;
+  const name = scoped.cookieName('two_factor');
+  const factor = await challenged('planted-challenge');
+  const browser = browserJar('localhost');
+  const challenge = async () => browser.take(await scoped.signInWithPassword(db, { source: SOURCE, email: factor.email, password: PASSWORD, headers: { cookie: browser.header(`${site}/api/auth/sign-in/email`) } }, allow));
+  await challenge();
+  const other = pairOf(cookieOf(await scoped.signInWithPassword(db, { source: SOURCE, email: factor.email, password: PASSWORD }, allow)), name);
+  browser.plant(name, other.slice(name.length + 1), { path: '/api/auth/two-factor' });
+  const verify = (code: string) => scoped.verifyTwoFactor(db, new Request(`${site}/api/auth/two-factor/verify-totp`, {
+    method: 'POST', headers: { 'content-type': 'application/json', origin: site, cookie: browser.header(`${site}/api/auth/two-factor/verify-totp`) }, body: JSON.stringify({ code }),
+  }));
+  const refused = await verify(totp(factor.uri, 1));
+  assert.equal(refused.status, 401);
+  browser.take(refused);
+  assert.equal(browser.count(name), 0);
+  await challenge();
+  assert.equal((await verify(totp(factor.uri, 1))).status, 200);
+});
+
+test('on https every auth cookie is __Host-: Secure, Path=/ and no Domain; a cookie under any other name is never read', { skip }, async () => {
+  const site = 'https://app.example.test';
+  const secure = authOver(db, { appUrl: site });
+  const name = secure.cookieName('session_token');
+  assert.match(name, /^__Host-[^.]+\.session_token$/);
+  for (const cookie of ['two_factor', 'known_device', 'dont_remember', 'trust_device']) assert.match(secure.cookieName(cookie), /^__Host-/);
+  const email = address('host-prefix');
+  const id = await account_(email);
+  const signedIn = await secure.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow);
+  const lines = signedIn.headers.getSetCookie();
+  assert.ok(lines.length >= 2);
+  for (const line of lines) {
+    assert.match(line, /^__Host-/, line);
+    assert.match(line, /; Secure/i, line);
+    assert.match(line, /; Path=\//i, line);
+    assert.doesNotMatch(line, /Domain=/i, line);
+  }
+  const own = pairOf(cookieOf(signedIn), name);
+  const session = (cookie: string) => secure.handler(new Request(`${site}/api/auth/get-session`, { headers: { cookie } })).then(response => response.json() as Promise<{ user: { id: string } } | null>);
+  // What a sibling subdomain could set for the parent domain: never under the __Host- name, so never read.
+  const value = own.slice(name.length + 1);
+  const sibling = [`__Secure-${name.replace(/^__Host-/, '')}=${value}`, `${name.replace(/^__Host-/, '')}=${value}`].join('; ');
+  assert.equal(await session(sibling), null);
+  assert.equal((await session(`${sibling}; ${own}`))!.user.id, id);
+});
+
+test('a known-device cookie sent twice counts as not known and is expired; the next sign-in issues a fresh one', { skip }, async () => {
+  const name = auth.cookieName('known_device');
+  const email = address('device-twice');
+  await account_(email);
+  const first = jar().take(await signIn(email)).device()!, second = jar().take(await signIn(email)).device()!;
+  let known: boolean | undefined;
+  const attempt = (cookie: string) => auth.signInWithPassword(db, { source: SOURCE, email, password: 'wrong password guess', headers: { cookie } },
+    accountStep(entry => { known = entry.knownDevice; return true; }));
+  // Each copy alone is a known device, planted variants beside it or not.
+  await attempt(`${name}=${first}`);
+  assert.equal(known, true);
+  await attempt(`${planted(auth)}; ${name}=${second}`);
+  assert.equal(known, true);
+  const twice = await attempt(`${name}=${first}; ${name}=${second}`);
+  assert.deepEqual([known, twice.status], [false, 401]);
+  assert.ok(expiring(twice, name).length > 0);
+  // The browser dropped both; the next sign-in issues a fresh entry, after the expiry, and the browser is known again.
+  const browser = browserJar();
+  browser.take(twice);
+  const fresh = await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: `${name}=${first}; ${name}=${second}` } }, allow);
+  const lines = fresh.headers.getSetCookie().filter(line => line.startsWith(`${name}=`));
+  assert.ok(lines.length >= 2 && /Max-Age=0/.test(lines[0]!) && !/Max-Age=0/.test(lines.at(-1)!), lines.join(' | '));
+  browser.take(fresh);
+  assert.equal(browser.count(name), 1);
+  await attempt(browser.header(`${ORIGIN}/api/auth/sign-in/email`));
+  assert.equal(known, true);
+});
