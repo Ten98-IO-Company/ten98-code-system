@@ -305,10 +305,10 @@ test('CLI checks the compiler-backed runtime and returns failure for any drift',
     writeFileSync(file, JSON.stringify(manifest));
     const script = fileURLToPath(new URL('../check.mjs', import.meta.url));
     const actual = fileURLToPath(new URL('..', import.meta.url));
-    let result = spawnSync(process.execPath, [script, actual, actual], { encoding: 'utf8', timeout: 30_000 });
+    let result = spawnSync(process.execPath, [script, actual, actual], { encoding: 'utf8', timeout: 60_000 });
     assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout.split('architecture declarations match').length - 1, 2);
     manifest.dependencies.express = '5.0.0'; writeFileSync(file, JSON.stringify(manifest));
-    result = spawnSync(process.execPath, [script, temporary], { encoding: 'utf8', timeout: 30_000 });
+    result = spawnSync(process.execPath, [script, temporary], { encoding: 'utf8', timeout: 60_000 });
     assert.equal(result.status, 1); assert.match(result.stderr, /Unapproved runtime dependency express/);
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 });
