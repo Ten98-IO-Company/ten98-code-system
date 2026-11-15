@@ -80,7 +80,24 @@ test('each refusal names the file and the required shape', needsParser, () => {
     "import * as Start from '@tanstack/react-start';\nexport const second = Start.createStart(() => ({}));\n",
     "export { createStart } from '@tanstack/react-start';\n",
   ]) refused({ 'src/server/other.ts': body }, /^src\/server\/other\.ts: createStart belongs in src\/start\.ts only/);
-  refused({ 'src/start.tsx': "import { createStart } from '@tanstack/react-start';\nexport const startInstance = createStart(() => ({}));\n" }, /^src\/start\.tsx: createStart belongs/);
+});
+
+test('no other file may carry an entry name Start resolves, so the checked entries are the ones Start runs', needsParser, () => {
+  // Start takes the first of src/<name>, .ts, .js, .mts, .mjs, .tsx and .jsx; every other spelling is refused too.
+  for (const kind of ['start', 'client']) {
+    const checked = kind === 'start' ? 'src/start.ts' : 'src/client.tsx';
+    for (const extension of ['', '.ts', '.js', '.mts', '.mjs', '.cts', '.cjs', '.tsx', '.jsx']) {
+      const name = `src/${kind}${extension}`;
+      if (name === checked) continue;
+      assert.deepEqual(app({ ...passing, [name]: 'export {};\n' }), [`${name}: Start can take its ${kind} entry from this file instead of ${checked}; keep ${checked} as the only src/${kind} file.`], name);
+    }
+    // A different case is the same file on a case-insensitive file system.
+    assert.equal(app({ ...passing, [`src/${kind.toUpperCase()}.js`]: 'export {};\n' }).length, 1);
+  }
+  // Folders of those names never resolve as an entry, and other names that start with one are unrelated.
+  assert.deepEqual(app({ ...passing, 'src/client/api.ts': 'export {};\n', 'src/start/setup.ts': 'export {};\n', 'src/client-api.ts': 'export {};\n', 'src/start.test.ts': 'export {};\n', 'src/client.d.ts': 'export {};\n' }), []);
+  // A second entry that also calls createStart is refused for both.
+  assert.deepEqual(app({ ...passing, 'src/start.tsx': "import { createStart } from '@tanstack/react-start';\nexport const startInstance = createStart(() => ({}));\n" }).map(error => error.split(':')[0]), ['src/start.tsx', 'src/start.tsx']);
 });
 
 test('the rule applies to apps that ship Start, and not to a waived profile or this package', needsParser, () => {

@@ -1,5 +1,5 @@
 import { inspectDatabasePolicy } from './database-policy.mjs';
-import { readFileSync, writeFileSync, realpathSync, existsSync, readdirSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, realpathSync, existsSync, readdirSync, lstatSync, statSync } from 'node:fs';
 import { resolve, relative, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -470,6 +470,12 @@ export function updatePresentationBaseline(directory: string, name: string, opti
 
 const START = '@tanstack/react-start', START_ENTRY = '@ten98/runtime/start';
 const START_FILE = 'src/start.ts', CLIENT_FILE = 'src/client.tsx';
+// Start resolves its start and client entries as `./start` and `./client` from src (start-plugin-core 1.171.50
+// planning.js resolveStartEntryPlan, through resolve-entries.js resolveEntry): exsolve takes the first file among the
+// bare name, then .ts, .js, .mts, .mjs, .tsx and .jsx; a folder never resolves. So the checked file is the one Start runs
+// only when no other file carries the entry's name. .cts and .cjs are refused as well, and names are compared without
+// case, as a case-insensitive file system resolves them.
+const ENTRY_NAME = /^(start|client)(?:\.(?:[cm]?[jt]s|[jt]sx))?$/iu;
 
 // Local names bound by value imports of `name` from `source`; type-only imports bind nothing at run time.
 function importedAs(body: AstNode[], source: string, name: string): Set<string> {
@@ -557,6 +563,13 @@ export function checkStartEntry(directory: string, manifest: PackageManifest, { 
     if (!client.some(node => node.type === 'ExpressionStatement' && node.expression.type === 'CallExpression' && node.expression.callee.type === 'Identifier' && hydrate.has(node.expression.callee.name))) {
       errors.push(`${CLIENT_FILE} must call hydrateTen98Start(...) from ${START_ENTRY} at its top level.`);
     }
+  }
+  const src = resolve(directory, 'src');
+  for (const entry of existsSync(src) ? readdirSync(src) : []) {
+    const name = `src/${entry}`, kind = ENTRY_NAME.exec(entry)?.[1]?.toLowerCase();
+    if (!kind || name === START_FILE || name === CLIENT_FILE || !statSync(resolve(src, entry), { throwIfNoEntry: false })?.isFile()) continue;
+    const checked = kind === 'start' ? START_FILE : CLIENT_FILE;
+    errors.push(`${name}: Start can take its ${kind} entry from this file instead of ${checked}; keep ${checked} as the only src/${kind} file.`);
   }
   const policy = resolved?.profile.sourceLanguage;
   for (const name of appSources(directory, policy?.roots ?? ['src'], new Set([START_FILE, ...policy?.artifactDirectories ?? []]))) {
