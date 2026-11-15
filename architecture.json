@@ -655,7 +655,8 @@
         "default": "typescript",
         "roots": [
           "src",
-          "tests"
+          "tests",
+          "scripts"
         ],
         "legacyJavaScript": [],
         "generated": {},
