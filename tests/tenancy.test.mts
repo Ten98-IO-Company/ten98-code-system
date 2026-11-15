@@ -146,8 +146,13 @@ test('the exported transaction refuses a database it cannot run safely instead o
   const Minified = class a extends ScriptedPool {}, minified = new Minified({});
   assert.equal(await transaction(drizzle(minified as never), async () => 'done'), 'done');
   assert.deepEqual([minified.sent, minified.released], [['begin', 'commit'], [false]]);
-  // A pg Client (a checked-out client is one) is Drizzle's own transaction on that client: nothing to check out or release.
-  const sent: string[] = [], query = async (config: string | { text: string }) => { sent.push(typeof config === 'string' ? config : config.text); return { rows: [], fields: [] }; };
+  // A pg Client (a checked-out client is one) runs the transaction on that client: nothing to check out or release. Its
+  // COMMIT answers as PostgreSQL does, with the COMMIT tag.
+  const sent: string[] = [], query = async (config: string | { text: string }) => {
+    const text = typeof config === 'string' ? config : config.text;
+    sent.push(text);
+    return { rows: [], fields: [], command: text === 'commit' ? 'COMMIT' : 'SELECT' };
+  };
   const client = Object.assign(new pg.Client(), { query });
   assert.equal(await transaction(drizzle(client as never), async () => 'done'), 'done');
   assert.deepEqual(sent, ['begin', 'commit']);

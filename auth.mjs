@@ -8,7 +8,7 @@
 // better-auth on one transaction that holds the user row, so a password change and a sign-in or revocation cannot
 // interleave.
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash, createHmac, hkdfSync, scrypt, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, hkdfSync, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { and, eq, getTableName, sql } from 'drizzle-orm';
 import { NodePgSession, NodePgTransaction } from 'drizzle-orm/node-postgres';
 import { PgTransaction } from 'drizzle-orm/pg-core';
@@ -63,7 +63,7 @@ export function verifyLegacyScryptHash(hash, password) {
 // Keys for tokens at rest: HKDF-SHA256 over the secret, one label per use, so neither equals the secret or any other key
 // an app derives from it. Rotating the secret ends every session, reset link and trusted device, and makes enrolled
 // second factors (encrypted with the secret itself) unreadable: it is a re-enrolment event.
-const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1' };
+const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1', knownDevice: 'ten98-auth:known-device:v1' };
 const checkedSecret = (secret) => {
     if (typeof secret !== 'string' || secret.length < 32)
         throw new TypeError('The auth secret must be at least 32 characters.');
@@ -72,6 +72,7 @@ const checkedSecret = (secret) => {
 const deriveKeys = (secret) => ({
     verification: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.verification, 32)),
     session: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.session, 32)),
+    knownDevice: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.knownDevice, 32)),
 });
 const mac = (key, value) => createHmac('sha256', key).update(value).digest('base64url');
 const raw = (value) => {
@@ -86,7 +87,7 @@ const tokenHandle = (keys, token) => handlePrefix + mac(keys.session, token);
 // The kept prefixes, longest first where they overlap. An attempt counter names its challenge, so its tail is stored
 // with this same rule and the stored counter is exactly '2fa-attempts-' || <stored challenge identifier>.
 const attemptsPrefix = '2fa-attempts-';
-const keptPrefixes = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:'];
+const keptPrefixes = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:', 'known-device-attempt:', 'known-device:'];
 function storedIdentifier(keys, identifier) {
     let head = '', rest = identifier;
     while (rest.startsWith(attemptsPrefix)) {
@@ -95,6 +96,46 @@ function storedIdentifier(keys, identifier) {
     }
     const prefix = keptPrefixes.find(candidate => rest.startsWith(candidate));
     return head + (prefix ? prefix + mac(keys.verification, rest.slice(prefix.length)) : handlePrefix + mac(keys.verification, rest));
+}
+// Known devices (#132): a browser that completed a sign-in for an account, so `signInWithPassword` can tell the app's
+// limiter to spare it the account-wide bucket. Each is a verification row `known-device:<deviceId>` (value: the user id,
+// expiresAt: its 90 days) with one `known-device-attempt:<deviceId>` row per attempt it was trusted for since its last
+// success; at 5 it is no longer trusted. Both prefixes are kept in storage, so a user's rows go with one prefix filter.
+const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts: 5, entries: 5, devices: 5, cookieLength: 1024, claims: { concurrency: 2, queue: 8, waitMs: 1000 } };
+const devicePrefix = 'known-device', deviceRow = (deviceId) => `known-device:${deviceId}`, attemptRow = (deviceId) => `known-device-attempt:${deviceId}`;
+const deviceEntryPattern = /^([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/;
+/** The tag binding a device id to one account: HMAC over userId ‖ deviceId (NUL-separated; neither contains NUL). */
+const deviceTag = (keys, userId, deviceId) => mac(keys.knownDevice, `${userId}\u0000${deviceId}`);
+/**
+ * The cookie's entries, one per account this browser signed in to, newest first and at most `device.entries`. A missing,
+ * oversized or malformed value, or a malformed entry, is ignored, never an error.
+ */
+function deviceEntries(value) {
+    if (typeof value !== 'string' || value.length > device.cookieLength)
+        return [];
+    return value.split('~').slice(0, device.entries).flatMap(text => {
+        const match = deviceEntryPattern.exec(text);
+        return match ? [{ deviceId: match[1], tag: match[2], text }] : [];
+    });
+}
+/** The entry whose tag verifies for `userId`, compared in constant time; undefined when none does. */
+function deviceFor(keys, userId, entries) {
+    let found;
+    for (const entry of entries) {
+        if (timingSafeEqual(Buffer.from(entry.tag), Buffer.from(deviceTag(keys, userId, entry.deviceId))) && !found)
+            found = entry;
+    }
+    return found;
+}
+/** One cookie from a Cookie header; undefined when absent. */
+function cookieFrom(headers, name) {
+    const header = headers === undefined ? null : new Headers(headers).get('cookie');
+    for (const pair of header?.split(';') ?? []) {
+        const at = pair.indexOf('=');
+        if (at > 0 && pair.slice(0, at).trim() === name)
+            return pair.slice(at + 1).trim();
+    }
+    return undefined;
 }
 /**
  * The `verification.identifier` the preset stores for a raw identifier, for an app that locks or reads the row with its
@@ -217,6 +258,8 @@ export class LockedAuthClosedError extends Error {
     constructor(message = 'This locked-auth transaction has ended; await every call inside its callback.') { super(message); this.name = 'LockedAuthClosedError'; }
 }
 const storeOf = (auth) => auth.$context;
+/** Deletes every known-device and attempt row of a user, so no browser of theirs stays trusted. */
+const forgetDevices = (adapter, userId) => adapter.deleteMany({ model: 'verification', where: [{ field: 'value', value: userId }, { field: 'identifier', operator: 'starts_with', value: devicePrefix }] });
 const INT32 = 2 ** 31;
 /**
  * A better-auth instance with the Ten98 policy. Sign-up stays closed: the first-boot claim creates the owner in the
@@ -301,9 +344,58 @@ function build(options, keys, locking, internal = {}) {
                         { field: 'id', operator: 'ne', value: current.id },
                         { field: 'expiresAt', operator: 'gt', value: new Date() },
                     ] });
+                await forgetDevices(adapter, current.userId);
                 return context.json({ status: true, revoked });
             }),
         },
+    };
+    const issueDevice = async (context, userId) => {
+        const cookie = context.context.createAuthCookie(device.cookie, { maxAge: device.lifetimeSeconds });
+        const entries = deviceEntries(context.getCookie(cookie.name));
+        const previous = deviceFor(keys, userId, entries);
+        const adapter = await getCurrentAdapter(context.context.adapter);
+        if (previous) {
+            for (const identifier of [deviceRow(previous.deviceId), attemptRow(previous.deviceId)]) {
+                await adapter.deleteMany({ model: 'verification', where: [{ field: 'identifier', value: identifier }, { field: 'value', value: userId }] });
+            }
+        }
+        const deviceId = randomBytes(24).toString('base64url');
+        await context.context.internalAdapter.createVerificationValue({ identifier: deviceRow(deviceId), value: userId, expiresAt: new Date(Date.now() + device.lifetimeSeconds * 1000) });
+        const live = await adapter.findMany({ model: 'verification', where: [{ field: 'value', value: userId }, { field: 'identifier', operator: 'starts_with', value: 'known-device:' }], sortBy: { field: 'createdAt', direction: 'desc' } });
+        for (const stale of live.slice(device.devices))
+            await adapter.delete({ model: 'verification', where: [{ field: 'id', value: stale.id }] });
+        const kept = entries.filter(entry => entry !== previous).map(entry => entry.text);
+        context.setCookie(cookie.name, [`${deviceId}.${deviceTag(keys, userId, deviceId)}`, ...kept].slice(0, device.entries).join('~'), cookie.attributes);
+    };
+    // After the two-factor plugin's hook, which clears newSession while a second factor is still pending, so only a
+    // completed sign-in (password, second factor, or the app's OIDC sign-in) issues an entry, and no other response does.
+    const signInPaths = new Set(['/sign-in/email', '/two-factor/verify-totp', '/two-factor/verify-backup-code', '/two-factor/verify-otp']);
+    const revokingPaths = new Set(['/change-password', '/revoke-sessions']);
+    const knownDevices = {
+        id: 'ten98-known-device',
+        hooks: { after: [
+                {
+                    matcher: (context) => signInPaths.has(context.path ?? '') || (context.path === undefined && typeof context.body?.oidcUserId === 'string'),
+                    handler: createAuthMiddleware(async (context) => {
+                        const created = context.context.newSession;
+                        if (!created || isAPIError(context.context.returned))
+                            return;
+                        // Confirming a factor while enabling two-factor is not a sign-in; only a sign-in challenge carries this cookie.
+                        if (context.path?.startsWith('/two-factor/') && !context.getCookie(context.context.createAuthCookie('two_factor').name))
+                            return;
+                        await issueDevice(context, created.user.id);
+                    }),
+                },
+                {
+                    matcher: (context) => revokingPaths.has(context.path ?? ''),
+                    handler: createAuthMiddleware(async (context) => {
+                        const userId = context.context.session?.user.id;
+                        if (!userId || isAPIError(context.context.returned))
+                            return;
+                        await forgetDevices(await getCurrentAdapter(context.context.adapter), userId);
+                    }),
+                },
+            ] },
     };
     // With legacy hashes accepted, every password check runs one legacy derive and one current derive, whichever hash is
     // stored or none, so response time does not reveal which accounts are unmigrated.
@@ -318,6 +410,25 @@ function build(options, keys, locking, internal = {}) {
             return legacy ? legacyOk : modernOk;
         },
     } : undefined;
+    /** The isAccountUsable hook, refusing a closed account by default. */
+    const usable = (account) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
+    /**
+     * The account an isAccountUsable check outside signInWithPassword reads (a reset, by id or lower-cased email): one
+     * indexed read of the user row's id, email and closedAt, never joined, so it costs the same whether or not a row
+     * exists. Through the adapter, whose user model must map closed_at as closedAt: without it the select throws, so the
+     * check fails loudly instead of being skipped (instanceSchema refuses such an adapter at start-up).
+     */
+    const storedAccount = async (adapter, where) => {
+        const found = await adapter
+            .findOne({ model: 'user', where: [where], select: ['id', 'email', 'closedAt'] });
+        if (found && found.closedAt === undefined)
+            throw new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
+        return found;
+    };
+    const refusedAccount = async (adapter, where) => {
+        const found = await storedAccount(adapter, where);
+        return found !== null && await usable({ id: found.id, email: found.email, closedAt: found.closedAt ?? null }) !== true;
+    };
     const auth = betterAuth({
         database: protectTokens(database, keys), baseURL: origin, secret, appName, trustedOrigins: [origin],
         // better-auth skips these checks when NODE_ENV=test or TEST is set unless they are pinned.
@@ -329,8 +440,9 @@ function build(options, keys, locking, internal = {}) {
         logger: { disabled: true },
         onAPIError: { onError(error) { if (isAPIError(error))
                 throw error; throw APIError.fromStatus('INTERNAL_SERVER_ERROR'); } },
+        user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false, defaultValue: () => null } } },
         session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false } },
-        plugins: [factors, oidcSessions, sessionRevocation],
+        plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
         emailAndPassword: {
             enabled: true,
             disableSignUp: true,
@@ -339,27 +451,54 @@ function build(options, keys, locking, internal = {}) {
             resetPasswordTokenExpiresIn: reset.expiresInSeconds,
             revokeSessionsOnPasswordReset: reset.revokesSessions,
             ...(sendResetPassword ? { sendResetPassword: async ({ user, token }) => { await sendResetPassword({ userId: user.id, email: user.email, token }); } } : {}),
-            // A reset also ends trusted devices and pending two-factor challenges, so the new password alone never skips the factor.
+            // A reset also ends trusted devices, pending two-factor challenges and known devices, so the new password alone
+            // never skips the factor and no browser stays trusted across it.
             onPasswordReset: async ({ user }) => {
                 // deleteMany has no row cap (findMany defaults to 100). Challenge rows hold the user id; their attempt counters
                 // ('2fa-attempts-…', value '0') expire with the challenge they belonged to.
                 // The prefixes are kept in storage, so these filters match the hashed rows.
                 const { adapter } = await storeOf(auth);
-                for (const prefix of ['trust-device-', '2fa-']) {
+                for (const prefix of ['trust-device-', '2fa-', devicePrefix]) {
                     await adapter.deleteMany({ model: 'verification', where: [{ field: 'value', value: user.id }, { field: 'identifier', operator: 'starts_with', value: prefix }] });
                 }
             },
             ...(legacyPassword ? { password: legacyPassword } : {}),
         },
         rateLimit: { enabled: false },
-        hooks: { after: createAuthMiddleware(async (context) => {
-                if (context.path !== '/sign-in/email' || isAPIError(context.context.returned))
+        hooks: { before: createAuthMiddleware(async (context) => {
+                // An account isAccountUsable refuses (by default a closed one) gets no reset. The request is handed to better-auth's
+                // route with an address no account has (a reset token no row has), so it takes the route's own unknown-email (invalid
+                // token) path, after the same validation and origin checks: the same answer, no token, nothing sent.
+                const { internalAdapter } = context.context;
+                const adapter = await getCurrentAdapter(context.context.adapter);
+                const body = (context.body ?? {});
+                // A body the route's own schema rejects is left to the route, so its 400 stays the same for every account.
+                if (context.path === '/request-password-reset' && sendResetPassword && typeof body.email === 'string' && resetBody.safeParse(body).success) {
+                    // Every request makes this one read, so an existing account costs what an unknown email does.
+                    if (await refusedAccount(adapter, { field: 'email', value: body.email.toLowerCase() })) {
+                        return { context: { body: { ...body, email: `${randomBytes(12).toString('hex')}@unusable-account.invalid` } } };
+                    }
+                }
+                if (context.path === '/reset-password') {
+                    const token = body.token || context.query?.token;
+                    if (typeof token !== 'string' || !token)
+                        return;
+                    const row = await internalAdapter.findVerificationValue(`reset-password:${token}`);
+                    if (row && await refusedAccount(adapter, { field: 'id', value: row.value })) {
+                        return { context: { body: { ...body, token: randomBytes(18).toString('base64url') } } };
+                    }
+                }
+            }), after: createAuthMiddleware(async (context) => {
+                const path = context.path ?? '';
+                if ((path !== '/sign-in/email' && !twoFactorPaths.has(path)) || isAPIError(context.context.returned))
                     return;
-                // The account this sign-in created a session (or a two-factor challenge) for, read before the two-factor plugin's
-                // hook clears it, so signInWithPassword can check it is the account it locked.
+                // The account this sign-in (or completed challenge) created a session (or a two-factor challenge) for, read before
+                // the two-factor plugin's hook clears it, so signInWithPassword and verifyTwoFactor can check it is the one locked.
                 const signedIn = context.context.newSession?.user.id;
                 if (internal.signedIn && signedIn)
                     internal.signedIn(signedIn);
+                if (path !== '/sign-in/email')
+                    return;
                 // signInWithPassword replaces a legacy hash itself, in a savepoint of its locked transaction. Here (raw sign-in,
                 // allowRawPasswordSignIn) it is best effort: a failure leaves the legacy hash for the next sign-in.
                 if (!legacyPasswords || internal.signedIn)
@@ -376,24 +515,45 @@ function build(options, keys, locking, internal = {}) {
                 catch { /* retried on the next successful sign-in */ }
             }) },
     });
+    // The request-reset route's body schema, as better-auth validates it after the before hooks; read before any wrapping.
+    const resetBody = auth.api.requestPasswordReset.options.body;
     const helpers = {
         storedVerificationIdentifier: (identifier) => storedIdentifier(keys, raw(identifier)),
         sessionTokenKey: (token) => tokenHandle(keys, raw(token)),
     };
+    // The two-factor challenge cookie's name, as better-auth's createAuthCookie builds it for this instance.
+    const challengeCookie = `${origin.startsWith('https:') ? '__Secure-' : ''}${prefix}.two_factor`;
+    /** Which locked sign-in a route needs: a password sign-in, the completion of a challenge, or neither. */
+    const signInKind = (path, headers) => passwordRoute.test(path) ? 'password' : challengeRoute.test(path) && cookieFrom(headers, challengeCookie) !== undefined ? 'twoFactor' : undefined;
     if (!locking)
         return Object.assign(auth, helpers);
     // On the instance the app holds, better-auth's own password sign-in has no limit, no lock and no constant-cost check,
     // so it is off: the route (any case, any trailing slash) answers 404 and api.signInEmail throws.
+    // A sign-in's two-factor challenge is completed only through verifyTwoFactor, under the account's lock, for the same
+    // reason; verification with a session (enabling two-factor) carries no challenge cookie and still goes through.
     if (options.allowRawPasswordSignIn !== true) {
         const route = auth.handler.bind(auth);
-        const routed = (request) => passwordRoute.test(new URL(request.url).pathname) ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
+        const routed = (request) => signInKind(new URL(request.url).pathname, request.headers) ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
         Object.assign(auth, { handler: routed, fetch: routed });
-        Object.assign(auth.api, { signInEmail() { throw new TypeError('Password sign-in is only supported through signInWithPassword.'); } });
+        const api = auth.api;
+        Object.assign(api, { signInEmail() { throw new TypeError('Password sign-in is only supported through signInWithPassword.'); } });
+        for (const name of twoFactorEndpoints) {
+            const original = api[name];
+            if (typeof original === 'function')
+                api[name] = input => {
+                    if (cookieFrom(input?.headers, challengeCookie) !== undefined)
+                        throw new TypeError('A two-factor sign-in challenge is only completed through verifyTwoFactor.');
+                    return original(input);
+                };
+        }
     }
     const { lockTimeoutMs = 5000 } = options;
     if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000)
         throw new TypeError('lockTimeoutMs must be an integer from 1 to 600000.');
     const slots = boundedSlots(options.passwordVerification);
+    const { concurrency: laneConcurrency = 1, queue: laneQueue = 20, waitMs: laneWaitMs = options.passwordVerification?.waitMs } = options.passwordVerification?.knownDevices ?? {};
+    const lane = boundedSlots({ concurrency: laneConcurrency, queue: laneQueue, waitMs: laneWaitMs }, 'passwordVerification.knownDevices');
+    const claims = boundedSlots(device.claims, 'knownDeviceClaims');
     void modernDummy();
     /**
      * Binds an instance to the transaction for `run`. The callback gets its own transaction object over a guarded view of
@@ -401,7 +561,7 @@ function build(options, keys, locking, internal = {}) {
      * held). When `run` settles, before COMMIT, the view and the instance close: a later or un-awaited call throws
      * LockedAuthClosedError instead of running outside the lock on a connection back in the pool.
      */
-    const bind = async (tx, hold, run, passwordSignIn = false) => {
+    const bind = async (tx, hold, run, allowed) => {
         // drizzle-orm internals, as transaction() in ./db reads them; drizzle-orm is pinned exactly for this reason.
         const { dialect, _: { session: inner } } = tx;
         const connection = inner.client;
@@ -418,32 +578,45 @@ function build(options, keys, locking, internal = {}) {
             },
         });
         const callbackTx = new NodePgTransaction(dialect, new NodePgSession(guarded, dialect, inner.schema, inner.options), inner.schema);
-        // For signInWithPassword: the account better-auth's sign-in created a session for, to compare with the locked one.
+        // For signInWithPassword and verifyTwoFactor: the account better-auth's sign-in created a session for, to compare
+        // with the locked one.
         let signedIn;
-        const bound = build({ ...options, database: transactionDatabase(callbackTx) }, keys, false, passwordSignIn ? { signedIn(userId) { signedIn = userId; } } : {});
+        const bound = build({ ...options, database: transactionDatabase(callbackTx) }, keys, false, allowed ? { signedIn(userId) { signedIn = userId; } } : {});
         Object.defineProperty(bound, signedInUser, { value: () => signedIn });
         // signInEmail holds this transaction's connection and lock while it hashes; only signInWithPassword, after its own
-        // check outside any transaction, may call it here.
-        const stalls = 'Password sign-in inside a locked-auth transaction holds a pool connection while it hashes; use signInWithPassword.';
-        const check = (signIn) => {
+        // check outside any transaction, may call it here. A challenge is completed only by verifyTwoFactor, which checks
+        // the account first.
+        const refusals = {
+            password: 'Password sign-in inside a locked-auth transaction holds a pool connection while it hashes; use signInWithPassword.',
+            twoFactor: 'A two-factor sign-in challenge is only completed through verifyTwoFactor.',
+        };
+        const check = (kind) => {
             if (!open)
                 throw closed();
-            if (signIn && !passwordSignIn)
-                throw new TypeError(stalls);
+            if (kind && kind !== allowed)
+                throw new TypeError(refusals[kind]);
         };
+        const apiKind = (key, input) => key === 'signInEmail' ? 'password'
+            : twoFactorEndpoints.includes(key) && cookieFrom(input?.headers, challengeCookie) !== undefined ? 'twoFactor' : undefined;
         const api = bound.api;
         const handler = bound.handler.bind(bound);
         Object.assign(bound, {
             userId: hold.userId,
             api: new Proxy(api, { get(target, key) {
                     const value = target[key];
-                    return typeof value === 'function' ? (...args) => { check(key === 'signInEmail'); return value.apply(target, args); } : value;
+                    return typeof value === 'function' ? (...args) => { check(apiKind(key, args[0])); return value.apply(target, args); } : value;
                 } }),
-            handler(request) { check(passwordRoute.test(new URL(request.url).pathname)); return handler(request); },
+            handler(request) { check(signInKind(new URL(request.url).pathname, request.headers)); return handler(request); },
             // better-auth's fetch is the same handler; it gets the same checks.
-            fetch(request) { check(passwordRoute.test(new URL(request.url).pathname)); return handler(request); },
-            async revokeAllSessions() { check(false); if (hold.userId !== undefined)
-                await (await storeOf(bound)).internalAdapter.deleteUserSessions(hold.userId); },
+            fetch(request) { check(signInKind(new URL(request.url).pathname, request.headers)); return handler(request); },
+            async revokeAllSessions() {
+                check(undefined);
+                if (hold.userId === undefined)
+                    return;
+                const store = await storeOf(bound);
+                await store.internalAdapter.deleteUserSessions(hold.userId);
+                await forgetDevices(store.adapter, hold.userId);
+            },
         });
         const unmark = markLockedAuth({ email: hold.email }, callbackTx, connection);
         try {
@@ -471,12 +644,29 @@ function build(options, keys, locking, internal = {}) {
         const outside = {};
         if (await getCurrentAdapter(outside) !== outside)
             throw new TypeError('withLockedAuth cannot run inside a better-auth request or hook.');
-        await emailIndex(db);
+        await instanceSchema(db);
+    };
+    /** The database schema, then the adapter's user model: it must map closed_at as closedAt, which the reset checks read. */
+    let adapterChecked;
+    const instanceSchema = async (db) => {
+        await schemaOf(db);
+        adapterChecked = recheckable(adapterChecked, async () => {
+            // Drizzle cannot build a select of an unmapped field and throws a TypeError; any other failure is reported as it is.
+            try {
+                await storedAccount((await storeOf(auth)).adapter, { field: 'id', value: '' });
+            }
+            catch (error) {
+                if (error instanceof TypeError)
+                    throw new SchemaMismatchError(['closedAt (closed_at) in the adapter\'s user model']);
+                throw error;
+            }
+        });
+        return adapterChecked.check;
     };
     // Parameterised raw statements by necessity: Drizzle has no builder for set_config or advisory locks. The timeout comes
     // first, so the lock statements that follow cannot wait forever.
     const limitLockWaits = (tx) => tx.execute(sql `SELECT set_config('lock_timeout', ${`${lockTimeoutMs}ms`}, true)`);
-    const byEmail = (db, address, run, passwordSignIn) => transaction(db, async (tx) => {
+    const byEmail = (db, address, run, allowed) => transaction(db, async (tx) => {
         await limitLockWaits(tx);
         await tx.execute(sql `SELECT pg_advisory_xact_lock(${emailLockKey}, hashtext(${address}))`);
         // lower() on both sides, as user_email_normalized_idx is defined, whatever JavaScript's lowercasing did. That index
@@ -484,8 +674,52 @@ function build(options, keys, locking, internal = {}) {
         const rows = await tx.select({ id: userTable.id }).from(userTable).where(sql `lower(${userTable.email}) = lower(${address})`).for('no key update');
         if (rows.length > 1)
             throw new AmbiguousAccountError();
-        return bind(tx, { userId: rows[0]?.id, email: address }, (auth, bound) => run(auth, bound, rows[0]?.id), passwordSignIn);
+        return bind(tx, { userId: rows[0]?.id, email: address }, (auth, bound) => run(auth, bound, rows[0]?.id), allowed);
     });
+    /**
+     * The id of the attempt row claimed for this browser's known device of the account behind `address`, or undefined.
+     * True only when an entry's tag verifies for that account, its device row exists, belongs to that user and has not
+     * expired, and fewer than `device.attempts` attempts are claimed since its last success. The tag is checked on a plain
+     * read first, so a forged or foreign cookie takes no lock; the claim itself runs under the account's email and user
+     * locks, so concurrent attempts claim exactly.
+     */
+    const claimDevice = async (db, address, headers) => {
+        const store = await storeOf(auth);
+        const entries = deviceEntries(cookieFrom(headers, store.createAuthCookie(device.cookie).name));
+        if (!entries.length)
+            return undefined;
+        // At most `device.claims` claims at once in this process (each one pool read, then one short locked transaction)
+        // and a few waiting; past that the browser counts as not known, so its cookie never holds more of the pool than that.
+        const release = await claims();
+        if (!release)
+            return undefined;
+        try {
+            return await claimed(db, address, entries);
+        }
+        finally {
+            release();
+        }
+    };
+    const claimed = async (db, address, entries) => {
+        const [account] = await db.select({ id: userTable.id }).from(userTable).where(sql `lower(${userTable.email}) = lower(${address})`).limit(1);
+        const entry = account ? deviceFor(keys, account.id, entries) : undefined;
+        if (!account || !entry)
+            return undefined;
+        // Two accounts at one email (the index dropped after start-up) claim nothing; the sign-in itself refuses them.
+        return byEmail(db, address, async (bound, _tx, userId) => {
+            if (userId !== account.id)
+                return undefined;
+            const { adapter, internalAdapter } = await storeOf(bound);
+            const row = await adapter.findOne({ model: 'verification', where: [{ field: 'identifier', value: deviceRow(entry.deviceId) }] });
+            const expiresAt = row ? new Date(row.expiresAt) : undefined;
+            if (!row || row.value !== userId || !expiresAt || !(expiresAt.getTime() > Date.now()))
+                return undefined;
+            if (await adapter.count({ model: 'verification', where: [{ field: 'identifier', value: attemptRow(entry.deviceId) }] }) >= device.attempts)
+                return undefined;
+            return (await internalAdapter.createVerificationValue({ identifier: attemptRow(entry.deviceId), value: userId, expiresAt })).id;
+        }).catch(error => { if (error instanceof AmbiguousAccountError)
+            return undefined; throw error; });
+    };
     const locked = {
         async withLockedAuth(db, userId, run) {
             await ready(db, run);
@@ -504,12 +738,13 @@ function build(options, keys, locking, internal = {}) {
             if (typeof email !== 'string')
                 throw new TypeError('withLockedAuthByEmail needs an email.');
             // Normalised as the team controller's lockEmail does, so both take the same advisory lock.
-            return byEmail(db, email.trim().toLowerCase(), run, false);
+            return byEmail(db, email.trim().toLowerCase(), run);
         },
-        async signInWithPassword(db, input, limit) {
-            if (typeof limit !== 'function')
-                throw new TypeError('signInWithPassword needs the app\'s rate limit.');
-            await ready(db, limit);
+        async signInWithPassword(db, input, limits) {
+            const { source: sourceLimit, account: accountLimit } = (limits ?? {});
+            if (typeof sourceLimit !== 'function' || typeof accountLimit !== 'function')
+                throw new TypeError('signInWithPassword needs the app\'s rate limits: { source, account }.');
+            await ready(db, accountLimit);
             const { email, password, source, rememberMe, headers } = (input ?? {});
             if (typeof source !== 'string' || !source)
                 throw new TypeError('signInWithPassword needs the request\'s source (the client address the app derived).');
@@ -520,21 +755,47 @@ function build(options, keys, locking, internal = {}) {
             if (crossSite(headers, origin))
                 return refusal(403, 'CROSS_SITE_SIGN_IN', 'Sign in from this site.');
             const address = email.trim().toLowerCase();
-            // 1. The app's limits, per source and per account, counted before any read, hash or queue: a flood of guesses costs
-            // a counter, and one source cannot fill the verification queue.
-            if (await limit({ email: address, source }) !== true)
-                return refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.');
+            const tooMany = (answer) => refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.', { 'retry-after': String(retryAfter(answer)) });
+            // 1. The app's per-source limits, counted before anything touches the database: a flood the app refuses costs a
+            // counter, never a pool connection, and one source cannot fill the verification queue.
+            const sourceAnswer = await sourceLimit({ email: address, source });
+            if (sourceAnswer !== true)
+                return tooMany(sourceAnswer);
+            // 2. Whether this browser is a known device of the account behind this email: it then claims one of the device's
+            // attempts (released again below unless the password was checked). It never authenticates; it only tells the app.
+            const claim = await claimDevice(db, address, headers);
+            const unclaim = async () => { if (claim)
+                await (await storeOf(auth)).adapter.delete({ model: 'verification', where: [{ field: 'id', value: claim }] }); };
+            // 3. The app's account-wide limit, which may spare a known device its bucket, still before any hash or queue.
+            let allowed;
+            try {
+                allowed = await accountLimit({ email: address, source, knownDevice: claim !== undefined });
+            }
+            catch (error) {
+                await unclaim();
+                throw error;
+            }
+            if (allowed !== true) {
+                await unclaim();
+                return tooMany(allowed);
+            }
             // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
             if (password.length > ten98AuthPolicy.password.maxLength)
                 return refused();
-            // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads.
-            const release = await slots();
-            if (!release)
+            // 4. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
+            // known-device claim was verified above (a database read, before anything that differs between a real and an
+            // unknown account) takes the reserved lane and only the lane, so a flood cannot crowd it out and many valid
+            // cookies cannot take shared capacity. Every other attempt (an unknown email, an account without a cookie, a
+            // forged, revoked or foreign cookie) takes the shared queue under one rule, so none can be told apart.
+            const release = claim !== undefined ? await lane() : await slots();
+            if (!release) {
+                await unclaim();
                 return refusal(503, 'SIGN_IN_BUSY', 'Sign-in is busy. Try again shortly.', { 'retry-after': '1' });
-            let verified;
+            }
+            let verified, stored;
             try {
-                // 3. One short pool read; its connection is back in the pool before any hashing starts.
-                const [stored] = await db.select({ password: accountTable.password }).from(userTable)
+                // 5. One short pool read; its connection is back in the pool before any hashing starts.
+                [stored] = await db.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt, password: accountTable.password }).from(userTable)
                     .leftJoin(accountTable, and(eq(accountTable.userId, userTable.id), eq(accountTable.providerId, 'credential')))
                     .where(sql `lower(${userTable.email}) = lower(${address})`).limit(1);
                 verified = await verifyStoredPassword(stored?.password, password, legacyPasswords);
@@ -544,18 +805,20 @@ function build(options, keys, locking, internal = {}) {
             }
             if (!verified)
                 return refused();
-            // 4. Only a correct password takes the lock; better-auth verifies again there and creates the session, for the
+            // An account that may not sign in is refused here, at a wrong password's cost, rather than after the lock; the lock
+            // asks again, for an account closed in between.
+            if (await usable({ id: stored.id, email: stored.email, closedAt: stored.closedAt }) !== true)
+                return refused();
+            // 6. Only a correct password takes the lock; better-auth verifies again there and creates the session, for the
             // locked account only.
             let response;
             try {
                 response = await byEmail(db, address, async (bound, tx, userId) => {
-                    // No account under the lock (its email moved before the lock was granted), or one that may not sign in: the
-                    // uniform 401, after the derivation the sign-in would have cost.
+                    // No account under the lock (its email moved before the lock was granted), or one closed since the check above:
+                    // the uniform 401.
                     const [account] = userId === undefined ? [] : await tx.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt }).from(userTable).where(eq(userTable.id, userId));
-                    if (!account || await usable(account) !== true) {
-                        await lockedCost(password);
+                    if (!account || await usable(account) !== true)
                         return refused();
-                    }
                     const signedIn = await bound.api.signInEmail({ body: { email: address, password, ...(rememberMe === undefined ? {} : { rememberMe }) }, ...(headers === undefined ? {} : { headers }), asResponse: true });
                     if (signedIn.ok) {
                         // A session (or challenge) for any other account than the locked one rolls the transaction back.
@@ -565,7 +828,7 @@ function build(options, keys, locking, internal = {}) {
                             await replaceLegacyHash(tx, account.id, password);
                     }
                     return signedIn;
-                }, true);
+                }, 'password');
             }
             catch (error) {
                 if (error instanceof LockedAccountMismatch || error instanceof AmbiguousAccountError)
@@ -578,15 +841,45 @@ function build(options, keys, locking, internal = {}) {
             return response.status === 401 ? refused() : response;
         },
         assertEmailIndex: db => emailIndex(db),
-    };
-    /** The isAccountUsable hook, refusing a closed account by default. */
-    const usable = (account) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
-    /** What better-auth's own check under the lock costs: both verifiers with legacy hashes accepted, else the current one. */
-    const lockedCost = async (candidate) => {
-        if (legacyPasswords)
-            await verifyStoredPassword(undefined, candidate, true);
-        else
-            await verifyPassword({ hash: await modernDummy(), password: candidate }).catch(() => false);
+        assertSchema: db => instanceSchema(db),
+        async verifyTwoFactor(db, request) {
+            await ready(db, () => undefined);
+            if (!(request instanceof Request) || !challengeRoute.test(new URL(request.url).pathname))
+                throw new TypeError('verifyTwoFactor completes a request to /two-factor/verify-totp, -backup-code or -otp.');
+            // The challenge the signed two_factor cookie names, and the account it was issued for.
+            const identifier = signedValue(cookieFrom(request.headers, challengeCookie), secret);
+            const challenge = identifier === undefined ? null
+                : await (await storeOf(auth)).adapter.findOne({ model: 'verification', where: [{ field: 'identifier', value: identifier }] });
+            if (!challenge || !(new Date(challenge.expiresAt).getTime() > Date.now()))
+                return challengeRefused();
+            let response;
+            try {
+                response = await transaction(db, async (tx) => {
+                    await limitLockWaits(tx);
+                    const [row] = await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, challenge.value)).for('no key update');
+                    if (!row)
+                        return challengeRefused();
+                    return bind(tx, { userId: row.id, email: undefined }, async (bound, boundTx) => {
+                        // An account closed (or otherwise refused) after its challenge was issued does not complete the sign-in.
+                        const [account] = await boundTx.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt }).from(userTable).where(eq(userTable.id, row.id));
+                        if (!account || await usable(account) !== true)
+                            return challengeRefused();
+                        const verified = await bound.handler(request);
+                        if (verified.ok && bound[signedInUser]() !== account.id)
+                            throw new LockedAccountMismatch();
+                        return verified;
+                    }, 'twoFactor');
+                });
+            }
+            catch (error) {
+                if (error instanceof LockedAccountMismatch)
+                    return challengeRefused();
+                if (error instanceof TransactionRolledBackError)
+                    return refusal(500, 'SIGN_IN_FAILED', 'Sign-in failed. Try again.');
+                throw error;
+            }
+            return response.status === 401 ? challengeRefused() : response;
+        },
     };
     /**
      * Replaces a legacy hash once, under the lock, in a savepoint: a failure (a trigger, a constraint) rolls back the
@@ -615,6 +908,31 @@ const modernDummy = () => (dummyModernHash ??= hashPassword('ten98-timing-equali
 const lockedContext = new AsyncLocalStorage();
 /** better-auth's password route, in any case and with any trailing slash. */
 const passwordRoute = /\/sign-in\/email\/*$/i;
+/** The two-factor routes that complete a sign-in's challenge, in any case and with any trailing slash. */
+const challengeRoute = /\/two-factor\/verify-(?:totp|backup-code|otp)\/*$/i;
+const twoFactorPaths = new Set(['/two-factor/verify-totp', '/two-factor/verify-backup-code', '/two-factor/verify-otp']);
+/** The two-factor plugin's server calls for those routes. */
+const twoFactorEndpoints = ['verifyTOTP', 'verifyBackupCode', 'verifyTwoFactorOTP'];
+/** The value of a cookie better-call signed with `secret`, or undefined when it is missing, malformed or forged. */
+function signedValue(cookie, secret) {
+    if (cookie === undefined || cookie.length > 512)
+        return undefined;
+    let decoded;
+    try {
+        decoded = decodeURIComponent(cookie);
+    }
+    catch {
+        return undefined;
+    }
+    const at = decoded.lastIndexOf('.');
+    if (at < 1)
+        return undefined;
+    const value = decoded.slice(0, at), signature = Buffer.from(decoded.slice(at + 1));
+    const expected = Buffer.from(createHmac('sha256', secret).update(value).digest('base64'));
+    return signature.length === expected.length && timingSafeEqual(signature, expected) ? value : undefined;
+}
+/** One answer for a challenge that is unknown, expired or for an account that may not sign in, and for a wrong code. */
+const challengeRefused = () => refusal(401, 'INVALID_TWO_FACTOR', 'Invalid two-factor code or challenge.');
 /** Where a bound instance keeps the account its password sign-in created a session for. */
 const signedInUser = Symbol('ten98.auth.signedInUser');
 /** better-auth signed in another account than the one signInWithPassword locked; thrown so the transaction rolls back. */
@@ -630,22 +948,83 @@ export class MissingEmailIndexError extends Error {
     code = 'MISSING_EMAIL_INDEX';
     constructor() { super('The user table needs a unique index on lower(email) (user_email_normalized_idx in workspace-team.sql) before locked auth can run.'); this.name = 'MissingEmailIndexError'; }
 }
-// One check per database object. A missing index is remembered, so every later call is refused too; a failed query is
-// not, so a transient error is retried.
+/** The tables and columns locked auth reads or writes directly, as workspace-team.sql and better-auth's schema name them. */
+const schemaTables = {
+    user: [userTable.id.name, userTable.email.name, userTable.closedAt.name],
+    account: [accountTable.userId.name, accountTable.providerId.name, accountTable.password.name, accountTable.updatedAt.name],
+    session: ['id', 'token', 'userId', 'expiresAt'],
+    verification: ['id', 'identifier', 'value', 'expiresAt'],
+};
+/** The schema is not the one locked auth uses: the tables or columns it names are missing. */
+export class SchemaMismatchError extends Error {
+    code = 'AUTH_SCHEMA_MISMATCH';
+    missing;
+    constructor(missing) {
+        const expected = Object.entries(schemaTables).map(([table, columns]) => `${table === 'user' ? '"user"' : table} (${columns.join(', ')})`).join(', ');
+        super(`Locked auth needs the tables ${expected}. Missing: ${missing.join('; ')}. An app whose tables have other names (users, accounts, sessions, verifications) must rename or map them before adopting.`);
+        this.name = 'SchemaMismatchError';
+        this.missing = missing;
+    }
+}
+/** How long a failed start-up check is answered from memory before it runs again. */
+const recheckMs = 2000;
+/**
+ * The check in `entry`, or a new run of `run`: a pass (or a run in flight) is kept for good; a failure is answered from
+ * memory for `recheckMs`, then checked again, so fixing the schema needs no restart and a wrong one costs one query per
+ * interval, not one per attempt.
+ */
+function recheckable(entry, run) {
+    if (entry && Date.now() < entry.retryAt)
+        return entry;
+    const fresh = { check: run(), retryAt: Number.POSITIVE_INFINITY };
+    fresh.check.catch(() => { fresh.retryAt = Date.now() + recheckMs; });
+    return fresh;
+}
+const schemaChecks = new WeakMap();
+/** The tables and columns, then the email index; cached per database like the index check. */
+function schemaOf(db) {
+    const entry = recheckable(schemaChecks.get(db), () => 
+    // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
+    db.execute(sql `SELECT t.name, a.attname AS "column" FROM unnest(string_to_array(${Object.keys(schemaTables).join(',')}, ',')) AS t(name)
+        LEFT JOIN pg_attribute a ON a.attrelid = to_regclass(quote_ident(t.name)) AND a.attnum > 0 AND NOT a.attisdropped`)
+        .then(result => {
+        const found = new Map();
+        for (const { name, column } of result.rows) {
+            const columns = found.get(name) ?? new Set();
+            if (column)
+                columns.add(column);
+            found.set(name, columns);
+        }
+        const missing = Object.entries(schemaTables).flatMap(([table, columns]) => {
+            const present = found.get(table);
+            const label = table === 'user' ? '"user"' : table;
+            if (!present?.size)
+                return [`table ${label}`];
+            return columns.filter(column => !present.has(column)).map(column => `${label}.${column}`);
+        });
+        if (missing.length)
+            throw new SchemaMismatchError(missing);
+    })
+        .then(() => emailIndex(db)));
+    schemaChecks.set(db, entry);
+    return entry.check;
+}
+// One check per database object, kept like the schema check: a pass for good, a refusal for `recheckMs`.
 const emailIndexChecks = new WeakMap();
 function emailIndex(db) {
-    let check = emailIndexChecks.get(db);
-    if (!check) {
-        // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
-        check = db.execute(sql `SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${`"${getTableName(userTable)}"`})
-        AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indnatts = 1 AND pg_get_expr(i.indexprs, i.indrelid) = 'lower(email)') AS indexed`)
-            .then(result => { if (result.rows[0]?.indexed !== true)
-            throw new MissingEmailIndexError(); });
-        check.catch(error => { if (!(error instanceof MissingEmailIndexError))
-            emailIndexChecks.delete(db); });
-        emailIndexChecks.set(db, check);
-    }
-    return check;
+    const entry = recheckable(emailIndexChecks.get(db), () => 
+    // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
+    db.execute(sql `SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${`"${getTableName(userTable)}"`})
+        AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indnatts = 1 AND (
+          -- lower(email) on a text column, or lower(email::text) on a varchar one
+          pg_get_expr(i.indexprs, i.indrelid) IN ('lower(email)', 'lower((email)::text)')
+          -- or a plain unique index on a citext email column, which compares case-insensitively itself
+          OR (i.indexprs IS NULL AND EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+            WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[0] AND a.attname = 'email' AND t.typname = 'citext')))) AS indexed`)
+        .then(result => { if (result.rows[0]?.indexed !== true)
+        throw new MissingEmailIndexError(); }));
+    emailIndexChecks.set(db, entry);
+    return entry.check;
 }
 /** Both verifiers on every attempt, one of them against a dummy; true only for a stored hash the password matches. */
 async function verifyStoredPassword(hash, candidate, legacyAccepted) {
@@ -664,16 +1043,21 @@ function crossSite(headers, origin) {
     return (from !== null && from !== origin) || site === 'cross-site' || site === 'same-site';
 }
 const refusal = (status, code, message, headers = {}) => new Response(JSON.stringify({ code, message }), { status, headers: { 'content-type': 'application/json', ...headers } });
+/** The wait a limiter's refusal names: its `retryAfterSeconds` when that is an integer from 1 to 86400, otherwise 60. */
+function retryAfter(answer) {
+    const seconds = answer?.retryAfterSeconds;
+    return typeof seconds === 'number' && Number.isInteger(seconds) && seconds >= 1 && seconds <= 86_400 ? seconds : 60;
+}
 /** One answer for an unknown email, a wrong password and an account without a password. */
 const refused = () => refusal(401, 'INVALID_EMAIL_OR_PASSWORD', 'Invalid email or password');
 /**
  * At most `concurrency` holders at once and `queue` waiting, each for at most `waitMs`. Resolves a release function, or
  * undefined when no slot came in time or the queue is full, so a caller is answered instead of left waiting.
  */
-function boundedSlots({ concurrency = 2, queue = 100, waitMs = 15_000 } = {}) {
+function boundedSlots({ concurrency = 2, queue = 100, waitMs = 15_000 } = {}, label = 'passwordVerification') {
     for (const [name, value] of Object.entries({ concurrency, queue, waitMs })) {
         if (!Number.isInteger(value) || value < (name === 'concurrency' ? 1 : 0))
-            throw new TypeError(`passwordVerification.${name} must be a whole number${name === 'concurrency' ? ' of at least 1' : ''}.`);
+            throw new TypeError(`${label}.${name} must be a whole number${name === 'concurrency' ? ' of at least 1' : ''}.`);
     }
     let active = 0;
     const waiting = [];

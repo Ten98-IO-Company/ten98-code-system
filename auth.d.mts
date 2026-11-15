@@ -108,11 +108,19 @@ export interface Ten98AuthOptions {
      * The bound on concurrent `signInWithPassword` verifications in this process: `concurrency` at once (2 by default,
      * each running two scrypt derivations, which together fill libuv's default four threads), at most `queue` waiting
      * (100), each for at most `waitMs` (15000). Past either bound the attempt is answered 503, never left waiting.
+     * `knownDevices` is the reserved lane for an attempt whose known-device claim was verified (1 at once, 20 waiting,
+     * the same `waitMs` by default): such an attempt uses only the lane, so it never takes shared capacity. Its
+     * verifications share the hashing threads: count its `concurrency` in when sizing `UV_THREADPOOL_SIZE`.
      */
     passwordVerification?: {
         concurrency?: number;
         queue?: number;
         waitMs?: number;
+        knownDevices?: {
+            concurrency?: number;
+            queue?: number;
+            waitMs?: number;
+        };
     };
     /** The app's public URL (APP_URL); validated with `appOrigin`. */
     appUrl: string;
@@ -131,8 +139,10 @@ export interface Ten98AuthOptions {
     /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
     cookiePrefix?: string;
     /**
-     * Whether an account may sign in with its password, asked under the account's lock in `signInWithPassword`; anything
-     * but `true` gets the uniform 401. Defaults to refusing a closed account (`closedAt` set).
+     * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
+     * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
+     * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
+     * Defaults to refusing a closed account (`closedAt` set).
      */
     isAccountUsable?(account: {
         id: string;
@@ -231,23 +241,41 @@ export interface Ten98Auth {
     withLockedAuthByEmail<TDatabase extends AnyDatabase, T>(db: TDatabase, email: string, run: (auth: LockedTen98Auth, tx: ScopedTransaction<TDatabase>, userId: string | undefined) => Promise<T>): Promise<T>;
     /**
      * The supported password sign-in. A browser request from another site (an Origin other than `appUrl`'s, or a
-     * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: `limit` (the app's per-source and per-account limits, evaluated and counted
-     * before anything else; anything but `true` answers 429); a slot among the bounded verifications (503 when none is
-     * free in time); one short pool read of the credential, its connection released; both the modern and the legacy
+     * cross-site Sec-Fetch-Site in `headers`) is answered 403 first. Then, in order: `limits.source` (the app's per-source
+     * and per-pair limits, before anything touches the database); whether the browser's known-device cookie holds a live
+     * device of the account behind `email` (`knownDevice`; see the guide); `limits.account` (the app's account-wide limit,
+     * which may skip its bucket for a known device); anything but `true` at either step answers 429; a slot among the
+     * bounded verifications (503 when none is free in time); one short pool read of the credential, its connection
+     * released; both the modern and the legacy
      * verifier, one of them against a fixed dummy, outside any transaction. A wrong password, an unknown email and an
      * account without a password all get the same 401. Only a correct password enters `withLockedAuthByEmail`, where
      * better-auth verifies again under the lock and creates the session (a legacy hash is replaced there once); if the
      * password changed in between, the answer is the same 401 and no session is created. The response carries the
      * session cookie, or the two-factor challenge, as `/sign-in/email` does.
      */
-    signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: PasswordAttempt) => boolean | Promise<boolean>): Promise<Response>;
+    signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limits: PasswordSignInLimits): Promise<Response>;
     /**
      * Resolves when the user table has the unique index on `lower(email)` that the locked lookups rely on, and rejects
      * otherwise. Call it at start-up; every locked call also checks it once per database and refuses to run without it.
      */
     assertEmailIndex(db: AnyDatabase): Promise<void>;
+    /**
+     * The start-up check: resolves when the tables `"user"`, `account`, `session` and `verification` have the columns the
+     * preset uses and the user table has its unique index on `lower(email)`; otherwise rejects with SchemaMismatchError
+     * (naming the expected and the missing tables and columns) or MissingEmailIndexError. Every locked call runs it once
+     * per database too, so a wrong schema fails loudly, never as a refused sign-in.
+     */
+    assertSchema(db: AnyDatabase): Promise<void>;
+    /**
+     * Completes a sign-in's two-factor challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
+     * `two_factor` cookie) under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge that is
+     * unknown or expired, gets one uniform 401, and a session for any other account rolls back. The instance the app holds
+     * refuses a challenge outside it. Pass the request as received; verification with a session (enabling two-factor) still
+     * goes to `handler`.
+     */
+    verifyTwoFactor(db: AnyDatabase, request: Request): Promise<Response>;
 }
-/** `signInWithPassword`'s input; `headers` are the request's, for the session's user agent and address. */
+/** `signInWithPassword`'s input; `headers` are the request's: its origin, its cookies, its user agent and address. */
 export type PasswordSignIn = {
     email: string;
     password: string;
@@ -256,19 +284,38 @@ export type PasswordSignIn = {
     headers?: HeadersInit;
 };
 /**
- * What `signInWithPassword` gives the app's limiter, before any hash and before the verification queue: the normalised
- * email, and `source`, the client address the app derived for the request (`clientLimitKey` of its trusted address), so
- * it counts per source as well as per account.
+ * What `signInWithPassword` gives the app's limiter: the normalised email; `source`, the client address the app derived
+ * for the request (`clientLimitKey` of its trusted address); and, at the account step, `knownDevice`, whether this
+ * browser is a known device of that account.
  */
 export type PasswordAttempt = {
     email: string;
     source: string;
+    knownDevice: boolean;
+};
+/**
+ * One step's answer: `true` allows the attempt; `{ retryAfterSeconds }` (an integer from 1 to 86400) refuses it with that
+ * wait; `false`, or anything else, refuses it with a wait of 60 seconds. Every refusal is a 429 with `Retry-After`.
+ */
+export type PasswordLimitAnswer = boolean | {
+    retryAfterSeconds: number;
+};
+/**
+ * The app's limiter for `signInWithPassword`, asked in two steps. `source` comes first, before anything touches the
+ * database: the per-source and per-pair (source and email) limits, so a flood the app refuses costs a counter and nothing
+ * else. Only an attempt it allows has its known-device cookie checked; `account` then gets `knownDevice` and may skip the
+ * account-wide bucket for it, and only that bucket. Both are asked before the password is checked: count an attempt
+ * against the failure buckets once its response is the 401, never on a 429 or a success.
+ */
+export type PasswordSignInLimits = {
+    source(attempt: Omit<PasswordAttempt, 'knownDevice'>): PasswordLimitAnswer | Promise<PasswordLimitAnswer>;
+    account(attempt: PasswordAttempt): PasswordLimitAnswer | Promise<PasswordLimitAnswer>;
 };
 /**
  * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
  * in with a password (use `signInWithPassword`), and throws LockedAuthClosedError once the callback has returned.
  */
-export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword' | 'assertEmailIndex'> {
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword' | 'assertEmailIndex' | 'assertSchema' | 'verifyTwoFactor'> {
     /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
     readonly userId: string | undefined;
     /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
@@ -290,4 +337,10 @@ export declare class AmbiguousAccountError extends Error {
 export declare class MissingEmailIndexError extends Error {
     readonly code: 'MISSING_EMAIL_INDEX';
     constructor();
+}
+/** The schema is not the one locked auth uses: the tables or columns it names are missing. */
+export declare class SchemaMismatchError extends Error {
+    readonly code: 'AUTH_SCHEMA_MISMATCH';
+    readonly missing: readonly string[];
+    constructor(missing: readonly string[]);
 }

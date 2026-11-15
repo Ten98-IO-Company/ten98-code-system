@@ -191,7 +191,8 @@
         "LockedAuthUserNotFoundError",
         "LockedAuthClosedError",
         "AmbiguousAccountError",
-        "MissingEmailIndexError"
+        "MissingEmailIndexError",
+        "SchemaMismatchError"
       ],
       "tests": [
         "tests/auth.test.mts",

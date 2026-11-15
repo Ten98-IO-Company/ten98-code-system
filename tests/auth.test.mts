@@ -321,7 +321,7 @@ const hmacOf = (label: string, value: string) => createHmac('sha256', keyFor(lab
 const expectedHandle = (token: string) => `v1.${hmacOf('ten98-auth:session-token:v1', token)}`;
 const expectedIdentifier = (identifier: string): string => {
   if (identifier.startsWith('2fa-attempts-')) return `2fa-attempts-${expectedIdentifier(identifier.slice('2fa-attempts-'.length))}`;
-  const prefix = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:'].find(candidate => identifier.startsWith(candidate));
+  const prefix = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:', 'known-device-attempt:', 'known-device:'].find(candidate => identifier.startsWith(candidate));
   const label = 'ten98-auth:verification-identifier:v1';
   return prefix ? prefix + hmacOf(label, identifier.slice(prefix.length)) : `v1.${hmacOf(label, identifier)}`;
 };
@@ -367,7 +367,36 @@ test('every better-auth 1.7.7 session-token path is one the storage wrapper was 
 test('only the reviewed plugins run: no multi-session (its deleteSessions deletes by a listed handle) and no admin', () => {
   const { auth } = setup();
   const ids = (auth as unknown as { options: { plugins: { id: string }[] } }).options.plugins.map(plugin => plugin.id);
-  assert.deepEqual(ids, ['two-factor', 'ten98-oidc-session', 'ten98-session-revocation']);
+  assert.deepEqual(ids, ['two-factor', 'ten98-oidc-session', 'ten98-session-revocation', 'ten98-known-device']);
+});
+
+test('a known device is issued only when a sign-in completes: after the second factor, never while it is pending or when enabling it', async () => {
+  const env = setup();
+  const device = (response: Response) => cookies(response).find(pair => pair.split('=')[0]!.endsWith('.known_device'));
+  const rows = () => env.db.verification!.filter(row => (row.identifier as string).startsWith('known-device:')).length;
+  const id = await env.user('owner@example.com', await hashPassword(PASSWORD));
+  const signedIn = await env.signIn();
+  assert.ok(device(signedIn));
+  assert.equal(rows(), 1);
+  const cookie = cookieOf(signedIn);
+  const enabled = await (await env.post('/two-factor/enable', { password: PASSWORD }, cookie)).json() as { totpURI: string };
+  // Confirming the factor while enabling it replaces the session, but it is not a sign-in.
+  const confirmed = await env.post('/two-factor/verify-totp', { code: totp(enabled.totpURI) }, cookie);
+  assert.equal(confirmed.status, 200);
+  assert.equal(device(confirmed), undefined);
+  // A pending challenge issues nothing; the challenge completed issues the entry.
+  const challenge = await env.signIn();
+  assert.deepEqual(await challenge.clone().json(), { twoFactorRedirect: true, twoFactorMethods: ['totp'] });
+  assert.equal(device(challenge), undefined);
+  const completed = await env.post('/two-factor/verify-totp', { code: totp(enabled.totpURI, 1) }, cookieOf(challenge));
+  assert.equal(completed.status, 200);
+  assert.ok(device(completed));
+  assert.equal(rows(), 2);
+  // The app's OIDC sign-in: challenged for this account, so nothing yet; a one-factor account gets its entry at once.
+  assert.equal(device(await env.auth.api.completeOidcSession({ body: { oidcUserId: id }, headers: {}, asResponse: true })), undefined);
+  const other = await env.user('sso@example.com');
+  assert.ok(device(await env.auth.api.completeOidcSession({ body: { oidcUserId: other }, headers: {}, asResponse: true })));
+  assert.equal(device(await env.signIn('owner@example.com', 'wrong password here')), undefined);
 });
 
 test('revoke-other ends only the caller\'s own other sessions, and count and deleteMany by token hash the token', async () => {
@@ -479,13 +508,13 @@ test('verification identifiers keep their prefix, hash the rest, and match the e
   assert.ok(stored().includes(agree(`reset-password:${env.resets.at(-1)}`)));
   // The prefixes no flow above creates, written through the same adapter.
   const { internalAdapter } = await env.context;
-  for (const identifier of ['2fa-otp-abc123', 'delete-account-xyz789']) {
+  for (const identifier of ['2fa-otp-abc123', 'known-device:dev123', 'known-device-attempt:dev123', 'delete-account-xyz789']) {
     await internalAdapter.createVerificationValue({ identifier, value: 'x', expiresAt: new Date(Date.now() + 60_000) });
     assert.ok(stored().includes(agree(identifier)), identifier);
   }
   assert.match(agree('delete-account-xyz789'), /^v1\.[A-Za-z0-9_-]{43}$/);
   const text = JSON.stringify(env.db.verification);
-  for (const secret of [challengeId.slice(4), trustId.slice('trust-device-'.length), env.resets.at(-1)!, 'abc123', 'xyz789']) assert.equal(text.includes(secret), false, secret);
+  for (const secret of [challengeId.slice(4), trustId.slice('trust-device-'.length), env.resets.at(-1)!, 'abc123', 'dev123', 'xyz789']) assert.equal(text.includes(secret), false, secret);
 });
 
 test('a reset link works end to end, its stored row cannot be redeemed, and the reset still ends hashed trusted devices', async () => {
