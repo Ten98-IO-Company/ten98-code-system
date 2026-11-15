@@ -598,6 +598,37 @@ function testingTenancyImports(sources) {
     return sources.filter(([, text]) => testingTenancy.test(text))
         .map(([path]) => `${path}: imports the test-only @ten98/runtime/tenancy/testing, which sets a scope without the membership check; only tests outside the data roots may.`);
 }
+// A log call that passes a whole configuration, environment, headers or body object writes every value under it,
+// whatever the redaction paths. This matches text: a level or child call on `log` or `logger` whose arguments name
+// `config`, `getConfig()`, `process.env`, `headers`, `body`, `req.headers`, `request.headers`, `req.body` or
+// `request.body` as a whole, not a field of it (`req.headers.host` passes) and not the first argument of another call
+// (`summary(config)` passes, and so does `JSON.stringify(config)`). Strings and comments are ignored. An alias,
+// another logger name or a spread of a renamed object is not seen.
+const logCall = /\b(?:log|logger)\s*\.\s*(?:debug|info|warn|error|fatal|trace|child)\s*\(/gu;
+const literals = /('(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`)|\/\/[^\n]*|\/\*[\s\S]*?\*\//gu;
+const wholeObject = /(?<![\w$])(?<![^.]\.)(?<![\w$)\]]\s*\(\s*)(?:config|getConfig\s*\(\s*\)|process\.env|headers|body|(?:req|request)\.(?:headers|body))(?!\s*[\w$.[(:?])/u;
+function wholeObjectLogCalls(sources) {
+    const found = [];
+    for (const [path, source] of sources) {
+        const text = source.replace(literals, (_, quoted) => quoted ? "''" : ' ');
+        for (const match of text.matchAll(logCall)) {
+            let depth = 0, end = match.index + match[0].length;
+            const limit = Math.min(text.length, end + 4000);
+            for (; end < limit; end++) {
+                const character = text[end];
+                if ('([{'.includes(character))
+                    depth++;
+                else if (')]}'.includes(character) && depth-- === 0)
+                    break;
+            }
+            if (wholeObject.test(text.slice(match.index + match[0].length, end))) {
+                found.push(`${path}: a log call passes a whole configuration, environment, headers or body object; log only the fields you mean to log.`);
+                break;
+            }
+        }
+    }
+    return found;
+}
 function readAllowlist(directory, policy) {
     const file = resolve(directory, policy.baseline);
     if (!existsSync(file))
@@ -629,7 +660,7 @@ export function checkDataAccess(directory, packageName) {
     directory = resolve(directory);
     const { allowed, errors } = readAllowlist(directory, policy);
     const sources = dataSources(directory, policy);
-    return [...errors, ...testingTenancyImports(sources), ...rawStatementRises(rawStatementCounts(sources), allowed, policy.baseline)];
+    return [...errors, ...testingTenancyImports(sources), ...wholeObjectLogCalls(sources), ...rawStatementRises(rawStatementCounts(sources), allowed, policy.baseline)];
 }
 // Lowers or removes allowlist entries and keeps their reasons; a rise is refused. A missing allowlist is recorded once
 // from current counts. New entries are written with an empty reason, which the check refuses until someone writes it,
