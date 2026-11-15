@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { checkStartEntry, type PackageManifest } from '../check.mjs';
 
 // The parser resolves as in presentation.test.mts, and CI never skips for want of it.
@@ -139,6 +141,34 @@ test('the rule applies to apps that ship Start, and not to a waived profile or t
   assert.match(app({}, { name: 'ten98-campaign', dependencies: { '@tanstack/react-start': '1.168.61' } }).join('\n'), missing);
   // The runtime has Start only as a development and optional peer dependency.
   assert.deepEqual(app({}, { name: '@ten98/runtime', devDependencies: { '@tanstack/react-start': '1.168.61' }, peerDependencies: { '@tanstack/react-start': '1.168.61' } }), []);
+});
+
+test('the CLI runs the Start entry check on a Start app', needsParser, () => {
+  // The CLI reads the canonical declaration beside check.mjs, so a copy of both declares a profile that needs Start
+  // and nothing else. The app sits under work/, where it resolves this package's parser as an installed app would.
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  mkdirSync(join(root, 'work'), { recursive: true });
+  const folder = mkdtempSync(join(root, 'work', 'start-cli-')), checker = join(folder, 'checker'), directory = join(folder, 'app');
+  try {
+    mkdirSync(checker);
+    mkdirSync(join(directory, 'src'), { recursive: true });
+    for (const name of ['check.mjs', 'database-policy.mjs']) copyFileSync(join(root, name), join(checker, name));
+    const contract = JSON.parse(readFileSync(join(root, 'architecture.json'), 'utf8'));
+    contract.profiles['fixture-start'] = { dependencies: { '@tanstack/react-start': '1.168.61' }, devDependencies: {}, sharedDependencies: [], sharedDevDependencies: [], peerDependencies: {}, checkScripts: ['test'], database: { engine: 'postgresql' } };
+    writeFileSync(join(checker, 'architecture.json'), JSON.stringify(contract));
+    writeFileSync(join(directory, 'package.json'), JSON.stringify({ name: 'fixture-start', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
+      dependencies: { '@tanstack/react-start': '1.168.61' }, scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'pnpm check:architecture && node --test' } }));
+    const run = () => spawnSync(process.execPath, [join(checker, 'check.mjs'), directory], { encoding: 'utf8', timeout: 60_000, windowsHide: true });
+    const missing = run();
+    assert.equal(missing.status, 1, missing.stdout + missing.stderr);
+    assert.match(missing.stderr, /: src\/start\.ts is missing/);
+    assert.match(missing.stderr, /: src\/client\.tsx is missing/);
+    writeFileSync(join(directory, 'src', 'start.ts'), START);
+    writeFileSync(join(directory, 'src', 'client.tsx'), CLIENT);
+    const passed = run();
+    assert.equal(passed.status, 0, passed.stdout + passed.stderr);
+    assert.match(passed.stdout, /architecture declarations match fixture-start/);
+  } finally { rmSync(folder, { recursive: true, force: true }); }
 });
 
 test('the Start entry check fails closed without a parser', () => {
