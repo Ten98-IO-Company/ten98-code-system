@@ -41,7 +41,7 @@ Each framework entry point takes its libraries as exact optional peers, so the a
 - Connect as a non-owner role without BYPASSRLS, and call `assertDatabaseRoles(pool)` at start-up and in a database test.
 - Reach scoped tables only through `withWorkspace` and `withWorkspaces`. Await nested calls on one transaction in turn.
 - Map `WorkspaceAccessError` to a not-found response and `UnlockedScopeError` to a bare 500. A `DatabaseRoleError` stops start-up.
-- Map `InvalidWorkspaceIdError` (`code: 'TENANCY_WORKSPACE_ID_INVALID'`, a TypeError) to invalid input. From the release after 0.29.0 the helpers throw it for a workspace id that is not a UUID instead of refusing it as not found (`withWorkspace`) or dropping it (`withWorkspaces`). Map `ScopeNestingError` to a bare 500.
+- Map `InvalidWorkspaceIdError` (`code: 'TENANCY_WORKSPACE_ID_INVALID'`, a TypeError) to invalid input. From the release that adds `./tenancy/system`, the helpers throw it for a workspace id that is not a UUID instead of refusing it as not found (`withWorkspace`) or dropping it (`withWorkspaces`). Map `ScopeNestingError` to a bare 500.
 - Before adopting read-only reads, check that no read callback writes.
 
 **`@ten98/runtime/tenancy/testing`** (0.27.1; peer `pg`)
