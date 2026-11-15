@@ -489,10 +489,24 @@ function importedAs(body: AstNode[], source: string, name: string): Set<string> 
   return locals;
 }
 
-// The createStart references in one file: value imports and re-exports of that name, and calls to a function or
-// method of that name or of one of `aliases`.
+const keyName = (node: AstNode | undefined): string | undefined => node?.type === 'Identifier' ? node.name : typeof node?.value === 'string' ? node.value : undefined;
+// An expression without its parentheses, TypeScript assertions and optional chain.
+const bare = (node: AstNode | undefined): AstNode | undefined =>
+  node && ['ParenthesizedExpression', 'TSAsExpression', 'TSSatisfiesExpression', 'TSNonNullExpression', 'TSTypeAssertion', 'ChainExpression'].includes(node.type) ? bare(node.expression) : node;
+
+// The createStart references in one file: value imports and re-exports of that name, calls to a function of that name
+// or of one of `aliases`, and calls to a method of that name on a TanStack module: a name imported from one, or an
+// `import()` or `require()` of one. A method of that name on any other object is not Start's.
 function createStartUses(program: AstNode[], aliases: Set<string> = new Set()): { specifiers: number; calls: number } {
   const uses = { specifiers: 0, calls: 0 };
+  const tanstack = (source: AstNode | undefined): boolean => typeof source?.value === 'string' && source.value.startsWith('@tanstack/');
+  const modules = new Set<string>(program.flatMap(node => node.type === 'ImportDeclaration' && tanstack(node.source) ? node.specifiers.map((specifier: AstNode) => specifier.local.name as string) : []));
+  const isModule = (node: AstNode | undefined): boolean => {
+    const object = bare(node?.type === 'AwaitExpression' ? node.argument : node);
+    return object?.type === 'Identifier' ? modules.has(object.name)
+      : object?.type === 'ImportExpression' ? tanstack(object.source)
+      : object?.type === 'CallExpression' && object.callee.type === 'Identifier' && object.callee.name === 'require' && tanstack(object.arguments[0]);
+  };
   const visit = (node: AstNode | AstNode[] | null | undefined): void => {
     if (Array.isArray(node)) return node.forEach(visit);
     if (!node || typeof node.type !== 'string' || node.importKind === 'type' || node.exportKind === 'type') return;
@@ -500,8 +514,8 @@ function createStartUses(program: AstNode[], aliases: Set<string> = new Set()): 
       const name = node.type === 'ImportSpecifier' ? node.imported : node.local;
       if ((name?.name ?? name?.value) === 'createStart') uses.specifiers++;
     } else if (node.type === 'CallExpression') {
-      const callee = node.callee;
-      if (callee.type === 'Identifier' ? callee.name === 'createStart' || aliases.has(callee.name) : callee.type === 'MemberExpression' && (callee.property?.name ?? callee.property?.value) === 'createStart') uses.calls++;
+      const callee = bare(node.callee);
+      if (callee?.type === 'Identifier' ? callee.name === 'createStart' || aliases.has(callee.name) : callee?.type === 'MemberExpression' && keyName(callee.property) === 'createStart' && isModule(bare(callee.object))) uses.calls++;
     }
     for (const value of Object.values(node)) if (value && typeof value === 'object') visit(value);
   };
@@ -511,10 +525,6 @@ function createStartUses(program: AstNode[], aliases: Set<string> = new Set()): 
 
 const ERROR_COMPONENT_KEYS = new Set(['errorComponent', 'defaultErrorComponent']);
 const ERROR_TEXT = new Set(['message', 'stack', 'cause', 'name', 'toString']);
-const keyName = (node: AstNode | undefined): string | undefined => node?.type === 'Identifier' ? node.name : typeof node?.value === 'string' ? node.value : undefined;
-// An expression without its parentheses, TypeScript assertions and optional chain.
-const bare = (node: AstNode | undefined): AstNode | undefined =>
-  node && ['ParenthesizedExpression', 'TSAsExpression', 'TSSatisfiesExpression', 'TSNonNullExpression', 'TSTypeAssertion', 'ChainExpression'].includes(node.type) ? bare(node.expression) : node;
 const isFunction = (node: AstNode | undefined): boolean => node?.type === 'ArrowFunctionExpression' || node?.type === 'FunctionExpression' || node?.type === 'FunctionDeclaration';
 
 // Where a function passed as errorComponent or defaultErrorComponent, in any object literal, reads its error's text:
@@ -626,13 +636,25 @@ export function checkStartEntry(directory: string, manifest: PackageManifest, { 
     // shadowed: the file holds no other declarations.
     const imported = start.flatMap(node => node.type === 'ImportDeclaration' ? node.specifiers.map((specifier: AstNode) => specifier.local.name as string) : []);
     const importedOnce = (locals: Set<string>, name: string): boolean => locals.has(name) && imported.filter(local => local === name).length === 1;
-    const exported = start.find(node => node.type === 'ExportNamedDeclaration' && node.declaration?.type === 'VariableDeclaration' && node.declaration.kind === 'const'
-      && node.declaration.declarations.every((declarator: AstNode) => {
-        const init = declarator.init, getOptions = init?.arguments?.[0], body = getOptions?.body;
+    // What the callback returns: its expression body, or the argument of the one return statement its block holds. An
+    // unnamed, non-generator function expression is accepted like an arrow; a named one would bind its own name.
+    const returned = (callback: AstNode | undefined): AstNode | undefined => {
+      if (!(callback?.type === 'ArrowFunctionExpression' || callback?.type === 'FunctionExpression' && !callback.id && !callback.generator) || callback.params.length) return undefined;
+      if (callback.body.type !== 'BlockStatement') return bare(callback.body);
+      const [only, ...rest] = callback.body.body;
+      return only?.type === 'ReturnStatement' && !rest.length ? bare(only.argument) : undefined;
+    };
+    const isInstance = (declaration: AstNode | undefined): boolean => declaration?.type === 'VariableDeclaration' && declaration.kind === 'const'
+      && declaration.declarations.every((declarator: AstNode) => {
+        const init = declarator.init, body = returned(init?.arguments?.[0]);
         return declarator.id.type === 'Identifier' && declarator.id.name === 'startInstance' && init?.type === 'CallExpression' && init.callee.type === 'Identifier' && importedOnce(createStart, init.callee.name)
-          && init.arguments.length === 1 && getOptions.type === 'ArrowFunctionExpression' && getOptions.expression === true && getOptions.params.length === 0
-          && body.type === 'CallExpression' && body.callee.type === 'Identifier' && importedOnce(options, body.callee.name);
-      }));
+          && init.arguments.length === 1 && body?.type === 'CallExpression' && body.callee.type === 'Identifier' && importedOnce(options, body.callee.name);
+      });
+    const declared = start.find(node => isInstance(node.type === 'ExportNamedDeclaration' ? node.declaration : node));
+    // `export { startInstance }` may stand in for the inline export.
+    const exportLists = start.filter(node => node.type === 'ExportNamedDeclaration' && !node.declaration && !node.source && node.exportKind !== 'type' && node.specifiers.length === 1
+      && keyName(node.specifiers[0].local) === 'startInstance' && keyName(node.specifiers[0].exported) === 'startInstance');
+    const exported = declared && (declared.type === 'ExportNamedDeclaration' ? !exportLists.length : exportLists.length === 1);
     let instanceNames = 0;
     const countInstanceNames = (node: unknown): void => {
       if (Array.isArray(node)) return node.forEach(countInstanceNames);
@@ -640,9 +662,9 @@ export function checkStartEntry(directory: string, manifest: PackageManifest, { 
       if ((node as AstNode).type === 'Identifier' && (node as AstNode).name === 'startInstance') instanceNames++;
       for (const value of Object.values(node)) if (value && typeof value === 'object') countInstanceNames(value);
     };
-    countInstanceNames(start);
+    countInstanceNames(start.filter(node => !exportLists.includes(node)));
     if (!exported) errors.push(`${START_FILE} must export const startInstance = createStart(() => ten98StartOptions(...)), returning ten98StartOptions from ${START_ENTRY} directly, so the shared error serialisation and CSRF middleware cannot be dropped.`);
-    else if (start.some(node => node !== exported && node.type !== 'ImportDeclaration') || instanceNames !== 1) {
+    else if (start.some(node => node !== declared && !exportLists.includes(node) && node.type !== 'ImportDeclaration') || instanceNames !== 1) {
       errors.push(`${START_FILE} must hold only its imports and the startInstance export, and name startInstance nowhere else, so nothing else can change the start instance.`);
     } else if (createStartUses(start, createStart).calls !== 1) errors.push(`${START_FILE} must call createStart only once, for startInstance.`);
   }
@@ -650,7 +672,12 @@ export function checkStartEntry(directory: string, manifest: PackageManifest, { 
   if (!existsSync(resolve(directory, CLIENT_FILE))) errors.push(`${CLIENT_FILE} is missing: a Start app calls hydrateTen98Start() from ${START_ENTRY} there.`);
   else if (client) {
     const hydrate = importedAs(client, START_ENTRY, 'hydrateTen98Start');
-    if (!client.some(node => node.type === 'ExpressionStatement' && node.expression.type === 'CallExpression' && node.expression.callee.type === 'Identifier' && hydrate.has(node.expression.callee.name))) {
+    // `hydrateTen98Start(...)` or `void hydrateTen98Start(...)` as a statement of its own.
+    const called = (statement: AstNode): AstNode | undefined => {
+      const expression = statement.type === 'ExpressionStatement' ? bare(statement.expression) : undefined;
+      return expression?.type === 'UnaryExpression' && expression.operator === 'void' ? bare(expression.argument) : expression;
+    };
+    if (!client.some(node => { const call = called(node); return call?.type === 'CallExpression' && call.callee.type === 'Identifier' && hydrate.has(call.callee.name); })) {
       errors.push(`${CLIENT_FILE} must call hydrateTen98Start(...) from ${START_ENTRY} at its top level.`);
     }
   }

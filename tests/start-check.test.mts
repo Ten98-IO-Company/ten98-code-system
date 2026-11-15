@@ -61,6 +61,33 @@ const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/
 const SHAPE =/^src\/start\.ts must export const startInstance = createStart\(\(\) => ten98StartOptions/;
 const IMPORTS = "import { createStart } from '@tanstack/react-start';\nimport { ten98StartOptions } from '@ten98/runtime/start';\n";
 
+test('equivalent spellings of the two entries pass, and a createStart method on another object is not Start', needsParser, () => {
+  for (const body of [
+    `${IMPORTS}export const startInstance = createStart(() => ten98StartOptions() as never);\n`,
+    `${IMPORTS}export const startInstance = createStart(() => { return ten98StartOptions({ requestMiddleware: [] }); });\n`,
+    `${IMPORTS}export const startInstance = createStart(function () { return ten98StartOptions(); });\n`,
+    `${IMPORTS}const startInstance = createStart(() => ten98StartOptions());\nexport { startInstance };\n`,
+    `${IMPORTS}export { startInstance };\nconst startInstance = createStart(() => ten98StartOptions());\n`,
+  ]) assert.deepEqual(app({ ...passing, 'src/start.ts': body }), [], body);
+  assert.deepEqual(app({ ...passing, 'src/client.tsx': "import { hydrateTen98Start } from '@ten98/runtime/start';\n\nvoid hydrateTen98Start();\n" }), []);
+  assert.deepEqual(app({ ...passing, 'src/setup/wizard.ts': "import { wizard } from './steps';\nexport const begin = () => wizard.createStart({ step: 1 });\nexport const again = (flow: { createStart(): void }) => flow.createStart();\n" }), []);
+  // Each stays refused when it is not what Start runs: a block that does more than return the call, a named function
+  // that binds the callee's name, another export name or a second export, and Start's createStart reached as a method.
+  for (const body of [
+    `${IMPORTS}export const startInstance = createStart(() => { ten98StartOptions(); return {}; });\n`,
+    `${IMPORTS}export const startInstance = createStart(function ten98StartOptions() { return ten98StartOptions(); });\n`,
+    `${IMPORTS}export const startInstance = createStart(() => { return ten98StartOptions(); function ten98StartOptions() { return {}; } });\n`,
+    `${IMPORTS}export const startInstance = createStart(function* () { return ten98StartOptions(); });\n`,
+    `${IMPORTS}const startInstance = createStart(() => ten98StartOptions());\nexport { startInstance as instance };\n`,
+    `${IMPORTS}const startInstance = createStart(() => ten98StartOptions());\n`,
+    `${IMPORTS}export const startInstance = createStart(() => ten98StartOptions());\nexport { startInstance };\n`,
+  ]) refused({ 'src/start.ts': body }, SHAPE);
+  for (const body of [
+    "export const second = (await import('@tanstack/react-start')).createStart(() => ({}));\n",
+    "export const second = require('@tanstack/react-start').createStart(() => ({}));\n",
+  ]) assert.match(app({ ...passing, 'src/server/other.ts': body }).join('\n'), /^src\/server\/other\.ts: createStart belongs in src\/start\.ts only/u, body);
+});
+
 test('each refusal names the file and the required shape', needsParser, () => {
   refused({ 'src/start.ts': undefined }, /^src\/start\.ts is missing/);
   refused({ 'src/client.tsx': undefined }, /^src\/client\.tsx is missing/);
