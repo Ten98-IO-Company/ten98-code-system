@@ -138,7 +138,7 @@ test('ten98-books accepts exactly its declared foundation dependencies', () => {
 
 // Discover's manifest as it stands at ten98-discover dev, with the browser library its tests import pinned (#117).
 const discover = (): AppManifestFixture => ({
-  name: 'ten98-monitor', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
+  name: 'ten98-discover', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
   dependencies: { '@modelcontextprotocol/server': '2.3.1', '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.28.0.tgz',
     '@ten98/ui': 'file:vendor/ten98-ui-0.37.0.tgz', 'better-auth': '1.7.7', 'detect-browser': '5.3.0', 'drizzle-orm': '0.45.2', 'mmdb-lib': '3.0.3', nodemailer: '10.1.4', parse5: '8.0.1',
     pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', saxes: '6.0.0', 'ua-parser-js': '1.0.41', zod: '4.6.6' },

@@ -901,16 +901,6 @@
       "reason": "ten98-io installs with npm from package-lock.json.",
       "owner": "ten98-io",
       "doneWhen": "ten98-io declares pnpm@11.19.0 and commits pnpm-lock.yaml in place of package-lock.json."
-    },
-    "discover-package-rename": {
-      "rule": "profile.name",
-      "profile": "ten98-discover",
-      "items": [
-        "ten98-monitor"
-      ],
-      "reason": "Discover still publishes its package as ten98-monitor.",
-      "owner": "ten98-discover",
-      "doneWhen": "Discover's package.json is named ten98-discover."
     }
   }
 }
