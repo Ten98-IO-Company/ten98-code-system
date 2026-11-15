@@ -147,7 +147,15 @@ export const user = pgTable('user', {
     emailVerified: boolean('emailVerified').notNull().default(false), image: text('image'),
     createdAt: timestamp('createdAt', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updatedAt', { withTimezone: true }).notNull().defaultNow(),
     twoFactorEnabled: boolean('twoFactorEnabled').notNull().default(false), closedAt: timestamp('closed_at', { withTimezone: true }),
-}, table => [uniqueIndex('user_email_normalized_idx').on(sql `lower(${table.email})`)]);
+}, table => [uniqueIndex('user_email_normalized_idx').on(sql `lower(${table.email})`), check('user_email_lowercase', sql `${table.email} = lower(${table.email})`)]);
+// better-auth's session table, as books, discover and campaign (0013) have it, plus `oidcProvider`: the app's provider
+// key for a session that began with a provider sign-in, NULL otherwise, its own column beside the hashed `token` (#131).
+// It declares no index: each app keeps its own on "userId" (session_user_idx or session_user_active_idx).
+export const session = pgTable('session', {
+    id: text('id').primaryKey(), expiresAt: timestamp('expiresAt', { withTimezone: true }).notNull(), token: text('token').notNull().unique('session_token_key'),
+    createdAt: timestamp('createdAt', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updatedAt', { withTimezone: true }).notNull().defaultNow(),
+    ipAddress: text('ipAddress'), userAgent: text('userAgent'), userId: text('userId').notNull(), oidcProvider: text('oidcProvider'),
+}, table => [foreignKey({ name: 'session_userId_fkey', columns: [table.userId], foreignColumns: [user.id] }).onDelete('cascade')]);
 export const account = pgTable('account', {
     id: text('id').primaryKey(), accountId: text('accountId').notNull(), providerId: text('providerId').notNull(), userId: text('userId').notNull(),
     password: text('password'),
@@ -201,4 +209,4 @@ export const instanceOperatorAudit = pgTable('instance_operator_audit', {
     AND (${table.scope} IS NULL OR ${table.scope} ~ '^workspace:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(/website:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$')`),
 ]);
 /** The team tables as one object, to spread into an app's Drizzle schema. */
-export const teamSchema = { user, account, workspace, membership, workspaceInvitation, workspaceTwoFactorRequirement, instanceOperator, instanceOperatorAudit };
+export const teamSchema = { user, session, account, workspace, membership, workspaceInvitation, workspaceTwoFactorRequirement, instanceOperator, instanceOperatorAudit };

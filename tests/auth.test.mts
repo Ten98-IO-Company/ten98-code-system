@@ -35,7 +35,8 @@ function setup(options: Partial<Ten98AuthOptions> = {}, wrap?: (adapter: Adapter
   }));
   const user = async (email: string, passwordHash?: string) => {
     const { internalAdapter } = await context;
-    const created = await internalAdapter.createUser({ email, name: 'Test', emailVerified: true });
+    // closedAt: null, as workspace-team.sql's closed_at reads for an open account (completeOidcSession refuses undefined).
+    const created = await internalAdapter.createUser({ email, name: 'Test', emailVerified: true, closedAt: null });
     if (passwordHash) await internalAdapter.linkAccount({ userId: created.id, providerId: 'credential', accountId: created.id, password: passwordHash });
     return created.id;
   };
@@ -218,7 +219,7 @@ test('OIDC sign-in sends a two-factor account through the challenge, and rotatio
   const env = setup();
   const { cookie } = await withTwoFactor(env);
   const id = (await env.auth.api.getSession({ headers: { cookie } }))!.user.id;
-  const challenged = await env.auth.api.completeOidcSession({ body: { oidcUserId: id }, headers: {}, asResponse: true });
+  const challenged = await env.auth.api.completeOidcSession({ body: { oidcUserId: id, provider: 'idp' }, headers: {}, asResponse: true });
   assert.equal((await challenged.json() as { twoFactorRedirect?: boolean }).twoFactorRedirect, true);
   assert.ok(cookies(challenged).some(pair => pair.split('=')[0]!.endsWith('.two_factor')));
   assert.equal(await env.auth.api.getSession({ headers: { cookie: cookieOf(challenged) } }), null);
@@ -235,11 +236,40 @@ test('OIDC sign-in sends a two-factor account through the challenge, and rotatio
   assert.equal((await env.post('/rotate-verified-session', { verifiedUserId: id }, cookie)).status, 404);
 });
 
+test('every sign-in challenge completeOidcSession opens carries its provider, whatever characters its identifier has', async () => {
+  const env = setup();
+  const { cookie } = await withTwoFactor(env);
+  const id = (await env.auth.api.getSession({ headers: { cookie } }))!.user.id;
+  // Challenge identifiers are '2fa-' and 20 random characters that include '-' and '_': open them until one has those.
+  const identifiers: string[] = [];
+  while (identifiers.length < 64 && (identifiers.length < 3 || !identifiers.some(value => /[-_]/.test(value.slice(4))))) {
+    const challenged = await env.auth.api.completeOidcSession({ body: { oidcUserId: id, provider: 'idp' }, headers: {}, asResponse: true });
+    const pair = cookies(challenged).find(item => item.split('=')[0]!.endsWith('.two_factor'))!;
+    const value = decodeURIComponent(pair.slice(pair.indexOf('=') + 1));
+    identifiers.push(value.slice(0, value.lastIndexOf('.')));
+  }
+  assert.ok(identifiers.some(value => /[-_]/.test(value.slice(4))));
+  const bindings = env.db.verification!.filter(row => String(row.identifier).startsWith('oidc-challenge:'));
+  assert.deepEqual(bindings.map(row => row.value), identifiers.map(() => 'idp'));
+  assert.deepEqual(bindings.map(row => row.identifier).sort(), identifiers.map(value => env.auth.storedVerificationIdentifier(`oidc-challenge:${value}`)).sort());
+  // Each binding lives exactly as long as its challenge.
+  for (const value of identifiers) {
+    const expiry = (identifier: string) => String(env.db.verification!.find(row => row.identifier === env.auth.storedVerificationIdentifier(identifier))?.expiresAt);
+    assert.equal(expiry(`oidc-challenge:${value}`), expiry(value));
+  }
+  // A password sign-in's challenge is bound too, to no provider (''), even when its request names one: only the
+  // server call completeOidcSession binds a provider.
+  const password = await env.post('/sign-in/email', { email: 'owner@example.com', password: PASSWORD, oidcUserId: 'any', provider: 'chosen' });
+  const passwordChallenge = decodeURIComponent(cookies(password).find(item => item.split('=')[0]!.endsWith('.two_factor'))!.split('=').slice(1).join('='));
+  const passwordBinding = env.db.verification!.find(row => row.identifier === env.auth.storedVerificationIdentifier(`oidc-challenge:${passwordChallenge.slice(0, passwordChallenge.lastIndexOf('.'))}`));
+  assert.equal(passwordBinding?.value, '');
+});
+
 test('a session alone cannot set up two-factor for an account without a password unless the app opts in', async () => {
   for (const [allowPasswordless, ok] of [[undefined, false], [false, false], [true, true]] as const) {
     const env = setup(allowPasswordless === undefined ? {} : { allowPasswordless });
     const id = await env.user('sso@example.com');
-    const session = await env.auth.api.completeOidcSession({ body: { oidcUserId: id }, headers: {}, asResponse: true });
+    const session = await env.auth.api.completeOidcSession({ body: { oidcUserId: id, provider: 'idp' }, headers: {}, asResponse: true });
     const enabled = await env.post('/two-factor/enable', {}, cookieOf(session));
     assert.equal(enabled.ok, ok, `allowPasswordless ${allowPasswordless}`);
   }
@@ -393,9 +423,9 @@ test('a known device is issued only when a sign-in completes: after the second f
   assert.ok(device(completed));
   assert.equal(rows(), 2);
   // The app's OIDC sign-in: challenged for this account, so nothing yet; a one-factor account gets its entry at once.
-  assert.equal(device(await env.auth.api.completeOidcSession({ body: { oidcUserId: id }, headers: {}, asResponse: true })), undefined);
+  assert.equal(device(await env.auth.api.completeOidcSession({ body: { oidcUserId: id, provider: 'idp' }, headers: {}, asResponse: true })), undefined);
   const other = await env.user('sso@example.com');
-  assert.ok(device(await env.auth.api.completeOidcSession({ body: { oidcUserId: other }, headers: {}, asResponse: true })));
+  assert.ok(device(await env.auth.api.completeOidcSession({ body: { oidcUserId: other, provider: 'idp' }, headers: {}, asResponse: true })));
   assert.equal(device(await env.signIn('owner@example.com', 'wrong password here')), undefined);
 });
 

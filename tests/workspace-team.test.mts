@@ -226,6 +226,11 @@ test('ids, tokens and emails are validated before any query', async () => {
   await assert.rejects(team.rotateInvitation(client, randomUUID(), randomUUID(), randomUUID(), 'x' as unknown as undefined), code('INVALID_INPUT'));
   await assert.rejects(team.setInstanceOperator(client, 'a@example.com', 'false'), code('INVALID_INPUT'));
   await assert.rejects(team.acceptVerifiedOidcInvitation(client, 'A'.repeat(43), { email: 'a@example.com', name: 'A' }, 5 as unknown as string), code('INVALID_INPUT'));
+  // An identity to link needs both its issuer (with a host) and a subject of 1 to 255 characters.
+  for (const identity of [{ issuer: 'https://idp.example.com' }, { subject: 'sub' }, { issuer: 'idp.example.com', subject: 'sub' }, { issuer: 'https://idp.example.com', subject: '' },
+    { issuer: 'https://idp.example.com', subject: 'x'.repeat(256) }, { issuer: 'https://idp.example.com', subject: 7 as unknown as string }]) {
+    await assert.rejects(team.acceptVerifiedOidcInvitation(client, 'A'.repeat(43), { email: 'a@example.com', name: 'A', ...identity }), code('INVALID_INPUT'));
+  }
   assert.deepEqual(calls, []);
   assert.throws(() => createWorkspaceTeam({ hashPassword: undefined as unknown as (password: string) => Promise<string> }), TypeError);
   for (const emailLockKey of [2 ** 31, -(2 ** 31) - 1, 1.5]) assert.throws(() => createWorkspaceTeam({ hashPassword: async () => 'h', emailLockKey }), TypeError);

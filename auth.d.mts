@@ -1,6 +1,7 @@
 import { type BetterAuthOptions } from 'better-auth';
 import { type AnyDatabase, type ScopedTransaction } from './db.mjs';
 export { LockedAuthTransactionError } from './locked-auth.mjs';
+export { normaliseOidcIssuer, normaliseOidcIssuerSql, oidcProviderId } from './oidc-issuer.mjs';
 /** The shared identity policy. Apps read it for forms and route limiters, so the numbers never drift between them. */
 export declare const ten98AuthPolicy: Readonly<{
     password: Readonly<{
@@ -69,10 +70,13 @@ export declare function storedVerificationIdentifier(secret: string, identifier:
  */
 export declare function sessionTokenKey(secret: string, token: string): string;
 /**
- * The statements every app's numbered migration runs once when it adopts hashed token storage, separated as drizzle-kit
- * separates statements. Rows stored in plain text before it would never match again: every session ends, and reset
- * links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go with them.
- * Rows an app writes with its own SQL are its own decision.
+ * The statements every app's numbered migration runs once when it adopts runtime 0.29.0's auth storage, separated as
+ * drizzle-kit separates statements. Rows stored in plain text before it would never match again: every session ends,
+ * and reset links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go
+ * with them. Then the session gains its provider binding, `oidcProvider`, and emails are stored lower-case
+ * (`user_email_lowercase`): the migration stops, listing the account ids and never an address, while two accounts share
+ * an email ignoring case, so an operator resolves them first. A second run does not fail (it ends the sessions and pending
+ * rows again, nothing else). Rows an app writes with its own SQL are its own decision.
  */
 export declare const tokenStorageUpgradeStatements: string;
 /** The user `withLockedAuth` was asked to lock does not exist; answer it as not found. */
@@ -156,12 +160,14 @@ export interface Ten98AuthOptions {
     allowRawPasswordSignIn?: boolean;
 }
 export interface Ten98AuthSession {
+    /** `oidcProvider`: the app's provider key when the session began with a provider sign-in (`completeOidcSession`). */
     session: {
         id: string;
         userId: string;
         token: string;
         expiresAt: Date;
         userAgent?: string | null;
+        oidcProvider?: string | null;
         [field: string]: unknown;
     };
     user: {
@@ -199,9 +205,15 @@ export interface Ten98Auth {
         rotateVerifiedSession: ServerCall<{
             verifiedUserId: string;
         }>;
-        /** Signs in a user the app's OIDC flow verified; an account with two-factor enabled gets the TOTP challenge instead. */
+        /**
+         * Signs in a user the app's OIDC flow verified (`signInOidcUser`); an account with two-factor enabled gets the TOTP
+         * challenge instead. `provider` is the app's key for the provider configuration it signed in through (1 to 256
+         * characters, no control characters): the session, or the session the challenge later creates, stores it as
+         * `oidcProvider`, so `revokeProviderSessions` can end it.
+         */
         completeOidcSession: ServerCall<{
             oidcUserId: string;
+            provider: string;
         }>;
         /**
          * Revokes the caller's other live sessions by id and keeps the current one (found from the cookie in `headers`).
@@ -344,3 +356,81 @@ export declare class SchemaMismatchError extends Error {
     readonly missing: readonly string[];
     constructor(missing: readonly string[]);
 }
+export type OidcIdentityErrorCode = 'OIDC_EMAIL_UNVERIFIED' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OIDC_IDENTITY_NOT_FOUND' | 'OIDC_LAST_SIGN_IN_METHOD';
+/** A refusal of a linked-identity operation: `status` is the HTTP status that fits and `message` is safe to show. */
+export declare class OidcIdentityError extends Error {
+    readonly status: 403 | 404 | 409;
+    readonly code: OidcIdentityErrorCode;
+    constructor(code: OidcIdentityErrorCode);
+}
+/** A linked identity: the ID token's `iss` and `sub`, after the app verified the token. */
+export type OidcIdentity = {
+    issuer: string;
+    subject: string;
+};
+/** The verified ID token claims `signInOidcUser` reads. */
+export type OidcClaims = {
+    iss: string;
+    sub: string;
+    email?: unknown;
+    email_verified?: unknown;
+    name?: unknown;
+    [claim: string]: unknown;
+};
+/** The provider configuration's trust setting: only `trustVerifiedEmail: true` lets a verified email create an account. */
+export type OidcProviderTrust = {
+    trustVerifiedEmail?: boolean;
+};
+/**
+ * The provider sign-in (#143): the user linked to the identity in `claims` (`iss`, `sub`), or a new account for it.
+ * It never links to an existing account. With no identity linked, an account is created only when `claims` carry
+ * `email_verified === true` and an email, and `provider.trustVerifiedEmail` is true; otherwise OIDC_EMAIL_UNVERIFIED.
+ * The account is created under the shared email lock (`pg_advisory_xact_lock(emailLockKey, hashtext(email))`, the team
+ * controller's `lockEmail`), as every account-creation path is; an email that already has an account is refused with
+ * OIDC_ACCOUNT_EXISTS (the user signs in and links, or accepts an invitation). The new account has a verified email, no
+ * password and an account row with no provider tokens. `claims` must come from an ID token the app verified. The
+ * account's usability (`closed_at`) is the app's check before it signs the user in with `completeOidcSession`.
+ */
+export declare function signInOidcUser(db: AnyDatabase, claims: OidcClaims, provider: OidcProviderTrust, { emailLockKey }?: {
+    emailLockKey?: number;
+}): Promise<{
+    userId: string;
+    created: boolean;
+}>;
+/**
+ * Links an identity to the signed-in user, the one `withLockedAuth` locked: call it inside that callback, on its `tx`,
+ * after the app verified an ID token the user obtained while signed in. `linked` is false when the identity already
+ * belongs to this user. An identity linked to another account is refused with OIDC_IDENTITY_IN_USE; nothing moves it.
+ */
+export declare function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity): Promise<{
+    linked: boolean;
+}>;
+/** What `unlinkOidcIdentity` counts as another way to sign in. */
+export type UnlinkOptions = {
+    /** As `createTen98Auth`'s option: whether a legacy Campaign hash counts as a password (it is never verified otherwise). */
+    legacyPasswords?: boolean;
+    /** Whether an identity of this (normalised) issuer can still sign in, for an app that knows its providers; all can by default. */
+    isIssuerUsable?(issuer: string): boolean | Promise<boolean>;
+};
+/**
+ * Unlinks an identity from the user `withLockedAuth` locked (inside that callback, on its `tx`), deleting its account
+ * row. Refused with OIDC_LAST_SIGN_IN_METHOD when the user would be left with no way to sign in. Only a way that can sign
+ * in counts: a password the preset can verify (see `UnlinkOptions.legacyPasswords`; an empty, malformed or unaccepted hash
+ * does not) or another linked OIDC identity whose issuer `isIssuerUsable` accepts. Account rows of any other provider do
+ * not count, as the preset signs no one in through them. The user's sessions are not ended; pair it with
+ * `revokeAllSessions()` where the app wants that.
+ */
+export declare function unlinkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity, { legacyPasswords, isIssuerUsable }?: UnlinkOptions): Promise<void>;
+/**
+ * Ends every session that began through `provider` (the key passed to `completeOidcSession`), when the app disables,
+ * deletes or reconfigures it, and the two-factor challenges such a sign-in opened, with their attempt counters, so none
+ * completes into a session later. The known devices of the users whose sessions it ended are forgotten too.
+ *
+ * Each pass is one transaction, challenges first: a challenge completing concurrently fails, or commits a session the
+ * second statement deletes. A challenge opened while a pass runs never completes (its binding row is gone). Passes repeat
+ * while one still removes something (at most 5), so a sign-in that commits during a pass is ended by the next; a pass a
+ * deadlock or serialisation failure aborts is retried (5 times at most). Resolves the number of sessions ended. Disable the
+ * provider first, so no new sign-in starts through it; a sign-in already past the app's check that commits after the last
+ * pass is bound to the provider, and calling this again ends it.
+ */
+export declare function revokeProviderSessions(db: AnyDatabase, provider: string): Promise<number>;

@@ -26,6 +26,14 @@ export function markLockedAuth(hold, ...targets) {
     return () => { for (const item of held)
         marked.delete(item); };
 }
+/**
+ * The user row a by-id `withLockedAuth` transaction locked: undefined outside one, and for `withLockedAuthByEmail`,
+ * whose account is the one behind an email being signed in to, not a signed-in user.
+ */
+export function lockedAuthUser(client) {
+    const hold = holdOf(client);
+    return hold?.email === undefined ? hold?.userId : undefined;
+}
 /** Throws LockedAuthTransactionError when `client` is, or runs on the connection of, a marked transaction. */
 export function refuseLockedAuth(client, operation) {
     if (holdOf(client))
