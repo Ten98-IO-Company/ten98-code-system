@@ -42,7 +42,8 @@ export type ScopedTransaction<TDatabase extends AnyDatabase> = TDatabase extends
  * `try`, so a failed BEGIN never releases the pooled connection, and a failed ROLLBACK replaces the error that caused
  * it. Over a pool this checks the connection out and runs BEGIN, COMMIT and ROLLBACK itself. It always releases the
  * connection, and discards it when BEGIN, COMMIT or ROLLBACK failed or the server ended it (its state is then
- * unknown). It throws the callback's own error, or a failed COMMIT's. While the connection is checked out it has an
+ * unknown; a COMMIT refused for a constraint or serialisation failure also discards a usable connection, which costs
+ * only a reconnect). It throws the callback's own error, or a failed COMMIT's. While the connection is checked out it has an
  * `error` listener, so a backend the server terminates fails the transaction instead of crashing the process.
  *
  * Given a transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. Any other

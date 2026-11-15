@@ -523,8 +523,8 @@ export function checkDeployment(directory: string, packageName: string): string[
 // The index after an optional type argument starting at `index` (whitespace first), or `index` when there is none.
 // Brackets are balanced so object types with `;`, nested generics and `=>` arrows are skipped whole.
 function afterTypeArgument(text: string, index: number): number {
-  let at = index;
-  while (/\s/u.test(text[at] ?? '')) at++;
+  // Whitespace and comments may stand before the type argument, as in `pool.query/* note */<Row>(`.
+  let at = index + (/^(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*/u.exec(text.slice(index, index + 4000))?.[0].length ?? 0);
   if (text[at] !== '<') return index;
   for (let depth = 0, end = Math.min(text.length, at + 4000); at < end; at++) {
     if (text[at] === '<') depth++;
@@ -533,26 +533,34 @@ function afterTypeArgument(text: string, index: number): number {
   return index;
 }
 
-// Counts raw statements in one file: a pg `.query(` call (also `?.(`, `!(`, `['query'](` and `.query.call(`, `.apply(`,
-// `.bind(`), Drizzle `sql.raw(`, and `.execute(` given SQL text, a `sql` template or `sql.join(` (also inside extra
-// parentheses or after a comment), each with or without a type argument, and with `sql` under any name it is imported
-// as from drizzle-orm, a namespace import included. Text matching, not parsing: the adoption guide lists the forms it
-// misses, while a comment or an unrelated `.query(` method is counted; the per-file allowlist absorbs the second kind.
+// Counts raw statements in one file: a pg `.query(` call (also `?.(`, `!(`, `?.<T>(`, `['query'](` and `.query.call(`,
+// `.apply(`, `.bind(`, with comments allowed before the parenthesis), Drizzle `sql.raw(`, and `.execute(` given SQL text,
+// a `sql` template or `sql.join(` (also inside extra parentheses or after a comment), each with or without a type
+// argument, and with `sql` under any name it is imported as from drizzle-orm, namespace imports included. Text
+// matching, not parsing: the adoption guide lists the forms it misses, while a comment or an unrelated query method is
+// counted; the per-file allowlist absorbs the second kind.
 function countRawStatements(text: string): number {
   const names = ['sql'], escape = (name: string) => name.replaceAll('$', '\\$');
   for (const [, list] of text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]drizzle-orm(?:\/[^'"]*)?['"]/gu)) {
     for (const [, alias] of list.matchAll(/\bsql\s+as\s+([A-Za-z_$][\w$]*)/gu)) names.push(escape(alias));
   }
-  for (const [, namespace] of text.matchAll(/import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]drizzle-orm(?:\/[^'"]*)?['"]/gu)) {
+  // `import * as d` and `import d, * as ns`.
+  for (const [, namespace] of text.matchAll(/import\s+(?:[A-Za-z_$][\w$]*\s*,\s*)?\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]drizzle-orm(?:\/[^'"]*)?['"]/gu)) {
     names.push(String.raw`${escape(namespace)}\s*\.\s*sql`);
   }
   const sqlName = `(?:${names.join('|')})`, tag = new RegExp(String.raw`^${sqlName}\b`, 'u');
-  const call = /^\s*(?:\?\.|!)?\s*\(/u, method = /^\s*!?\s*\??\.\s*(?:call|apply|bind)\s*\(/u, quote = /^\s*[`'"]/u, join = /^\s*\.\s*join\s*\(/u;
+  // Whitespace and comments.
+  const gap = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*`;
+  const call = new RegExp(String.raw`^${gap}(?:\?\.|!)?${gap}\(`, 'u'), method = new RegExp(String.raw`^${gap}!?${gap}\??\.${gap}(?:call|apply|bind)${gap}\(`, 'u');
+  const quote = /^\s*[`'"]/u, join = /^\s*\.\s*join\s*\(/u, optional = /^\s*(?:\?\.|!)(?=\s*<)/u;
   // `.execute`'s opening parenthesis, with any further parentheses and comments before its argument.
-  const opening = /^\s*\((?:\s|\(|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*/u;
+  const opening = new RegExp(String.raw`^\s*\((?:\s|\(|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*`, 'u');
   let count = 0;
   for (const match of text.matchAll(new RegExp(String.raw`\.query\b|\[\s*['"]query['"]\s*\]|\b${sqlName}\.raw\b|\.execute\b`, 'gu'))) {
-    const rest = text.slice(afterTypeArgument(text, match.index + match[0].length));
+    let at = match.index + match[0].length;
+    // `?.` or `!` before a type argument, as in `pool.query?.<Row>(`.
+    at += optional.exec(text.slice(at, at + 16))?.[0].length ?? 0;
+    const rest = text.slice(afterTypeArgument(text, at));
     if (match[0].endsWith('.raw')) count += Number(call.test(rest));
     else if (match[0] !== '.execute') count += Number(call.test(rest) || method.test(rest));
     else {
@@ -568,21 +576,38 @@ function countRawStatements(text: string): number {
   return count;
 }
 
-function rawStatementCounts(directory: string, policy: DataPolicy): Record<string, number> {
-  const counts: Record<string, number> = {};
+// Each source file under the data roots, as its forward-slash path from the app and its text.
+function dataSources(directory: string, policy: DataPolicy): [string, string][] {
+  const sources: [string, string][] = [];
   const walk = (folder: string): void => {
     if (!existsSync(folder)) return;
     for (const entry of readdirSync(folder, { withFileTypes: true })) {
       const file = resolve(folder, entry.name);
       if (entry.isDirectory()) walk(file);
       else if (entry.isFile() && /\.(?:[cm]?[jt]s|[jt]sx)$/u.test(entry.name) && !/\.d\.[cm]?ts$/u.test(entry.name)) {
-        const found = countRawStatements(readFileSync(file, 'utf8'));
-        if (found) counts[relative(directory, file).replaceAll('\\', '/')] = found;
+        sources.push([relative(directory, file).replaceAll('\\', '/'), readFileSync(file, 'utf8')]);
       }
     }
   };
   for (const root of policy.roots) walk(resolve(directory, root));
+  return sources;
+}
+
+function rawStatementCounts(sources: readonly [string, string][]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const [path, text] of sources) {
+    const found = countRawStatements(text);
+    if (found) counts[path] = found;
+  }
   return counts;
+}
+
+// The test-only tenancy entry sets a scope without the membership check, so production code (the data roots) never
+// imports it: as `from`, a bare or dynamic `import`, or `require`. Tests live outside the data roots.
+const testingTenancy = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)['"`]@ten98\/runtime\/tenancy\/testing['"`]/u;
+function testingTenancyImports(sources: readonly [string, string][]): string[] {
+  return sources.filter(([, text]) => testingTenancy.test(text))
+    .map(([path]) => `${path}: imports the test-only @ten98/runtime/tenancy/testing, which sets a scope without the membership check; only tests outside the data roots may.`);
 }
 
 // One allowlist entry: how many raw statements the file may hold and why they cannot be typed Drizzle queries.
@@ -615,7 +640,8 @@ export function checkDataAccess(directory: string, packageName: string): string[
   if (!policy) return [];
   directory = resolve(directory);
   const { allowed, errors } = readAllowlist(directory, policy);
-  return [...errors, ...rawStatementRises(rawStatementCounts(directory, policy), allowed, policy.baseline)];
+  const sources = dataSources(directory, policy);
+  return [...errors, ...testingTenancyImports(sources), ...rawStatementRises(rawStatementCounts(sources), allowed, policy.baseline)];
 }
 
 // Lowers or removes allowlist entries and keeps their reasons; a rise is refused. A missing allowlist is recorded once
@@ -625,7 +651,7 @@ export function updateRawStatementBaseline(directory: string, packageName: strin
   const policy = resolveProfile(packageName)?.profile.data;
   if (!policy) return [];
   directory = resolve(directory);
-  const { allowed, exists } = readAllowlist(directory, policy), counts = rawStatementCounts(directory, policy);
+  const { allowed, exists } = readAllowlist(directory, policy), counts = rawStatementCounts(dataSources(directory, policy));
   if (exists) {
     const rises = rawStatementRises(counts, allowed, policy.baseline);
     if (rises.length) return rises;
