@@ -23,3 +23,4 @@ export const failingFn = createServerFn({ method: 'POST' }).handler(async () => 
 export const publicFailingFn = createServerFn({ method: 'POST' }).handler(async () => { throw publicError(); });
 export const redirectingFn = createServerFn({ method: 'POST' }).handler(async () => { throw redirect({ to: '/' }); });
 export const missingFn = createServerFn({ method: 'POST' }).handler(async () => { throw notFound(); });
+export const readingFn = createServerFn({ method: 'GET' }).handler(async () => 'fixture-read');

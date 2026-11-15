@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { createCsrfMiddleware } from '@tanstack/react-start';
 import { PublicError, publicErrorMessage, ten98RootErrorOptions, ten98StartOptions } from '@ten98/runtime/start';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -67,8 +68,8 @@ const page = async (mode: string, path: string) => {
 };
 // The server function URLs the fixture renders, by button id.
 const functionUrls = async (mode: string): Promise<Record<string, string>> => Object.fromEntries([...(await page(mode, '/server-fn')).body.matchAll(/id="(\w+)" data-url="([^"]+)"/gu)].map(match => [match[1], match[2]]));
-const callFunction = async (mode: string, name: string, headers: Record<string, string>) => {
-  const response = await send(servers[mode]!.origin + (await functionUrls(mode))[name], { method: 'POST', headers: { 'x-tsr-serverFn': 'true', ...headers }, redirect: 'manual' });
+const callFunction = async (mode: string, name: string, headers: Record<string, string>, method = 'POST') => {
+  const response = await send(servers[mode]!.origin + (await functionUrls(mode))[name], { method, headers: { 'x-tsr-serverFn': 'true', ...headers }, redirect: 'manual' });
   return { status: response.status, headers: response.headers, body: await response.text() };
 };
 const sameOrigin = (mode: string) => ({ Origin: servers[mode]!.origin });
@@ -78,20 +79,31 @@ const assertHidden = (body: string, where: string) => {
   assert.doesNotMatch(body, /file:\/\/|_ssr\/|\bat (?:Object\.|async |new )|\$TSR\/Error|new Error\(/u, where);
 };
 
-test('CSRF holds in every configuration: a cross-origin server-function POST answers 403', async () => {
+// Against an app with no src/start.ts this test fails on the adapter marker in the same-origin answer, not on a 403:
+// that app already has Start's own default CSRF. Against a start instance without the shared options it fails on 403.
+test('CSRF holds in every configuration: a server-function call not from the same origin answers 403', async () => {
   for (const mode of ['default', 'middleware', 'reporter']) {
-    for (const headers of [{ Origin: 'https://elsewhere.example' }, { 'Sec-Fetch-Site': 'cross-site' }] as Record<string, string>[]) {
-      const refused = await callFunction(mode, 'failing', headers);
-      assert.equal(refused.status, 403, `${mode} ${JSON.stringify(headers)}`);
+    // Another origin or site, by Origin or Sec-Fetch-Site; a request with no origin headers at all; and the same calls
+    // to a GET server function and with other methods.
+    const calls: [string, string, Record<string, string>][] = [];
+    for (const headers of [{ Origin: 'https://elsewhere.example' }, { 'Sec-Fetch-Site': 'cross-site' }, { 'Sec-Fetch-Site': 'same-site' }, {}] as Record<string, string>[]) {
+      calls.push(['failing', 'POST', headers], ['reading', 'GET', headers], ['failing', 'PUT', headers]);
+    }
+    for (const [name, method, headers] of calls) {
+      const refused = await callFunction(mode, name, headers, method);
+      assert.equal(refused.status, 403, `${mode} ${method} ${name} ${JSON.stringify(headers)}`);
       assert.equal(refused.body, 'Forbidden');
       // The CSRF middleware runs first, so the app's own middleware never sees a refused request.
       assert.equal(refused.headers.get('x-fixture-app-middleware'), null);
     }
-    // The same call from the app's own origin reaches the function, and the app's middleware runs after the check.
+    // The same calls from the app's own origin reach the function, and the app's middleware runs after the check.
     const allowed = await callFunction(mode, 'failing', sameOrigin(mode));
     assert.equal(allowed.status, 200, mode);
     assert.match(allowed.body, /"\$TSR\/t\/ten98\/error"/u);
     assert.equal(allowed.headers.get('x-fixture-app-middleware'), mode === 'middleware' ? 'ran' : null);
+    const read = await callFunction(mode, 'reading', { 'Sec-Fetch-Site': 'same-origin' }, 'GET');
+    assert.equal(read.status, 200, mode);
+    assert.match(read.body, /fixture-read/u);
   }
 });
 
@@ -273,6 +285,37 @@ test('the CSRF middleware always comes first, ahead of the app middleware, and n
   for (const options of [ten98StartOptions(), ten98StartOptions({ requestMiddleware: [marker] })]) {
     assert.equal(await answer(options.requestMiddleware[0], crossOrigin), 403);
   }
+});
+
+test('the CSRF middleware refuses every server-function call not proven same-origin, whatever its method', async () => {
+  const [csrf] = ten98StartOptions().requestMiddleware;
+  const refused: Record<string, string>[] = [crossOrigin, { Origin: 'null' }, { 'Sec-Fetch-Site': 'cross-site' }, { 'Sec-Fetch-Site': 'same-site' }, { 'Sec-Fetch-Site': 'none' },
+    { 'Sec-Fetch-Site': 'same-site', Origin: 'http://app.test' }, { Referer: 'https://elsewhere.example/page' }, {}];
+  const allowed: Record<string, string>[] = [{ 'Sec-Fetch-Site': 'same-origin' }, { Origin: 'http://app.test' }, { Referer: 'http://app.test/page' }];
+  for (const method of ['POST', 'GET', 'PUT', 'PATCH', 'DELETE']) {
+    for (const headers of refused) assert.equal(await answer(csrf, headers, method), 403, `${method} ${JSON.stringify(headers)}`);
+    for (const headers of allowed) assert.equal(await answer(csrf, headers, method), NEXT, `${method} ${JSON.stringify(headers)}`);
+  }
+  // Server routes and page requests are outside it, as they are outside Start's own default.
+  assert.equal(await answer(csrf, crossOrigin, 'POST', 'router'), NEXT);
+});
+
+// Tripwires for a Start upgrade: the shared middleware is Start's own with Start's default options, and
+// hydrateTen98Start copies Start's default client entry, so either changing upstream must fail here first.
+test("Start's own CSRF default still refuses a request with no origin headers or from the same site", async () => {
+  const startDefault = createCsrfMiddleware();
+  for (const headers of [{}, { 'Sec-Fetch-Site': 'same-site' }] as Record<string, string>[]) assert.equal(await answer(startDefault, headers), 403, JSON.stringify(headers));
+  assert.equal(await answer(startDefault, { 'Sec-Fetch-Site': 'same-origin' }), NEXT);
+});
+
+test("Start's default client entry is still the one hydrateTen98Start copies", () => {
+  const entry = readFileSync(join(root, 'node_modules', '@tanstack', 'react-start', 'dist', 'plugin', 'default-entry', 'client.tsx'), 'utf8');
+  assert.equal(entry.replace(/\s+/gu, ' ').trim(), [
+    "import { StrictMode, startTransition } from 'react'",
+    "import { hydrateRoot } from 'react-dom/client'",
+    "import { StartClient } from '@tanstack/react-start/client'",
+    'startTransition(() => { hydrateRoot( document, <StrictMode> <StartClient /> </StrictMode>, ) })',
+  ].join(' '));
 });
 
 test('React root errors are silent in production apart from the reporter, and logged with the component stack in development', async () => {

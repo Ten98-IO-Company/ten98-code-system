@@ -1,9 +1,9 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { PublicError } from '@ten98/runtime/start';
 import { useState } from 'react';
-import { failingFn, missingFn, publicFailingFn, redirectingFn } from '../secrets';
+import { failingFn, missingFn, publicFailingFn, readingFn, redirectingFn } from '../secrets';
 
-const functions = { failing: failingFn, public: publicFailingFn, redirecting: redirectingFn, missing: missingFn };
+const functions = { failing: failingFn, public: publicFailingFn, redirecting: redirectingFn, missing: missingFn, reading: readingFn };
 
 // Each button calls one server function from the browser and shows what arrived; the links carry each function's URL
 // for the HTTP tests.
