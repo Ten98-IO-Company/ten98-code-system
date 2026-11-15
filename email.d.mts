@@ -18,15 +18,23 @@ export interface EmailStatus {
 export interface SendTransactionalEmailOptions {
     /** Defaults to process.env. */
     env?: Environment;
-    /** The app's suppression lookup, consulted for every transport; true, a throw or a rejection refuses the send. */
-    isSuppressed?: (address: string) => boolean | Promise<boolean>;
+    /**
+     * Required, so no call site sends unchecked by omission. The app's suppression lookup, consulted for every transport:
+     * only `false` lets the message go, so `true`, any other result, a throw or a rejection refuses it. Pass the literal
+     * `false` instead of a function when the app keeps no suppression list.
+     */
+    isSuppressed: ((address: string) => boolean | Promise<boolean>) | false;
 }
 /** Every failure, bad configuration and input included. The message is fixed and carries no provider or message content. */
 export declare class EmailDeliveryError extends Error {
     readonly status = 503;
     constructor();
 }
-/** Configuration only: never throws, contacts no provider and promises no delivery. Read `.configured`. */
+/**
+ * Configuration only: never throws, contacts no provider and promises no delivery. Read `.configured`. SMTP counts as
+ * configured only when the optional nodemailer peer is installed (or a test SMTP sender is in place), since a send
+ * would otherwise refuse.
+ */
 export declare function getEmailStatus(env?: Environment): EmailStatus;
 /** The nodemailer SMTP options a send passes, so a test adapter can check them. */
 export interface SmtpTransportOptions {
@@ -81,5 +89,5 @@ export declare function withEmailTransportsForTests<T>(transports: EmailTestTran
  * Success means the provider accepted the message, never that it was delivered. Every failure is the same
  * EmailDeliveryError (status 503) with no cause attached; nothing is logged.
  */
-export declare function sendTransactionalEmail(input: TransactionalEmail, { env, isSuppressed }?: SendTransactionalEmailOptions): Promise<EmailAcceptance>;
+export declare function sendTransactionalEmail(input: TransactionalEmail, options: SendTransactionalEmailOptions): Promise<EmailAcceptance>;
 export {};

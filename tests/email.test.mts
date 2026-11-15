@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -72,7 +73,7 @@ test('FROM, HOST, USER and PASSWORD accept _FILE through readEnvironment, which 
   assert.deepEqual(getEmailStatus(env), { configured: true, transport: 'smtp' });
   let seen: SmtpTransportOptions | undefined, from = '';
   const result = await withEmailTransportsForTests({ smtp(options) { seen = options; return { async sendMail(mail) { from = mail.from; return { accepted: [message.to], rejected: [] }; }, close() {} }; } },
-    () => sendTransactionalEmail(message, { env }));
+    () => sendTransactionalEmail(message, { isSuppressed: false, env }));
   assert.deepEqual(result, accepted);
   assert.equal(from, values.EMAIL_FROM);
   assert.equal(seen?.host, values.EMAIL_SMTP_HOST);
@@ -83,34 +84,34 @@ test('FROM, HOST, USER and PASSWORD accept _FILE through readEnvironment, which 
 test('every send failure is one EmailDeliveryError with status 503, disabled and bad configuration included', async () => {
   const error = new EmailDeliveryError();
   assert.ok(error instanceof Error); assert.equal(error.status, 503); assert.equal(error.cause, undefined);
-  await assert.rejects(sendTransactionalEmail(message, { env: {} }), unconfirmed);
-  await assert.rejects(sendTransactionalEmail(message, { env: { EMAIL_TRANSPORT: 'smtp' } }), unconfirmed);
-  await assert.rejects(sendTransactionalEmail(message, { env: { ...smtp, EMAIL_SMTP_HOST: '127.0.0.1' } }), unconfirmed);
-  await assert.rejects(sendTransactionalEmail(message, { env: { ...smtp, EMAIL_SMTP_PASSWORD_FILE: file('both', 'x') } }), unconfirmed);
+  await assert.rejects(sendTransactionalEmail(message, { isSuppressed: false, env: {} }), unconfirmed);
+  await assert.rejects(sendTransactionalEmail(message, { isSuppressed: false, env: { EMAIL_TRANSPORT: 'smtp' } }), unconfirmed);
+  await assert.rejects(sendTransactionalEmail(message, { isSuppressed: false, env: { ...smtp, EMAIL_SMTP_HOST: '127.0.0.1' } }), unconfirmed);
+  await assert.rejects(sendTransactionalEmail(message, { isSuppressed: false, env: { ...smtp, EMAIL_SMTP_PASSWORD_FILE: file('both', 'x') } }), unconfirmed);
   // An adapter that throws anything, a non-Error included, still surfaces as the same error.
-  await assert.rejects(withEmailTransportsForTests({ smtp() { throw 'raw string'; } }, () => sendTransactionalEmail(message, { env: smtp })), unconfirmed);
+  await assert.rejects(withEmailTransportsForTests({ smtp() { throw 'raw string'; } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: smtp })), unconfirmed);
 });
 
 test('input is strict: one bare mailbox, a subject of at most 200 characters without control characters, text of at most 65,536 bytes', async () => {
   const { calls, adapters } = transports();
   await withEmailTransportsForTests(adapters, async () => {
     for (const to of ['recipient@example.com,other@example.com', 'Name <recipient@example.com>', 'recipient@example.com\r\nBcc:other@example.com', ' recipient@example.com', 'recipient', `${'a'.repeat(250)}@example.com`]) {
-      await assert.rejects(sendTransactionalEmail({ ...message, to }, { env: cloudflare }), unconfirmed, to);
+      await assert.rejects(sendTransactionalEmail({ ...message, to }, { isSuppressed: false, env: cloudflare }), unconfirmed, to);
     }
     for (const subject of ['', 'x\r\nBcc:other@example.com', 'bad\0subject', 'tab\tsubject', 'bad subject', 'bad‮subject', 'x'.repeat(201), '\ud800']) {
-      await assert.rejects(sendTransactionalEmail({ ...message, subject }, { env: cloudflare }), unconfirmed, JSON.stringify(subject));
+      await assert.rejects(sendTransactionalEmail({ ...message, subject }, { isSuppressed: false, env: cloudflare }), unconfirmed, JSON.stringify(subject));
     }
     for (const text of ['', '\udfff', 'bad\0text', 'bell\u0007', '😀'.repeat(16_385), 'é'.repeat(32_768) + 'a']) {
-      await assert.rejects(sendTransactionalEmail({ ...message, text }, { env: cloudflare }), unconfirmed, text.slice(0, 20));
+      await assert.rejects(sendTransactionalEmail({ ...message, text }, { isSuppressed: false, env: cloudflare }), unconfirmed, text.slice(0, 20));
     }
     // @ts-expect-error An untrusted caller cannot add a raw HTML part or another field.
-    await assert.rejects(sendTransactionalEmail({ ...message, html: '<img src="https://outside.example/">' }, { env: cloudflare }), unconfirmed);
+    await assert.rejects(sendTransactionalEmail({ ...message, html: '<img src="https://outside.example/">' }, { isSuppressed: false, env: cloudflare }), unconfirmed);
     // @ts-expect-error Neither can it add a second recipient field.
-    await assert.rejects(sendTransactionalEmail({ ...message, cc: 'other@example.com' }, { env: cloudflare }), unconfirmed);
+    await assert.rejects(sendTransactionalEmail({ ...message, cc: 'other@example.com' }, { isSuppressed: false, env: cloudflare }), unconfirmed);
     assert.equal(calls.fetch, 0, 'Refused input reaches no provider.');
     // The limits themselves are accepted: 200 characters, and 65,536 UTF-8 bytes of two-byte characters with tabs and line breaks.
-    assert.deepEqual(await sendTransactionalEmail({ ...message, subject: 'x'.repeat(200) }, { env: cloudflare }), accepted);
-    assert.deepEqual(await sendTransactionalEmail({ ...message, text: 'é'.repeat(32_767) + '\t\n' }, { env: cloudflare }), accepted);
+    assert.deepEqual(await sendTransactionalEmail({ ...message, subject: 'x'.repeat(200) }, { isSuppressed: false, env: cloudflare }), accepted);
+    assert.deepEqual(await sendTransactionalEmail({ ...message, text: 'é'.repeat(32_767) + '\t\n' }, { isSuppressed: false, env: cloudflare }), accepted);
   });
   assert.equal(calls.fetch, 2);
 });
@@ -145,7 +146,7 @@ test('SES sends one SigV4-signed SendEmail to the fixed regional origin through 
     assert.equal(body.Content.Simple.Subject.Data, message.subject); assert.equal(body.Content.Simple.Body.Text.Data, message.text);
     assert.ok(!String(init.body).includes(ses.EMAIL_SES_SECRET_ACCESS_KEY));
     return sesReply();
-  } }, () => sendTransactionalEmail(message, { env: { ...ses, EMAIL_SES_CONFIGURATION_SET: 'transactional-1' } }));
+  } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: { ...ses, EMAIL_SES_CONFIGURATION_SET: 'transactional-1' } }));
   assert.deepEqual(result, accepted); assert.equal(calls, 1);
 });
 
@@ -157,11 +158,11 @@ test('Cloudflare sends one request with escaped generated HTML; delivered and qu
     assert.equal(init.method, 'POST'); assert.equal(init.redirect, 'error');
     assert.deepEqual(JSON.parse(String(init.body)), { from: 'sender@example.com', to: [message.to], subject: '😀', text, html: '<div>&lt;script&gt;&quot;private&quot; &amp; &#39;link&#39;&lt;/script&gt;<br>😀</div>' });
     return json(receipt());
-  } }, () => sendTransactionalEmail({ ...message, subject: '😀', text }, { env: cloudflare }));
+  } }, () => sendTransactionalEmail({ ...message, subject: '😀', text }, { isSuppressed: false, env: cloudflare }));
   assert.deepEqual(result, accepted); assert.equal(calls, 1);
-  assert.deepEqual(await withEmailTransportsForTests({ fetch: async () => json(receipt([message.to], [])) }, () => sendTransactionalEmail(message, { env: cloudflare })), accepted);
+  assert.deepEqual(await withEmailTransportsForTests({ fetch: async () => json(receipt([message.to], [])) }, () => sendTransactionalEmail(message, { isSuppressed: false, env: cloudflare })), accepted);
   for (const reply of [receipt([], [], [message.to]), receipt([], [], [], [message.to]), receipt(['other@example.com'], []), { ...receipt(), success: false }]) {
-    await assert.rejects(withEmailTransportsForTests({ fetch: async () => json(reply) }, () => sendTransactionalEmail(message, { env: cloudflare })), unconfirmed);
+    await assert.rejects(withEmailTransportsForTests({ fetch: async () => json(reply) }, () => sendTransactionalEmail(message, { isSuppressed: false, env: cloudflare })), unconfirmed);
   }
 });
 
@@ -178,25 +179,25 @@ test('SMTP forces authentication, requires TLS 1.2 or later on the configured na
       assert.equal(options.maxRecipients, 1); assert.equal(options.disableFileAccess, true); assert.equal(options.disableUrlAccess, true);
       assert.equal(options.logger, false); assert.equal(options.debug, false); assert.equal(options.transactionLog, false);
       return { async sendMail(mail) { assert.deepEqual({ ...mail, html: undefined }, { from: 'sender@example.com', ...message, html: undefined }); return { accepted: [message.to], rejected: [] }; }, close() { closes++; } };
-    } }, () => sendTransactionalEmail(message, { env: { ...smtp, EMAIL_SMTP_TLS: tls } }));
+    } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: { ...smtp, EMAIL_SMTP_TLS: tls } }));
     assert.deepEqual(result, accepted); assert.equal(socket?.destroyed, true);
   }
   assert.equal(calls, 2); assert.equal(closes, 2);
   let port = 0;
-  await withEmailTransportsForTests({ smtp(options) { port = options.port; return smtpSender(); } }, () => sendTransactionalEmail(message, { env: { ...smtp, EMAIL_SMTP_PORT: '2525' } }));
+  await withEmailTransportsForTests({ smtp(options) { port = options.port; return smtpSender(); } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: { ...smtp, EMAIL_SMTP_PORT: '2525' } }));
   assert.equal(port, 2525);
 });
 
 test('one attempt and one recipient: a rejected, mismatched or failed send is not retried', async () => {
   let calls = 0, closes = 0;
   for (const reply of [{ accepted: [], rejected: [] }, { accepted: ['other@example.com'], rejected: [] }, { accepted: [message.to, 'other@example.com'], rejected: [] }, { accepted: [message.to], rejected: [message.to] }, { accepted: [message.to], rejected: [], pending: [message.to] }, null]) {
-    await assert.rejects(withEmailTransportsForTests({ smtp() { calls++; return smtpSender(reply, () => { closes++; }); } }, () => sendTransactionalEmail(message, { env: smtp })), unconfirmed);
+    await assert.rejects(withEmailTransportsForTests({ smtp() { calls++; return smtpSender(reply, () => { closes++; }); } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: smtp })), unconfirmed);
   }
   assert.equal(calls, 6); assert.equal(closes, 6);
   for (const response of [() => new Response('', { status: 500 }), () => new Response('', { status: 429 }), () => json({ success: false, errors: [{ code: 10001 }] }, 400)]) {
     let fetches = 0;
-    await assert.rejects(withEmailTransportsForTests({ fetch: async () => { fetches++; return response(); } }, () => sendTransactionalEmail(message, { env: cloudflare })), unconfirmed);
-    await assert.rejects(withEmailTransportsForTests({ fetch: async () => { fetches++; return response(); } }, () => sendTransactionalEmail(message, { env: ses })), unconfirmed);
+    await assert.rejects(withEmailTransportsForTests({ fetch: async () => { fetches++; return response(); } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: cloudflare })), unconfirmed);
+    await assert.rejects(withEmailTransportsForTests({ fetch: async () => { fetches++; return response(); } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: ses })), unconfirmed);
     assert.equal(fetches, 2, 'One request per send; no automatic retry.');
   }
 });
@@ -205,7 +206,7 @@ test('the 15-second limit covers the whole send: a stalled SMTP send, response b
   context.mock.timers.enable({ apis: ['setTimeout'] });
   let calls = 0, closes = 0, socket: Socket | undefined, rejectLate: ((reason: Error) => void) | undefined;
   const stalledSmtp = withEmailTransportsForTests({ smtp(options) { calls++; socket = options.socket; return { sendMail: () => new Promise((_, reject) => { rejectLate = reject; }), close() { closes++; } }; } },
-    () => sendTransactionalEmail(message, { env: smtp }));
+    () => sendTransactionalEmail(message, { isSuppressed: false, env: smtp }));
   assert.equal(calls, 1); context.mock.timers.tick(14_999); await Promise.resolve(); assert.equal(closes, 0);
   context.mock.timers.tick(1); await assert.rejects(stalledSmtp, unconfirmed);
   assert.equal(socket?.destroyed, true); assert.equal(closes, 1);
@@ -217,7 +218,7 @@ test('the 15-second limit covers the whole send: a stalled SMTP send, response b
 
   let cancelled = 0;
   const response = new Response(new ReadableStream({ pull() { return new Promise(() => {}); }, cancel() { cancelled++; } }), { headers: { 'content-type': 'application/json' } });
-  const stalledBody = withEmailTransportsForTests({ fetch: async () => response }, () => sendTransactionalEmail(message, { env: cloudflare }));
+  const stalledBody = withEmailTransportsForTests({ fetch: async () => response }, () => sendTransactionalEmail(message, { isSuppressed: false, env: cloudflare }));
   for (let turn = 0; turn < 20 && !response.body?.locked; turn++) await Promise.resolve();
   assert.equal(response.body?.locked, true); context.mock.timers.tick(15_000); await assert.rejects(stalledBody, unconfirmed);
   assert.equal(cancelled, 1);
@@ -237,9 +238,9 @@ test('message contents, credentials and provider errors are never logged nor car
     context.mock.method(stream, 'write', (chunk: unknown, ...rest: never[]) => { written.push(String(chunk)); return original(chunk as string, ...rest); });
   }
   const failures: Promise<unknown>[] = [
-    withEmailTransportsForTests({ smtp() { return { async sendMail() { throw new Error('provider-detail ' + message.text); }, close() {} }; } }, () => sendTransactionalEmail(message, { env: smtp })),
-    withEmailTransportsForTests({ fetch: async () => new Response('provider-detail private-token ' + message.text, { status: 403 }) }, () => sendTransactionalEmail(message, { env: cloudflare })),
-    withEmailTransportsForTests({ fetch: async () => { throw new Error('provider-detail ' + ses.EMAIL_SES_SECRET_ACCESS_KEY); } }, () => sendTransactionalEmail(message, { env: ses })),
+    withEmailTransportsForTests({ smtp() { return { async sendMail() { throw new Error('provider-detail ' + message.text); }, close() {} }; } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: smtp })),
+    withEmailTransportsForTests({ fetch: async () => new Response('provider-detail private-token ' + message.text, { status: 403 }) }, () => sendTransactionalEmail(message, { isSuppressed: false, env: cloudflare })),
+    withEmailTransportsForTests({ fetch: async () => { throw new Error('provider-detail ' + ses.EMAIL_SES_SECRET_ACCESS_KEY); } }, () => sendTransactionalEmail(message, { isSuppressed: false, env: ses })),
     sendTransactionalEmail(message, { env: ses, isSuppressed: () => { throw new Error('provider-detail ' + message.to); } }),
   ];
   for (const failure of failures) {
@@ -263,4 +264,42 @@ test('nodemailer is an optional peer loaded by dynamic import, so the entry load
   assert.deepEqual(manifest.exports['./email'], { types: './email.d.mts', import: './email.mjs' });
   // The named ESM export the SMTP path relies on.
   assert.equal(typeof (await import('nodemailer')).createTransport, 'function');
+});
+
+test('isSuppressed is required: missing options or a non-function, non-false value refuses before any provider call', async () => {
+  let fetches = 0;
+  const adapters = { fetch: async () => { fetches++; return json(receipt([message.to], [])); } };
+  for (const options of [undefined, null, {}, { env: cloudflare }, { env: cloudflare, isSuppressed: undefined }, { env: cloudflare, isSuppressed: true }, { env: cloudflare, isSuppressed: 'no' }]) {
+    await assert.rejects(withEmailTransportsForTests(adapters, () => sendTransactionalEmail(message, options as never)), unconfirmed, JSON.stringify(options ?? null));
+  }
+  assert.equal(fetches, 0);
+  // Only an explicit false from the lookup sends; undefined, null, 0, '' and 'false' refuse.
+  for (const result of [undefined, null, 0, '', 'false', 1]) {
+    await assert.rejects(withEmailTransportsForTests(adapters, () => sendTransactionalEmail(message, { env: cloudflare, isSuppressed: () => result as never })), unconfirmed, String(result));
+  }
+  assert.equal(fetches, 0);
+  assert.deepEqual(await withEmailTransportsForTests(adapters, () => sendTransactionalEmail(message, { env: cloudflare, isSuppressed: () => false })), accepted);
+  assert.deepEqual(await withEmailTransportsForTests(adapters, () => sendTransactionalEmail(message, { env: cloudflare, isSuppressed: false })), accepted);
+  assert.equal(fetches, 2);
+});
+
+test('an SMTP host whose last label is numeric is refused, as an address in disguise', async () => {
+  for (const host of ['2130706433', '127.1', '10.0.0.1.', 'mail.123', '0x7f000001', '127.0x1', '0x7f.0.0.1']) {
+    await assert.rejects(sendTransactionalEmail(message, { isSuppressed: false, env: { ...smtp, EMAIL_SMTP_HOST: host } }), unconfirmed, host);
+    // Refused as configuration, before any DNS lookup: getEmailStatus reads the host rule alone.
+    assert.deepEqual(getEmailStatus({ ...smtp, EMAIL_SMTP_HOST: host }), { configured: false, transport: 'disabled' }, host);
+  }
+});
+
+test('getEmailStatus reports SMTP as not configured when the optional nodemailer peer cannot be loaded', () => {
+  const entry = new URL('../email.mjs', import.meta.url).href;
+  const script = `import { registerHooks } from 'node:module';
+registerHooks({ resolve(s, c, n) { if (s === 'nodemailer') throw Object.assign(new Error('absent'), { code: 'ERR_MODULE_NOT_FOUND' }); return n(s, c); } });
+const { getEmailStatus } = await import(${JSON.stringify(entry)});
+process.stdout.write(JSON.stringify([getEmailStatus(${JSON.stringify(smtp)}), getEmailStatus(${JSON.stringify(cloudflare)})]));`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 30_000, windowsHide: true });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), [{ configured: false, transport: 'smtp' }, { configured: true, transport: 'cloudflare' }]);
+  // With nodemailer installed, as in this package, SMTP is configured.
+  assert.deepEqual(getEmailStatus(smtp), { configured: true, transport: 'smtp' });
 });
