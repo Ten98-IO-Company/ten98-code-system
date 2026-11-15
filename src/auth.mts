@@ -173,13 +173,15 @@ export function sessionTokenKey(secret: string, token: string): string {
  * and reset links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go
  * with them. Then the session gains its provider binding, `oidcProvider`, and emails are stored lower-case
  * (`user_email_lowercase`): the migration stops, listing the account ids and never an address, while two accounts share
- * an email ignoring case, so an operator resolves them first. Rows an app writes with its own SQL are its own decision.
+ * an email ignoring case, so an operator resolves them first. A second run does not fail (it ends the sessions and pending
+ * rows again, nothing else). Rows an app writes with its own SQL are its own decision.
  */
 export const tokenStorageUpgradeStatements = [
   'DELETE FROM "session";',
   'DELETE FROM verification WHERE identifier LIKE \'reset-password:%\' OR identifier LIKE \'trust-device-%\' OR identifier LIKE \'2fa-%\';',
-  'ALTER TABLE "session" ADD COLUMN "oidcProvider" text;',
-  // #143, comment 6891409340, verbatim.
+  'ALTER TABLE "session" ADD COLUMN IF NOT EXISTS "oidcProvider" text;',
+  // #143, comment 6891409340: the pre-check and the UPDATE verbatim; the constraint is added once, NOT VALID, then
+  // validated, so a second run passes and VALIDATE (in its own transaction) scans without blocking writes.
   `DO $$
 DECLARE twins integer; listed text;
 BEGIN
@@ -194,7 +196,14 @@ BEGIN
 END
 $$;`,
   'UPDATE "user" SET email = lower(email) WHERE email <> lower(email);',
-  'ALTER TABLE "user" ADD CONSTRAINT user_email_lowercase CHECK (email = lower(email));',
+  `DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'user_email_lowercase' AND conrelid = '"user"'::regclass) THEN
+    ALTER TABLE "user" ADD CONSTRAINT user_email_lowercase CHECK (email = lower(email)) NOT VALID;
+  END IF;
+END
+$$;`,
+  'ALTER TABLE "user" VALIDATE CONSTRAINT user_email_lowercase;',
 ].join('\n--> statement-breakpoint\n');
 
 type Clause = { field: string; value: unknown; operator?: string; [option: string]: unknown };
@@ -514,6 +523,8 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     const original = hook.matcher;
     hook.matcher = context => original(context) || (context.path === undefined && typeof context.body?.oidcUserId === 'string');
   }
+  /** The isAccountUsable hook, refusing a closed account by default. */
+  const usable = (account: { id: string; email: string; closedAt: Date | null }) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
   const verifiedUser = async (context: Parameters<Parameters<typeof createAuthEndpoint.serverOnly>[1]>[0], field: 'verifiedUserId' | 'oidcUserId') => {
     const userId = (context.body as Record<string, unknown> | undefined)?.[field];
     if (typeof userId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(userId)) throw APIError.fromStatus('BAD_REQUEST');
@@ -543,14 +554,21 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       completeOidcSession: createAuthEndpoint.serverOnly({ method: 'POST' }, async context => {
         const provider = providerKey((context.body as Record<string, unknown> | undefined)?.provider);
         if (provider === undefined) throw APIError.fromStatus('BAD_REQUEST');
-        return issue(context, await verifiedUser(context, 'oidcUserId'), provider);
+        const user = await verifiedUser(context, 'oidcUserId');
+        // closedAt is undefined only when the app's Drizzle user table does not map closed_at: then usability cannot be
+        // judged, so the sign-in fails loudly instead of skipping the check. An unusable account gets the unknown-user 401.
+        const closedAt = (user as { closedAt?: Date | null }).closedAt;
+        if (closedAt === undefined) throw new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
+        if (await usable({ id: user.id, email: user.email, closedAt }) !== true) throw APIError.fromStatus('UNAUTHORIZED');
+        return issue(context, user, provider);
       }),
     },
   } as const;
-  // The provider binding of a session created without one (#143). A two-factor challenge that completeOidcSession
-  // started carries its provider in an `oidc-challenge:<challenge>` row, read (and deleted) when the challenge creates
-  // its session; any other session created while one is current (a password change's replacement, say) keeps the
-  // current session's provider.
+  // The provider binding of a session created without one (#143). Every sign-in challenge is opened with an
+  // `oidc-challenge:<challenge>` row holding its provider (completeOidcSession) or '' (a password sign-in), read and
+  // deleted when the challenge creates its session. A challenge with no such row was revoked while it was being opened
+  // (revokeProviderSessions deleted the row written just before it), so it never completes. Any other session created
+  // while one is current (a password change's replacement, say) keeps the current session's provider.
   type HookContext = {
     path?: string;
     body?: Record<string, unknown>;
@@ -563,11 +581,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   } | null | undefined;
   const boundProvider = async (context: HookContext): Promise<string | undefined> => {
     const current = providerKey(context?.context.session?.session?.oidcProvider);
-    if (current !== undefined || !context || !twoFactorPaths.has(context.path ?? '')) return current;
+    if (current !== undefined || !context || context.context.session || !twoFactorPaths.has(context.path ?? '')) return current;
     const challenge = await context.getSignedCookie(context.context.createAuthCookie('two_factor').name, context.context.secret);
     if (typeof challenge !== 'string' || !challenge) return undefined;
     const binding = await context.context.internalAdapter.findVerificationValue(challengeProviderPrefix + challenge);
-    if (!binding) return undefined;
+    if (!binding) throw APIError.fromStatus('UNAUTHORIZED');
     await context.context.internalAdapter.deleteVerificationByIdentifier(challengeProviderPrefix + challenge);
     return providerKey(binding.value);
   };
@@ -578,13 +596,13 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       return provider === undefined ? undefined : { data: { ...data, oidcProvider: provider } };
     } } },
     verification: { create: { async before(data, context) {
-      // The sign-in challenge the two-factor plugin opens for completeOidcSession (a server call, so no path): its
-      // identifier is exactly '2fa-' and 20 characters of better-auth's generateRandomString (letters, digits, '-' and
-      // '_'); its '2fa-attempts-' and '2fa-otp-' rows name the challenge and are always longer.
+      // A sign-in challenge the two-factor plugin opens: its identifier is exactly '2fa-' and 20 characters of
+      // better-auth's generateRandomString (letters, digits, '-' and '_'); its '2fa-attempts-' and '2fa-otp-' rows name
+      // the challenge and are always longer. completeOidcSession is a server call (no path); any other is a password sign-in.
       const hook = context as unknown as HookContext;
-      const provider = providerKey(hook?.body?.provider);
-      if (!hook || hook.path !== undefined || typeof hook.body?.oidcUserId !== 'string' || provider === undefined || !/^2fa-[A-Za-z0-9_-]{20}$/.test(data.identifier)) return;
-      await hook.context.internalAdapter.createVerificationValue({ identifier: challengeProviderPrefix + data.identifier, value: provider, expiresAt: data.expiresAt });
+      if (!hook || !/^2fa-[A-Za-z0-9_-]{20}$/.test(data.identifier)) return;
+      const provider = hook.path === undefined && typeof hook.body?.oidcUserId === 'string' ? providerKey(hook.body.provider) : undefined;
+      await hook.context.internalAdapter.createVerificationValue({ identifier: challengeProviderPrefix + data.identifier, value: provider ?? '', expiresAt: data.expiresAt });
     } } },
   };
   // Replaces better-auth's /revoke-other-sessions (a plugin endpoint of the same name wins), which compares the caller's
@@ -683,10 +701,15 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     // Adapter failures can contain query parameters, and better-call logs non-API exceptions even with the logger off,
     // so every unexpected error becomes a bare 500 before it can expose SQL, hashes or tokens.
     logger: { disabled: true },
-    onAPIError: { onError(error) { if (isAPIError(error)) throw error; throw APIError.fromStatus('INTERNAL_SERVER_ERROR'); } },
+    // A deadlock or serialisation failure is a retryable 503 instead.
+    onAPIError: { onError(error) { if (isAPIError(error)) throw error; throw APIError.fromStatus(retryable(error) ? 'SERVICE_UNAVAILABLE' : 'INTERNAL_SERVER_ERROR'); } },
     // oidcProvider is server-set only (input: false): no request can bind or unbind a session.
     session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false },
       additionalFields: { oidcProvider: { type: 'string', required: false, input: false } } },
+    // closed_at, read by completeOidcSession's usability check; never written through better-auth nor returned by it.
+    user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false } } },
+    // Identities are linked and unlinked only through linkOidcIdentity and unlinkOidcIdentity, under the user's lock.
+    disabledPaths: ['/unlink-account', '/list-accounts'],
     databaseHooks,
     plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
     emailAndPassword: {
@@ -973,7 +996,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       const challenge = identifier === undefined ? null
         : await (await storeOf(auth)).adapter.findOne<{ value: string; expiresAt: Date | string }>({ model: 'verification', where: [{ field: 'identifier', value: identifier }] });
       if (!challenge || !(new Date(challenge.expiresAt).getTime() > Date.now())) return challengeRefused();
-      let response: Response;
+      let response: Response, interrupted = false;
       try {
         response = await transaction(db, async tx => {
           await limitLockWaits(tx);
@@ -984,20 +1007,23 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
             const [account] = await boundTx.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt }).from(userTable).where(eq(userTable.id, row.id));
             if (!account || await usable(account) !== true) return challengeRefused();
             const verified = await bound.handler(request);
+            // 503 is onAPIError's answer to a deadlock or serialisation failure inside better-auth (see retryable).
+            interrupted = verified.status === 503;
             if (verified.ok && (bound as unknown as Record<symbol, () => string | undefined>)[signedInUser]!() !== account.id) throw new LockedAccountMismatch();
             return verified;
           }, 'twoFactor');
         });
       } catch (error) {
         if (error instanceof LockedAccountMismatch) return challengeRefused();
+        // A deadlock or serialisation failure (this completion against revokeProviderSessions, say): nothing persisted,
+        // the challenge stands, and the same request can be sent again.
+        if ((interrupted && error instanceof TransactionRolledBackError) || retryable(error)) return signInRetry();
         if (error instanceof TransactionRolledBackError) return refusal(500, 'SIGN_IN_FAILED', 'Sign-in failed. Try again.');
         throw error;
       }
       return response.status === 401 ? challengeRefused() : response;
     },
   };
-  /** The isAccountUsable hook, refusing a closed account by default. */
-  const usable = (account: { id: string; email: string; closedAt: Date | null }) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
   /**
    * Replaces a legacy hash once, under the lock, in a savepoint: a failure (a trigger, a constraint) rolls back the
    * savepoint only, so the sign-in stands and the next one retries.
@@ -1037,6 +1063,16 @@ function signedValue(cookie: string | undefined, secret: string): string | undef
   const expected = Buffer.from(createHmac('sha256', secret).update(value).digest('base64'));
   return signature.length === expected.length && timingSafeEqual(signature, expected) ? value : undefined;
 }
+/** A deadlock (40P01) or serialisation failure (40001), possibly wrapped by Drizzle or better-auth: safe to retry. */
+function retryable(error: unknown): boolean {
+  for (let item = error, depth = 0; item && depth < 5; item = (item as { cause?: unknown }).cause, depth++) {
+    const code = (item as { code?: unknown }).code;
+    if (code === '40P01' || code === '40001') return true;
+  }
+  return false;
+}
+/** A sign-in a deadlock or serialisation failure interrupted; nothing persisted, so the client sends it again. */
+const signInRetry = () => refusal(503, 'SIGN_IN_RETRY', 'Sign-in was interrupted. Try again.', { 'retry-after': '1' });
 /** One answer for a challenge that is unknown, expired or for an account that may not sign in, and for a wrong code. */
 const challengeRefused = () => refusal(401, 'INVALID_TWO_FACTOR', 'Invalid two-factor code or challenge.');
 /** Where a bound instance keeps the account its password sign-in created a session for. */
@@ -1095,11 +1131,25 @@ function schemaOf(db: AnyDatabase): Promise<void> {
         });
         if (missing.length) throw new SchemaMismatchError(missing);
       })
+      .then(() => identityIndex(db))
       .then(() => emailIndex(db));
     check.catch(() => schemaChecks.delete(db));
     schemaChecks.set(db, check);
   }
   return check;
+}
+
+/**
+ * The unique index on account ("providerId", "accountId") (account_providerId_accountId_key) that makes a linked
+ * identity unique and is the ON CONFLICT arbiter of linkOidcIdentity; SchemaMismatchError without it.
+ */
+async function identityIndex(db: AnyDatabase): Promise<void> {
+  // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
+  const result = await db.execute(sql`SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${getTableName(accountTable)})
+      AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnatts = 2
+      AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM pg_attribute a WHERE a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey))
+        = ARRAY[${accountTable.accountId.name}, ${accountTable.providerId.name}]::text[]) AS indexed`);
+  if ((result as unknown as { rows: { indexed: boolean }[] }).rows[0]?.indexed !== true) throw new SchemaMismatchError([`account unique ("${accountTable.providerId.name}", "${accountTable.accountId.name}")`]);
 }
 
 // One check per database object. Only a pass is remembered: a refusal, or a failed query, is checked again on the next
@@ -1123,9 +1173,9 @@ function emailIndex(db: AnyDatabase): Promise<void> {
   return check;
 }
 
-/** An app's provider key: 1 to 256 characters with no control characters; undefined for anything else. */
+/** An app's provider key: at most 256 characters, not blank, with no control characters; undefined for anything else. */
 function providerKey(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length >= 1 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
+  return typeof value === 'string' && value.length <= 256 && value.trim().length >= 1 && !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
 }
 
 export type OidcIdentityErrorCode = 'OIDC_EMAIL_UNVERIFIED' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OIDC_IDENTITY_NOT_FOUND' | 'OIDC_LAST_SIGN_IN_METHOD';
@@ -1226,44 +1276,84 @@ export async function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity):
   return { linked: false };
 }
 
+/** A stored password the preset can verify: better-auth's `salt:key` hash, or Campaign's legacy one when accepted. */
+const MODERN_HASH = /^[0-9a-f]{32}:[0-9a-f]{128}$/;
+const verifiablePassword = (hash: unknown, legacyPasswords: boolean) => typeof hash === 'string' && (MODERN_HASH.test(hash) || (legacyPasswords && isLegacyHash(hash)));
+
+/** What `unlinkOidcIdentity` counts as another way to sign in. */
+export type UnlinkOptions = {
+  /** As `createTen98Auth`'s option: whether a legacy Campaign hash counts as a password (it is never verified otherwise). */
+  legacyPasswords?: boolean;
+  /** Whether an identity of this (normalised) issuer can still sign in, for an app that knows its providers; all can by default. */
+  isIssuerUsable?(issuer: string): boolean | Promise<boolean>;
+};
+
 /**
  * Unlinks an identity from the user `withLockedAuth` locked (inside that callback, on its `tx`), deleting its account
- * row. Refused with OIDC_LAST_SIGN_IN_METHOD when the user would be left with no way to sign in: no password and no
- * other linked identity. The user's sessions are not ended; pair it with `revokeAllSessions()` where the app wants that.
+ * row. Refused with OIDC_LAST_SIGN_IN_METHOD when the user would be left with no way to sign in. Only a way that can sign
+ * in counts: a password the preset can verify (see `UnlinkOptions.legacyPasswords`; an empty, malformed or unaccepted hash
+ * does not) or another linked OIDC identity whose issuer `isIssuerUsable` accepts. Account rows of any other provider do
+ * not count, as the preset signs no one in through them. The user's sessions are not ended; pair it with
+ * `revokeAllSessions()` where the app wants that.
  */
-export async function unlinkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity): Promise<void> {
+export async function unlinkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity, { legacyPasswords = false, isIssuerUsable }: UnlinkOptions = {}): Promise<void> {
   const userId = lockedUser(tx, 'unlinkOidcIdentity');
   const key = identityKey(identity?.issuer, identity?.subject);
-  // The user's credential rows, locked so the count below holds until COMMIT (locked auth's order: after the user row).
+  // The user's credential rows, locked so the count below holds until COMMIT (locked auth's order: after the user row),
+  // also against a writer that does not hold the user row.
   const rows = await tx.select({ id: accountTable.id, providerId: accountTable.providerId, accountId: accountTable.accountId, password: accountTable.password })
     .from(accountTable).where(eq(accountTable.userId, userId)).for('update');
   const target = rows.find(row => row.providerId === key.providerId && row.accountId === key.accountId);
   if (!target) throw new OidcIdentityError('OIDC_IDENTITY_NOT_FOUND');
-  const remaining = rows.filter(row => row !== target && (row.providerId !== 'credential' || (typeof row.password === 'string' && row.password !== '')));
-  if (!remaining.length) throw new OidcIdentityError('OIDC_LAST_SIGN_IN_METHOD');
+  let remaining = false;
+  for (const row of rows) {
+    if (row === target) continue;
+    if (row.providerId === 'credential' ? verifiablePassword(row.password, legacyPasswords)
+      : row.providerId.startsWith('oidc:') && (!isIssuerUsable || await isIssuerUsable(row.providerId.slice('oidc:'.length)) === true)) { remaining = true; break; }
+  }
+  if (!remaining) throw new OidcIdentityError('OIDC_LAST_SIGN_IN_METHOD');
   await tx.delete(accountTable).where(eq(accountTable.id, target.id));
 }
 
+const revocationPasses = 5;
 /**
  * Ends every session that began through `provider` (the key passed to `completeOidcSession`), when the app disables,
  * deletes or reconfigures it, and the two-factor challenges such a sign-in opened, with their attempt counters, so none
- * completes into a session later. Challenges go first, in one transaction, so a challenge completing concurrently fails,
- * or commits a session the second statement deletes, or one of the two aborts on a deadlock (SQLSTATE 40P01; a failed
- * revocation is retried). Resolves the number of sessions ended. Disable the provider first, so no new sign-in starts
- * through it meanwhile.
+ * completes into a session later. The known devices of the users whose sessions it ended are forgotten too.
+ *
+ * Each pass is one transaction, challenges first: a challenge completing concurrently fails, or commits a session the
+ * second statement deletes. A challenge opened while a pass runs never completes (its binding row is gone). Passes repeat
+ * while one still removes something (at most 5), so a sign-in that commits during a pass is ended by the next; a pass a
+ * deadlock or serialisation failure aborts is retried (5 times at most). Resolves the number of sessions ended. Disable the
+ * provider first, so no new sign-in starts through it; a sign-in already past the app's check that commits after the last
+ * pass is bound to the provider, and calling this again ends it.
  */
 export async function revokeProviderSessions(db: AnyDatabase, provider: string): Promise<number> {
   refuseLockedAuth(db, 'revokeProviderSessions');
   const key = providerKey(provider);
-  if (key === undefined) throw new TypeError('A provider key is 1 to 256 characters with no control characters.');
-  return transaction(db, async tx => {
-    // Parameterised raw statement by necessity: verification has no Drizzle table in the common schema.
-    await tx.execute(sql`WITH bound AS (SELECT identifier, substr(identifier, ${challengeProviderPrefix.length + 1}) AS challenge FROM verification
+  if (key === undefined) throw new TypeError('A provider key is at most 256 characters, not blank, with no control characters.');
+  const pass = () => transaction(db, async tx => {
+    // Parameterised raw statements by necessity: verification has no Drizzle table in the common schema.
+    const challenges = await tx.execute(sql`WITH bound AS (SELECT identifier, substr(identifier, ${challengeProviderPrefix.length + 1}) AS challenge FROM verification
         WHERE starts_with(identifier, ${challengeProviderPrefix}) AND value = ${key})
       DELETE FROM verification WHERE identifier IN (SELECT identifier FROM bound UNION ALL SELECT challenge FROM bound UNION ALL SELECT ${attemptsPrefix} || challenge FROM bound)`);
-    const ended = await tx.delete(sessionTable).where(eq(sessionTable.oidcProvider, key));
-    return (ended as unknown as { rowCount: number | null }).rowCount ?? 0;
+    const ended = await tx.delete(sessionTable).where(eq(sessionTable.oidcProvider, key)).returning({ userId: sessionTable.userId });
+    const users = [...new Set(ended.map(row => row.userId))];
+    if (users.length) await tx.execute(sql`DELETE FROM verification WHERE value IN ${users} AND starts_with(identifier, ${devicePrefix})`);
+    return { sessions: ended.length, challenges: (challenges as unknown as { rowCount: number | null }).rowCount ?? 0 };
   });
+  let total = 0;
+  for (let passes = 0, retries = 0; passes < revocationPasses;) {
+    let removed: { sessions: number; challenges: number };
+    try { removed = await pass(); } catch (error) {
+      if (retryable(error) && ++retries < revocationPasses) continue;
+      throw error;
+    }
+    total += removed.sessions;
+    passes++;
+    if (!removed.sessions && !removed.challenges) break;
+  }
+  return total;
 }
 
 /** Both verifiers on every attempt, one of them against a dummy; true only for a stored hash the password matches. */

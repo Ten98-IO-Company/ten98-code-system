@@ -35,7 +35,8 @@ function setup(options: Partial<Ten98AuthOptions> = {}, wrap?: (adapter: Adapter
   }));
   const user = async (email: string, passwordHash?: string) => {
     const { internalAdapter } = await context;
-    const created = await internalAdapter.createUser({ email, name: 'Test', emailVerified: true });
+    // closedAt: null, as workspace-team.sql's closed_at reads for an open account (completeOidcSession refuses undefined).
+    const created = await internalAdapter.createUser({ email, name: 'Test', emailVerified: true, closedAt: null });
     if (passwordHash) await internalAdapter.linkAccount({ userId: created.id, providerId: 'credential', accountId: created.id, password: passwordHash });
     return created.id;
   };
@@ -251,6 +252,17 @@ test('every sign-in challenge completeOidcSession opens carries its provider, wh
   const bindings = env.db.verification!.filter(row => String(row.identifier).startsWith('oidc-challenge:'));
   assert.deepEqual(bindings.map(row => row.value), identifiers.map(() => 'idp'));
   assert.deepEqual(bindings.map(row => row.identifier).sort(), identifiers.map(value => env.auth.storedVerificationIdentifier(`oidc-challenge:${value}`)).sort());
+  // Each binding lives exactly as long as its challenge.
+  for (const value of identifiers) {
+    const expiry = (identifier: string) => String(env.db.verification!.find(row => row.identifier === env.auth.storedVerificationIdentifier(identifier))?.expiresAt);
+    assert.equal(expiry(`oidc-challenge:${value}`), expiry(value));
+  }
+  // A password sign-in's challenge is bound too, to no provider (''), even when its request names one: only the
+  // server call completeOidcSession binds a provider.
+  const password = await env.post('/sign-in/email', { email: 'owner@example.com', password: PASSWORD, oidcUserId: 'any', provider: 'chosen' });
+  const passwordChallenge = decodeURIComponent(cookies(password).find(item => item.split('=')[0]!.endsWith('.two_factor'))!.split('=').slice(1).join('='));
+  const passwordBinding = env.db.verification!.find(row => row.identifier === env.auth.storedVerificationIdentifier(`oidc-challenge:${passwordChallenge.slice(0, passwordChallenge.lastIndexOf('.'))}`));
+  assert.equal(passwordBinding?.value, '');
 });
 
 test('a session alone cannot set up two-factor for an account without a password unless the app opts in', async () => {

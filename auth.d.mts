@@ -75,7 +75,8 @@ export declare function sessionTokenKey(secret: string, token: string): string;
  * and reset links, trusted devices and pending two-factor challenges (with their `2fa-otp-` and `2fa-attempts-` rows) go
  * with them. Then the session gains its provider binding, `oidcProvider`, and emails are stored lower-case
  * (`user_email_lowercase`): the migration stops, listing the account ids and never an address, while two accounts share
- * an email ignoring case, so an operator resolves them first. Rows an app writes with its own SQL are its own decision.
+ * an email ignoring case, so an operator resolves them first. A second run does not fail (it ends the sessions and pending
+ * rows again, nothing else). Rows an app writes with its own SQL are its own decision.
  */
 export declare const tokenStorageUpgradeStatements: string;
 /** The user `withLockedAuth` was asked to lock does not exist; answer it as not found. */
@@ -384,18 +385,32 @@ export declare function signInOidcUser(db: AnyDatabase, claims: OidcClaims, prov
 export declare function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity): Promise<{
     linked: boolean;
 }>;
+/** What `unlinkOidcIdentity` counts as another way to sign in. */
+export type UnlinkOptions = {
+    /** As `createTen98Auth`'s option: whether a legacy Campaign hash counts as a password (it is never verified otherwise). */
+    legacyPasswords?: boolean;
+    /** Whether an identity of this (normalised) issuer can still sign in, for an app that knows its providers; all can by default. */
+    isIssuerUsable?(issuer: string): boolean | Promise<boolean>;
+};
 /**
  * Unlinks an identity from the user `withLockedAuth` locked (inside that callback, on its `tx`), deleting its account
- * row. Refused with OIDC_LAST_SIGN_IN_METHOD when the user would be left with no way to sign in: no password and no
- * other linked identity. The user's sessions are not ended; pair it with `revokeAllSessions()` where the app wants that.
+ * row. Refused with OIDC_LAST_SIGN_IN_METHOD when the user would be left with no way to sign in. Only a way that can sign
+ * in counts: a password the preset can verify (see `UnlinkOptions.legacyPasswords`; an empty, malformed or unaccepted hash
+ * does not) or another linked OIDC identity whose issuer `isIssuerUsable` accepts. Account rows of any other provider do
+ * not count, as the preset signs no one in through them. The user's sessions are not ended; pair it with
+ * `revokeAllSessions()` where the app wants that.
  */
-export declare function unlinkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity): Promise<void>;
+export declare function unlinkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity, { legacyPasswords, isIssuerUsable }?: UnlinkOptions): Promise<void>;
 /**
  * Ends every session that began through `provider` (the key passed to `completeOidcSession`), when the app disables,
  * deletes or reconfigures it, and the two-factor challenges such a sign-in opened, with their attempt counters, so none
- * completes into a session later. Challenges go first, in one transaction, so a challenge completing concurrently fails,
- * or commits a session the second statement deletes, or one of the two aborts on a deadlock (SQLSTATE 40P01; a failed
- * revocation is retried). Resolves the number of sessions ended. Disable the provider first, so no new sign-in starts
- * through it meanwhile.
+ * completes into a session later. The known devices of the users whose sessions it ended are forgotten too.
+ *
+ * Each pass is one transaction, challenges first: a challenge completing concurrently fails, or commits a session the
+ * second statement deletes. A challenge opened while a pass runs never completes (its binding row is gone). Passes repeat
+ * while one still removes something (at most 5), so a sign-in that commits during a pass is ended by the next; a pass a
+ * deadlock or serialisation failure aborts is retried (5 times at most). Resolves the number of sessions ended. Disable the
+ * provider first, so no new sign-in starts through it; a sign-in already past the app's check that commits after the last
+ * pass is bound to the provider, and calling this again ends it.
  */
 export declare function revokeProviderSessions(db: AnyDatabase, provider: string): Promise<number>;

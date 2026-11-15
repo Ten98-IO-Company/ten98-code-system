@@ -604,6 +604,12 @@ test('the published upgrade statements end plain sessions and better-auth verifi
     await pre.query('INSERT INTO session(id,"expiresAt",token,"userId","oidcProvider") VALUES($1,now()+interval \'1 day\',$2,$3,$4)', [randomUUID(), 'bound', 'd1', 'idp']);
     await assert.rejects(pre.query('INSERT INTO "user"(id,name,email) VALUES($1,$2,$3)', ['e1', 'Pre', 'Later@example.com']),
       (error: { code?: string; constraint?: string }) => error.code === '23514' && error.constraint === 'user_email_lowercase');
+    // The constraint was added NOT VALID and then validated; a second run passes and adds nothing.
+    const constraints = async () => (await pre.query<{ convalidated: boolean }>(`SELECT convalidated FROM pg_constraint WHERE conname = 'user_email_lowercase' AND conrelid = '"user"'::regclass`)).rows;
+    assert.deepEqual(await constraints(), [{ convalidated: true }]);
+    await pre.query(tokenStorageUpgradeStatements);
+    assert.deepEqual(await constraints(), [{ convalidated: true }]);
+    assert.equal((await pre.query('SELECT 1 FROM information_schema.columns WHERE table_schema = \'pre\' AND table_name = \'session\' AND column_name = \'oidcProvider\'')).rowCount, 1);
   } finally { await pre.end(); }
   // The adoption guide publishes exactly these statements.
   assert.ok(readFileSync(new URL('../docs/FEATURE-ADOPTION.md', import.meta.url), 'utf8').includes(tokenStorageUpgradeStatements));
@@ -881,8 +887,9 @@ test('a session better-auth creates for any other account than the locked one is
 test('locked auth refuses to run without the unique index on lower(email), and refuses two matching accounts', { skip }, async () => {
   assert.equal(await auth.assertEmailIndex(db), undefined);
   // A schema without the index, holding case-variant twins.
-  // Every other table the schema check asks for is there, so only the index is missing.
+  // Every other table and index the schema check asks for is there, so only the email index is missing.
   await pool!.query(`CREATE SCHEMA bare; CREATE TABLE bare."user" (LIKE public."user" INCLUDING DEFAULTS); CREATE TABLE bare.account (LIKE public.account INCLUDING DEFAULTS);
+    ALTER TABLE bare.account ADD UNIQUE ("providerId", "accountId");
     CREATE TABLE bare.session (LIKE public.session INCLUDING ALL); CREATE TABLE bare.verification (LIKE public.verification INCLUDING ALL);
     CREATE SCHEMA dropped; CREATE TABLE dropped."user" (LIKE public."user" INCLUDING ALL); CREATE TABLE dropped.account (LIKE public.account INCLUDING ALL);
     ALTER TABLE dropped."user" DROP CONSTRAINT user_email_lowercase;
@@ -1057,10 +1064,12 @@ test('assertSchema fails at start-up on campaign-style table names, naming the e
     CREATE TABLE campaign.verifications (id text PRIMARY KEY, identifier text, value text, expires_at bigint);
     CREATE SCHEMA partial; CREATE TABLE partial."user" (LIKE public."user" INCLUDING ALL); ALTER TABLE partial."user" DROP COLUMN closed_at;
     CREATE TABLE partial.account (LIKE public.account INCLUDING ALL); CREATE TABLE partial.session (LIKE public.session INCLUDING ALL);
-    ALTER TABLE partial.session DROP COLUMN "oidcProvider"; CREATE TABLE partial.verification (LIKE public.verification INCLUDING ALL);`);
-  const pools = ['campaign', 'partial'].map(name => new pg.Pool({ connectionString: url, max: 2, options: `-c search_path=${name}` }));
+    ALTER TABLE partial.session DROP COLUMN "oidcProvider"; CREATE TABLE partial.verification (LIKE public.verification INCLUDING ALL);
+    CREATE SCHEMA nounique; CREATE TABLE nounique."user" (LIKE public."user" INCLUDING ALL); CREATE TABLE nounique.account (LIKE public.account INCLUDING DEFAULTS);
+    CREATE TABLE nounique.session (LIKE public.session INCLUDING ALL); CREATE TABLE nounique.verification (LIKE public.verification INCLUDING ALL);`);
+  const pools = ['campaign', 'partial', 'nounique'].map(name => new pg.Pool({ connectionString: url, max: 2, options: `-c search_path=${name}` }));
   try {
-    const [campaignDb, partialDb] = pools.map(item => drizzle(item, { schema }));
+    const [campaignDb, partialDb, nouniqueDb] = pools.map(item => drizzle(item, { schema }));
     const campaignAuth = authOver(campaignDb!);
     const mismatch = (pattern: RegExp) => (error: unknown) => error instanceof SchemaMismatchError && error.code === 'AUTH_SCHEMA_MISMATCH' && pattern.test(error.message);
     const names = /Locked auth needs the tables "user" \(id, email, closed_at\), account \(userId, providerId, password, updatedAt\), session \(id, token, userId, expiresAt, oidcProvider\), verification \(id, identifier, value, expiresAt\)\. Missing: table "user"; table account; table session; table verification\./;
@@ -1069,6 +1078,8 @@ test('assertSchema fails at start-up on campaign-style table names, naming the e
     await assert.rejects(campaignAuth.signInWithPassword(campaignDb!, { source: SOURCE, email: address('campaign'), password: PASSWORD }, allow), mismatch(names));
     await assert.rejects(campaignAuth.withLockedAuth(campaignDb!, randomUUID(), async () => 1), mismatch(names));
     await assert.rejects(authOver(partialDb!).assertSchema(partialDb!), mismatch(/Missing: "user"\.closed_at; session\.oidcProvider\./));
+    // Every column is there, but nothing makes (providerId, accountId) unique: linked identities could repeat.
+    await assert.rejects(authOver(nouniqueDb!).assertSchema(nouniqueDb!), mismatch(/Missing: account unique \("providerId", "accountId"\)\./));
   } finally { await Promise.all(pools.map(item => item.end())); }
 });
 
@@ -1091,6 +1102,40 @@ const refusedWith = (code: string, status?: number) => (error: unknown) => error
 const identitiesOf = async (userId: string) => (await pool!.query<{ providerId: string; accountId: string }>(
   'SELECT "providerId","accountId" FROM account WHERE "userId"=$1 AND "providerId" LIKE \'oidc:%\' ORDER BY "providerId","accountId"', [userId])).rows;
 const usersAt = async (email: string) => (await pool!.query('SELECT 1 FROM "user" WHERE lower(email)=lower($1)', [email])).rowCount;
+/** The raw challenge identifier a two_factor cookie carries (signed by better-call). */
+const challengeOf = (cookie: string) => {
+  const pair = cookie.split('; ').find(item => item.split('=')[0]!.endsWith('.two_factor'))!;
+  const value = decodeURIComponent(pair.slice(pair.indexOf('=') + 1));
+  return value.slice(0, value.lastIndexOf('.'));
+};
+/** True once at least `count` backends of this database wait on a lock, so a forced interleaving is in place. */
+async function waitersAtLeast(count: number) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const { rows } = await pool!.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'");
+    if (rows[0]!.n >= count) return true;
+    await delay(25);
+  }
+  return false;
+}
+/**
+ * A trigger that pauses matching inserts into `table` on advisory lock `key` until the test's own connection, which
+ * holds it, commits: the way these tests force one side of a race to stop between two of its statements.
+ */
+async function pauseInserts(table: 'session' | 'verification', key: number, when: string) {
+  const name = `pause_${table}_${key}`;
+  await pool!.query(`CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(${key}); RETURN NEW; END $$;
+    CREATE TRIGGER ${name} BEFORE INSERT ON ${table} FOR EACH ROW WHEN (${when}) EXECUTE FUNCTION ${name}();`);
+  const holder = await pool!.connect();
+  await holder.query('BEGIN');
+  await holder.query('SELECT pg_advisory_xact_lock($1)', [key]);
+  return {
+    holder,
+    async release() { await holder.query('COMMIT'); },
+    async drop() { holder.release(); await pool!.query(`DROP TRIGGER ${name} ON ${table}; DROP FUNCTION ${name}();`); },
+  };
+}
+const providerSignIn = (userId: string, provider: string, target: Ten98Auth = auth) => target.api.completeOidcSession({ body: { oidcUserId: userId, provider }, headers: {}, asResponse: true });
+const boundSessions = async (provider: string) => (await pool!.query('SELECT 1 FROM session WHERE "oidcProvider"=$1', [provider])).rowCount;
 const issuerCases: [string, string][] = [
   ['https://IdP.Example.COM/', 'https://idp.example.com'],
   ['HTTPS://idp.example.com:443/realms/Acme/', 'https://idp.example.com/realms/Acme'],
@@ -1098,7 +1143,8 @@ const issuerCases: [string, string][] = [
   ['http://localhost:8080/', 'http://localhost:8080'],
   ['https://idp.example.com:80/', 'https://idp.example.com:80'],
   ['https://idp.example.com:4430', 'https://idp.example.com:4430'],
-  ['https://idp.example.com//', 'https://idp.example.com/'],
+  ['https://idp.example.com:/', 'https://idp.example.com'],
+  ['https://[::1]:/realms/', 'https://[::1]/realms'],
   ['https://login.example.com/Tenant-ID/v2.0', 'https://login.example.com/Tenant-ID/v2.0'],
   ['https://idp.example.com/a%2Fb/?Tenant=X#Frag', 'https://idp.example.com/a%2Fb?Tenant=X#Frag'],
   ['https://Admin@IdP.example.com/', 'https://Admin@idp.example.com'],
@@ -1107,26 +1153,41 @@ const issuerCases: [string, string][] = [
   ['custom+Scheme://Host/', 'custom+scheme://host'],
   ['https://idp.example.com', 'https://idp.example.com'],
 ];
-const badIssuers = ['idp.example.com', '', 'https://', 'https:///realms', 'https://:443/', ' https://idp.example.com'];
+// Malformed authorities (a second port, a non-numeric port, a bare bracket) and a path ending in '//' are refused, so a
+// normalised issuer normalises to itself.
+const badIssuers = ['idp.example.com', '', 'https://', 'https:///realms', 'https://:443/', ' https://idp.example.com', 'https://h:443:443/', 'https://h:x/',
+  'https://h]/', 'https://[::1/', 'https://idp.example.com//', 'https://h/a//?q'];
+const tryNormalise = (raw: string) => { try { return normaliseOidcIssuer(raw); } catch { return null; } };
+// Seeded, so a failure reproduces: issuers built from the characters the rule treats specially.
+function generatedIssuers(count: number): string[] {
+  let seed = 143;
+  const next = (n: number) => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; seed >>>= 0; return seed % n; };
+  const schemes = ['https://', 'HTTP://', 'https://', 'x+y://', 'https:/', ''];
+  const parts = ['Idp', 'h', '.example', ':', ':443', ':80', ':', '[', ']', '[::1]', '@', 'U@', '/', '//', '/', '?', '#', 'q=A', '%2F', 'İ', ' ', '\n', '0'];
+  return Array.from({ length: count }, () => schemes[next(schemes.length)]! + Array.from({ length: 1 + next(7) }, () => parts[next(parts.length)]!).join(''));
+}
 
-test('normaliseOidcIssuer lowercases the scheme and host, drops a default port and one trailing slash, and keeps the rest', () => {
+test('normaliseOidcIssuer lowercases the scheme and host, drops an empty or default port and one trailing slash, keeps the rest, and is idempotent', () => {
   for (const [raw, expected] of issuerCases) {
     assert.equal(normaliseOidcIssuer(raw), expected, raw);
     assert.equal(oidcProviderId(raw), `oidc:${expected}`, raw);
   }
   for (const raw of [...badIssuers, 42, undefined]) assert.throws(() => normaliseOidcIssuer(raw as string), TypeError, String(raw));
+  // Normalising twice equals normalising once.
+  for (const raw of [...issuerCases.map(([value]) => value), ...generatedIssuers(5000)]) {
+    const once = tryNormalise(raw);
+    if (once !== null) assert.equal(normaliseOidcIssuer(once), once, JSON.stringify(raw));
+  }
 });
 
-test('normaliseOidcIssuerSql gives the function\'s result for every case, and NULL where it throws', { skip }, async () => {
+test('normaliseOidcIssuerSql gives the function\'s result for every case and 5000 generated issuers, and NULL where it throws', { skip }, async () => {
   const client = await pool!.connect();
   try {
     await client.query(normaliseOidcIssuerSql);
-    for (const raw of [...issuerCases.map(([value]) => value), ...badIssuers]) {
-      let expected: string | null;
-      try { expected = normaliseOidcIssuer(raw); } catch { expected = null; }
-      const { rows } = await client.query<{ normalised: string | null }>('SELECT pg_temp.ten98_normalise_oidc_issuer($1) AS normalised', [raw]);
-      assert.equal(rows[0]!.normalised, expected, raw);
-    }
+    const inputs = [...issuerCases.map(([value]) => value), ...badIssuers, ...generatedIssuers(5000)];
+    const { rows } = await client.query<{ raw: string; normalised: string | null }>('SELECT raw, pg_temp.ten98_normalise_oidc_issuer(raw) AS normalised FROM unnest($1::text[]) AS raw', [inputs]);
+    assert.equal(rows.length, inputs.length);
+    for (const { raw, normalised } of rows) assert.equal(normalised, tryNormalise(raw), JSON.stringify(raw));
   } finally { client.release(); }
 });
 
@@ -1259,10 +1320,20 @@ test('revokeProviderSessions ends that provider\'s sessions and pending challeng
   const factorOne = await challenged('p1-factor'), factorTwo = await challenged('p2-factor');
   const c1 = await providerSession(factorOne.id, 'p1'), c2 = await providerSession(factorTwo.id, 'p2');
   assert.equal((await pool!.query('SELECT 1 FROM verification WHERE starts_with(identifier, \'oidc-challenge:\') AND value IN (\'p1\', \'p2\')')).rowCount, 2);
+  const counterOf = (cookie: string) => auth.storedVerificationIdentifier(`2fa-attempts-${challengeOf(cookie)}`);
+  const counted = async (cookie: string) => (await pool!.query('SELECT 1 FROM verification WHERE identifier=$1', [counterOf(cookie)])).rowCount;
+  assert.deepEqual([await counted(c1), await counted(c2)], [1, 1]);
+  // A one-factor provider sign-in issued a known device; so did the password sign-in, which the revocation spares.
+  assert.ok((await deviceRows(one)).length > 0);
+  const localDevices = await deviceRows((await pool!.query<{ id: string }>('SELECT id FROM "user" WHERE email=$1', [localEmail])).rows[0]!.id);
+  assert.ok(localDevices.length > 0);
   assert.equal(await revokeProviderSessions(db, 'p1'), 1);
   assert.equal(await auth.api.getSession({ headers: { cookie: s1 } }), null);
   assert.ok(await auth.api.getSession({ headers: { cookie: s2r } }));
   assert.ok(await auth.api.getSession({ headers: { cookie: local } }));
+  // The challenge's attempt counter went with it, and so did the known devices of the user signed out.
+  assert.deepEqual([await counted(c1), await counted(c2)], [0, 1]);
+  assert.deepEqual(await deviceRows(one), []);
   // p1's challenge went with it, so it cannot complete into a session; p2's completes into a session bound to p2.
   assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', c1, { code: totp(factorOne.uri, 1) }))).status, 401);
   const completed = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', c2, { code: totp(factorTwo.uri, 1) }));
@@ -1274,7 +1345,8 @@ test('revokeProviderSessions ends that provider\'s sessions and pending challeng
   assert.ok(await auth.api.getSession({ headers: { cookie: local } }));
   // A provider key is required, and a locked-auth transaction (one user's rows) cannot end other users' sessions.
   assert.equal((await auth.api.completeOidcSession({ body: { oidcUserId: one } as { oidcUserId: string; provider: string }, headers: {}, asResponse: true })).status, 400);
-  await assert.rejects(revokeProviderSessions(db, ''), TypeError);
+  for (const blank of ['', ' ', '\t']) await assert.rejects(revokeProviderSessions(db, blank), TypeError);
+  assert.equal((await auth.api.completeOidcSession({ body: { oidcUserId: one, provider: '  ' }, headers: {}, asResponse: true })).status, 400);
   await assert.rejects(auth.withLockedAuth(db, one, (_bound, tx) => revokeProviderSessions(tx, 'p1')), refused);
 });
 
@@ -1502,4 +1574,251 @@ test('the limiter runs before the lane too: a refused known device gets 429 whil
   assert.deepEqual([refused.status, asked], [429, 1]);
   assert.equal(await attempts(id), 0);
   await laneHolder;
+});
+
+// Races around revokeProviderSessions, each forced: pauseInserts stops one side between two of its statements.
+test('a two-factor challenge opened while its provider is revoked never completes into a session', { skip }, async () => {
+  const factor = await challenged('window');
+  const before = await sessions(factor.id);
+  // The challenge row's insert waits; its binding row, written just before it, is already committed.
+  const pause = await pauseInserts('verification', 424_201, `NEW.value = '${factor.id}' AND starts_with(NEW.identifier, '2fa-') AND NOT starts_with(NEW.identifier, '2fa-attempts-')`);
+  try {
+    const signing = providerSignIn(factor.id, 'window');
+    const waited = await someoneWaits();
+    const bindings = (await pool!.query("SELECT 1 FROM verification WHERE starts_with(identifier, 'oidc-challenge:') AND value = 'window'")).rowCount;
+    const revoked = await revokeProviderSessions(db, 'window');
+    await pause.release();
+    assert.deepEqual([waited, bindings, revoked], [true, 1, 0]);
+    const challenge = cookieOf(await signing);
+    assert.ok(challengeOf(challenge));
+    // The challenge exists, but its binding went with the revocation, so it cannot complete.
+    const completed = await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', challenge, { code: totp(factor.uri, 1) }));
+    assert.equal(completed.status, 401);
+    assert.deepEqual([await sessions(factor.id), await boundSessions('window')], [before, 0]);
+  } finally { await pause.drop(); }
+});
+
+test('a challenge completing while its provider is revoked leaves no session, because challenges are revoked before sessions', { skip }, async () => {
+  const factor = await challenged('race-order');
+  const challenge = cookieOf(await providerSignIn(factor.id, 'race'));
+  // The completion waits as it inserts its session, holding the challenge, its counter and its binding, uncommitted.
+  const pause = await pauseInserts('session', 424_202, `NEW."oidcProvider" = 'race'`);
+  try {
+    const completing = auth.verifyTwoFactor(db, post('/two-factor/verify-totp', challenge, { code: totp(factor.uri, 1) }));
+    const first = await someoneWaits();
+    const revoking = revokeProviderSessions(db, 'race');
+    revoking.catch(() => undefined);
+    // The revocation now waits on the rows the completion holds.
+    const both = await waitersAtLeast(2);
+    await pause.release();
+    assert.deepEqual([first, both], [true, true]);
+    const [completed, revoked] = await Promise.all([completing, revoking]);
+    assert.deepEqual([completed.status, revoked, await boundSessions('race')], [200, 1, 0]);
+    assert.equal(await auth.api.getSession({ headers: { cookie: cookieOf(completed) } }), null);
+  } finally { await pause.drop(); }
+});
+
+test('a provider sign-in that commits while a revocation pass runs is ended by the next pass', { skip }, async () => {
+  const early = await account_(address('loop-a')), late = await account_(address('loop-b'));
+  assert.equal((await providerSignIn(early, 'loop')).status, 200);
+  const holder = await pool!.connect();
+  try {
+    await holder.query('BEGIN');
+    // The pass's session DELETE waits on this row; a session committed meanwhile is not in its snapshot.
+    await holder.query('SELECT 1 FROM session WHERE "userId"=$1 FOR UPDATE', [early]);
+    const revoking = revokeProviderSessions(db, 'loop');
+    revoking.catch(() => undefined);
+    const waited = await someoneWaits();
+    const lateSignIn = await providerSignIn(late, 'loop');
+    await holder.query('COMMIT');
+    assert.deepEqual([waited, lateSignIn.status], [true, 200]);
+    assert.equal(await revoking, 2);
+    assert.equal(await boundSessions('loop'), 0);
+  } finally { await holder.query('ROLLBACK').catch(() => undefined); holder.release(); }
+});
+
+test('a challenge completion a deadlock aborts answers a retryable 503, and the same request then signs in', { skip }, async () => {
+  const factor = await challenged('deadlock');
+  const challenge = cookieOf(await providerSignIn(factor.id, 'dl'));
+  const stored = auth.storedVerificationIdentifier(challengeOf(challenge));
+  const pause = await pauseInserts('session', 424_203, `NEW."oidcProvider" = 'dl'`);
+  const request = () => post('/two-factor/verify-totp', challenge, { code: totp(factor.uri, 1) });
+  try {
+    const completing = auth.verifyTwoFactor(db, request());
+    assert.equal(await someoneWaits(), true);
+    // The holder waits on the challenge row the completion consumed: a cycle. The completion's wait began first, so its
+    // deadlock check runs first (the holder's is delayed) and PostgreSQL aborts it with 40P01.
+    await pause.holder.query("SET LOCAL deadlock_timeout = '10s'");
+    const holding = pause.holder.query('DELETE FROM verification WHERE identifier=$1', [stored]);
+    const completed = await completing;
+    await holding;
+    await pause.holder.query('ROLLBACK');
+    assert.equal(completed.status, 503);
+    assert.equal(completed.headers.get('retry-after'), '1');
+    assert.equal((await completed.json() as { code: string }).code, 'SIGN_IN_RETRY');
+    assert.equal(await boundSessions('dl'), 0);
+    // Nothing the aborted completion did persisted: the challenge stands and completes.
+    const retried = await auth.verifyTwoFactor(db, request());
+    assert.equal(retried.status, 200);
+    assert.equal(await boundSessions('dl'), 1);
+  } finally { await pause.drop(); }
+});
+
+test('first provider sign-ins of one identity queued on its email lock resolve to one account: the identity is read again under the lock', { skip }, async () => {
+  const email = address('queued'), sub = subject();
+  const holder = await pool!.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT pg_advisory_xact_lock(109859, hashtext($1))', [email]);
+    const signIns = Promise.allSettled([signInOidcUser(db, claimsFor(email, sub), trusted), signInOidcUser(db, claimsFor(email, sub), trusted)]);
+    const waited = await waitersAtLeast(2);
+    await holder.query('COMMIT');
+    assert.equal(waited, true);
+    const settled = await signIns;
+    assert.deepEqual(settled.map(item => item.status), ['fulfilled', 'fulfilled'], JSON.stringify(settled));
+    const results = settled.map(item => (item as PromiseFulfilledResult<{ userId: string; created: boolean }>).value);
+    assert.equal(new Set(results.map(item => item.userId)).size, 1);
+    assert.deepEqual(results.map(item => item.created).sort(), [false, true]);
+    assert.equal(await usersAt(email), 1);
+  } finally { await holder.query('ROLLBACK').catch(() => undefined); holder.release(); }
+});
+
+test('first provider sign-ins of one identity under two emails at once resolve to one account: the loser falls back to it', { skip }, async () => {
+  const first = address('twin-a'), second = address('twin-b'), sub = subject();
+  const holder = await pool!.connect();
+  try {
+    await holder.query('BEGIN');
+    for (const email of [first, second]) await holder.query('SELECT pg_advisory_xact_lock(109859, hashtext($1))', [email]);
+    const signIns = Promise.allSettled([first, second].map(email => signInOidcUser(db, claimsFor(email, sub), trusted)));
+    const waited = await waitersAtLeast(2);
+    await holder.query('COMMIT');
+    assert.equal(waited, true);
+    const settled = await signIns;
+    assert.deepEqual(settled.map(item => item.status), ['fulfilled', 'fulfilled'], JSON.stringify(settled));
+    const results = settled.map(item => (item as PromiseFulfilledResult<{ userId: string; created: boolean }>).value);
+    assert.equal(new Set(results.map(item => item.userId)).size, 1);
+    assert.deepEqual(results.map(item => item.created).sort(), [false, true]);
+    assert.equal((await usersAt(first))! + (await usersAt(second))!, 1);
+  } finally { await holder.query('ROLLBACK').catch(() => undefined); holder.release(); }
+});
+
+test('unlinking waits for a concurrent change to the user\'s other sign-in methods and counts what remains', { skip }, async () => {
+  const id = await account_(address('unlink-race'), { hash: null });
+  const kept = { issuer: ISSUER, subject: subject() }, other = { issuer: 'https://other.example.com', subject: subject() };
+  for (const identity of [kept, other]) await auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, identity));
+  const holder = await pool!.connect();
+  try {
+    await holder.query('BEGIN');
+    // A writer that does not hold the user row (an app's own statement, say) removes the other identity meanwhile.
+    await holder.query('DELETE FROM account WHERE "providerId"=$1 AND "accountId"=$2', [oidcProviderId(other.issuer), other.subject]);
+    const unlinking = auth.withLockedAuth(db, id, (_bound, tx) => unlinkOidcIdentity(tx, kept));
+    unlinking.catch(() => undefined);
+    const waited = await someoneWaits();
+    await holder.query('COMMIT');
+    assert.equal(waited, true);
+    await assert.rejects(unlinking, refusedWith('OIDC_LAST_SIGN_IN_METHOD'));
+    assert.deepEqual((await identitiesOf(id)).map(row => row.accountId), [kept.subject]);
+  } finally { await holder.query('ROLLBACK').catch(() => undefined); holder.release(); }
+});
+
+test('only a way that can sign in keeps an identity unlinkable: a verifiable password, or an identity of a usable issuer', { skip }, async () => {
+  const id = await account_(address('methods'), { hash: null });
+  const identity = { issuer: ISSUER, subject: subject() }, retired = { issuer: 'https://retired.example.com', subject: subject() };
+  await auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, identity));
+  const unlink = (options: Parameters<typeof unlinkOidcIdentity>[2] = {}) => auth.withLockedAuth(db, id, (_bound, tx) => unlinkOidcIdentity(tx, identity, options));
+  const setPassword = (value: string | null) => pool!.query('UPDATE account SET password=$1 WHERE "userId"=$2 AND "providerId"=\'credential\'', [value, id]);
+  // Not ways in: another provider's account row, an empty or malformed hash, or a legacy hash with legacy passwords off.
+  await pool!.query('INSERT INTO account(id,"accountId","providerId","userId") VALUES($1,$2,\'google\',$3)', [randomUUID(), `g-${randomUUID()}`, id]);
+  for (const value of ['', 'not-a-hash', `${hashes.old}x`, hashes.legacy]) {
+    await setPassword(value);
+    await assert.rejects(unlink(), refusedWith('OIDC_LAST_SIGN_IN_METHOD'), value);
+  }
+  // Nor an identity of an issuer the app no longer accepts.
+  await setPassword(null);
+  await auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, retired));
+  const asked: string[] = [];
+  await assert.rejects(unlink({ isIssuerUsable: issuer => { asked.push(issuer); return issuer !== normaliseOidcIssuer(retired.issuer); } }), refusedWith('OIDC_LAST_SIGN_IN_METHOD'));
+  assert.deepEqual(asked, [normaliseOidcIssuer(retired.issuer)]);
+  await pool!.query('DELETE FROM account WHERE "providerId"=$1', [oidcProviderId(retired.issuer)]);
+  // A legacy hash is a way in where legacy passwords are accepted.
+  await setPassword(hashes.legacy);
+  await unlink({ legacyPasswords: true });
+  assert.deepEqual(await identitiesOf(id), []);
+});
+
+test('an invitation accepted with an identity another account holds is refused before anything is written', { skip }, async () => {
+  const holderId = await account_(address('holder'));
+  const identity = { issuer: ISSUER, subject: subject() };
+  await auth.withLockedAuth(db, holderId, (_bound, tx) => linkOidcIdentity(tx, identity));
+  const owner = await account_(address('inviter-2'));
+  const invited = address('second-invitee');
+  const { token } = await inTransaction(async client => team.inviteMember(client, await workspaceOf(owner), owner, { email: invited, role: 'viewer' }));
+  // A caller that commits after the refusal still leaves no account behind.
+  const client = await pool!.connect();
+  try {
+    await client.query('BEGIN');
+    await assert.rejects(team.acceptVerifiedOidcInvitation(client as unknown as TeamClient, token, { email: invited, name: 'Second', ...identity }),
+      (error: { code?: string; status?: number }) => error.code === 'OIDC_IDENTITY_IN_USE' && error.status === 409);
+    await client.query('COMMIT');
+  } finally { client.release(); }
+  assert.equal(await usersAt(invited), 0);
+  assert.deepEqual(await signInOidcUser(db, { iss: ISSUER, sub: identity.subject }, {}), { userId: holderId, created: false });
+});
+
+test('completeOidcSession refuses a closed account, or one isAccountUsable refuses, as it refuses an unknown user', { skip }, async () => {
+  const closedId = await account_(address('closed-provider'));
+  await pool!.query('UPDATE "user" SET closed_at=now() WHERE id=$1', [closedId]);
+  const [closed, unknown] = [await providerSignIn(closedId, 'idp'), await providerSignIn(randomUUID(), 'idp')];
+  assert.deepEqual([closed.status, await closed.text()], [unknown.status, await unknown.text()]);
+  assert.equal(closed.status, 401);
+  assert.equal(await sessions(closedId), 0);
+  const open = await account_(address('refused-provider'));
+  const asked: string[] = [];
+  const refusing = authOver(db, { isAccountUsable: account => { asked.push(account.id); return false; } });
+  assert.equal((await providerSignIn(open, 'idp', refusing)).status, 401);
+  assert.deepEqual(asked, [open]);
+  assert.equal(await sessions(open), 0);
+  assert.equal((await providerSignIn(open, 'idp')).status, 200);
+  // A Drizzle user table that does not map closed_at cannot have usability judged: no session either way.
+  const unmappedUser = pgTable('user', {
+    id: text('id').primaryKey(), name: text('name').notNull(), email: text('email').notNull(), emailVerified: boolean('emailVerified').notNull(), image: text('image'),
+    createdAt: stamp('createdAt').notNull(), updatedAt: stamp('updatedAt').notNull(), twoFactorEnabled: boolean('twoFactorEnabled').notNull(),
+  });
+  const unmapped = { ...schema, user: unmappedUser };
+  const unmappedAuth = createTen98Auth({ database: drizzleAdapter(db, { provider: 'pg', schema: unmapped }), appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test' });
+  const other = await account_(address('unmapped'));
+  const outcome = await providerSignIn(other, 'idp', unmappedAuth).then(response => response.status, () => 'refused');
+  assert.notEqual(outcome, 200);
+  assert.equal(await sessions(other), 0);
+});
+
+test('better-auth\'s own account routes are off: /unlink-account and /list-accounts answer 404 and change nothing', { skip }, async () => {
+  const email = address('routes');
+  const id = await account_(email);
+  await auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, { issuer: ISSUER, subject: subject() }));
+  const cookie = cookieOf(await signIn(email));
+  const rows = async () => (await pool!.query('SELECT id FROM account WHERE "userId"=$1 ORDER BY id', [id])).rows;
+  const before = await rows();
+  for (const request of [post('/unlink-account', cookie, { providerId: 'credential' }), post('/unlink-account', cookie, { providerId: oidcProviderId(ISSUER) }),
+    new Request(`${ORIGIN}/api/auth/list-accounts`, { headers: { cookie, origin: ORIGIN } })]) {
+    assert.equal((await auth.handler(request)).status, 404, new URL(request.url).pathname);
+  }
+  assert.deepEqual(await rows(), before);
+});
+
+test('no request can bind, rebind or unbind a session: /update-session refuses oidcProvider', { skip }, async () => {
+  const id = await account_(address('pinned'));
+  const cookie = cookieOf(await providerSignIn(id, 'pinned'));
+  for (const value of [null, 'other', '']) assert.equal((await auth.handler(post('/update-session', cookie, { oidcProvider: value }))).status, 400, String(value));
+  assert.equal((await auth.api.getSession({ headers: { cookie } }))!.session.oidcProvider, 'pinned');
+});
+
+test('a blank subject or provider key, or a subject with a control character, is refused before any query', { skip }, async () => {
+  const id = await account_(address('inputs'));
+  for (const bad of [' ', '\t', 'a\u0000b', 'line\nbreak', 'del\u007f']) {
+    await assert.rejects(signInOidcUser(db, claimsFor(address('input'), bad), trusted), TypeError, JSON.stringify(bad));
+    await assert.rejects(auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, { issuer: ISSUER, subject: bad })), TypeError, JSON.stringify(bad));
+  }
+  for (const bad of [' ', '\t\t']) assert.equal((await providerSignIn(id, bad)).status, 400);
+  assert.deepEqual(await identitiesOf(id), []);
 });

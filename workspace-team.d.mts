@@ -6,7 +6,7 @@ export interface TeamClient {
         rowCount: number | null;
     }>;
 }
-export type TeamErrorCode = 'INVALID_INPUT' | 'SIGN_IN_REQUIRED' | 'NOT_FOUND' | 'FORBIDDEN' | 'LAST_OWNER' | 'FACTOR_REQUIRED' | 'INVITATION_UNAVAILABLE' | 'INVITATION_NOT_PENDING' | 'MEMBER_EXISTS' | 'WRONG_ACCOUNT' | 'CONFIRMATION_MISMATCH' | 'MEMBERSHIP_CHANGED' | 'OIDC_INVITE_EMAIL_MISMATCH' | 'OIDC_ACCOUNT_EXISTS' | 'OPERATOR_REQUIRED';
+export type TeamErrorCode = 'INVALID_INPUT' | 'SIGN_IN_REQUIRED' | 'NOT_FOUND' | 'FORBIDDEN' | 'LAST_OWNER' | 'FACTOR_REQUIRED' | 'INVITATION_UNAVAILABLE' | 'INVITATION_NOT_PENDING' | 'MEMBER_EXISTS' | 'WRONG_ACCOUNT' | 'CONFIRMATION_MISMATCH' | 'MEMBERSHIP_CHANGED' | 'OIDC_INVITE_EMAIL_MISMATCH' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OPERATOR_REQUIRED';
 /** Every refusal: `status` is the HTTP status that fits and `message` is safe to show. */
 export declare class TeamError extends Error {
     readonly status: 400 | 401 | 403 | 404 | 409 | 410;
@@ -141,7 +141,8 @@ export declare function createWorkspaceTeam({ hashPassword, emailLockKey }: {
      * Server only: `identity` must be cryptographically verified OIDC claims, and its email the invited one. Creates the
      * account; an existing one must link explicitly. With `issuer` and `subject` (the token's `iss` and `sub`) it also
      * links that identity to the new account, as an account row with no provider tokens, so the next sign-in through
-     * the provider finds it; an identity already linked to another account is refused as OIDC_ACCOUNT_EXISTS.
+     * the provider finds it; an identity already linked to another account is refused as OIDC_IDENTITY_IN_USE. An
+     * acceptance through a provider should always pass them.
      */
     acceptVerifiedOidcInvitation(client: TeamClient, tokenValue: unknown, identity: {
         email: string;

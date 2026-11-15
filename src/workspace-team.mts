@@ -22,7 +22,7 @@ export interface TeamClient {
 export type TeamErrorCode =
   | 'INVALID_INPUT' | 'SIGN_IN_REQUIRED' | 'NOT_FOUND' | 'FORBIDDEN' | 'LAST_OWNER' | 'FACTOR_REQUIRED' | 'INVITATION_UNAVAILABLE'
   | 'INVITATION_NOT_PENDING' | 'MEMBER_EXISTS' | 'WRONG_ACCOUNT' | 'CONFIRMATION_MISMATCH' | 'MEMBERSHIP_CHANGED'
-  | 'OIDC_INVITE_EMAIL_MISMATCH' | 'OIDC_ACCOUNT_EXISTS' | 'OPERATOR_REQUIRED';
+  | 'OIDC_INVITE_EMAIL_MISMATCH' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OPERATOR_REQUIRED';
 /** Every refusal: `status` is the HTTP status that fits and `message` is safe to show. */
 export class TeamError extends Error {
   readonly status: 400 | 401 | 403 | 404 | 409 | 410;
@@ -361,7 +361,8 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }: { 
      * Server only: `identity` must be cryptographically verified OIDC claims, and its email the invited one. Creates the
      * account; an existing one must link explicitly. With `issuer` and `subject` (the token's `iss` and `sub`) it also
      * links that identity to the new account, as an account row with no provider tokens, so the next sign-in through
-     * the provider finds it; an identity already linked to another account is refused as OIDC_ACCOUNT_EXISTS.
+     * the provider finds it; an identity already linked to another account is refused as OIDC_IDENTITY_IN_USE. An
+     * acceptance through a provider should always pass them.
      */
     async acceptVerifiedOidcInvitation(client: TeamClient, tokenValue: unknown, identity: { email: string; name: string; issuer?: string; subject?: string }, passwordHash?: string) {
       refuseLockedAuth(client, 'acceptVerifiedOidcInvitation');
@@ -373,13 +374,17 @@ export function createWorkspaceTeam({ hashPassword, emailLockKey = 109_859 }: { 
       try { providerId = claims.issuer === undefined ? undefined : oidcProviderId(claims.issuer as string); } catch { invalid(); }
       const { workspaceId, invitation } = await lockInvitation(client, digest(token(tokenValue)));
       if (invitation.email !== verified.email) fail(403, 'OIDC_INVITE_EMAIL_MISMATCH', 'The verified provider email does not match the invitation recipient.');
-      const existing = 'Sign in with the existing account before accepting this invitation. Link the provider explicitly in account settings.';
-      if ((await client.query('SELECT id FROM "user" WHERE lower(email)=$1', [verified.email])).rowCount) fail(409, 'OIDC_ACCOUNT_EXISTS', existing);
+      // Both refusals come before any write, so nothing is created even for a caller that commits after a refusal.
+      const taken = (await client.query<{ account: boolean; identity: boolean }>(`SELECT EXISTS(SELECT 1 FROM "user" WHERE lower(email)=$1) AS account,
+        EXISTS(SELECT 1 FROM account WHERE "providerId"=$2 AND "accountId"=$3) AS identity`, [verified.email, providerId ?? null, claims.subject ?? null])).rows[0]!;
+      if (taken.account) fail(409, 'OIDC_ACCOUNT_EXISTS', 'Sign in with the existing account before accepting this invitation. Link the provider explicitly in account settings.');
+      const inUse = 'This provider identity is linked to another account. Sign in to that account instead.';
+      if (taken.identity) fail(409, 'OIDC_IDENTITY_IN_USE', inUse);
       const userId = randomUUID();
       await client.query('INSERT INTO "user"(id,name,email,"emailVerified") VALUES($1,$2,$3,true)', [userId, verified.name, verified.email]);
-      // An identity another account holds is refused; the caller rolls back, so the user row above goes with it.
+      // The same identity linked by a concurrent acceptance under another email's lock: refused; the caller rolls back.
       if (providerId && (await client.query('INSERT INTO account(id,"accountId","providerId","userId") VALUES($1,$2,$3,$4) ON CONFLICT ("providerId","accountId") DO NOTHING',
-        [randomUUID(), claims.subject, providerId, userId])).rowCount !== 1) fail(409, 'OIDC_ACCOUNT_EXISTS', existing);
+        [randomUUID(), claims.subject, providerId, userId])).rowCount !== 1) fail(409, 'OIDC_IDENTITY_IN_USE', inUse);
       if (passwordHash) await client.query('INSERT INTO account(id,"accountId","providerId","userId",password) VALUES($1,$2,\'credential\',$2,$3)', [randomUUID(), userId, passwordHash]);
       const { role } = await consumeInvitation(client, invitation, workspaceId, userId);
       return { userId, workspaceId, role };
