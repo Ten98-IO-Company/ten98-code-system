@@ -14,8 +14,9 @@ export declare const ten98AuthPolicy: Readonly<{
         updateAgeSeconds: 86400;
     }>;
     /**
-     * TOTP (RFC 6238, SHA-1). `replaySeconds` is the window in which an accepted code is refused again; the app keeps that
-     * ledger. Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
+     * TOTP (RFC 6238, SHA-1). The preset keeps the replay ledger: per user, the last time step a code was accepted for;
+     * a code whose step is at or before it is refused everywhere a TOTP code is taken. `replaySeconds` is how long that
+     * refusal can matter (the ±1-step window). Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
      * `backupCodeInputLength` characters as typed, with the hyphen.
      * The lockout counts failures during sign-in challenges only; session-bound step-up checks are limited per user by the
      * app (`rateLimits.accountSecurityWritesPerUser`).
@@ -429,6 +430,12 @@ export declare function signInOidcUser(db: AnyDatabase, claims: OidcClaims, prov
     userId: string;
     created: boolean;
 }>;
+/**
+ * Checks a TOTP code for an app's own account action, inside `withLockedAuth` on its `tx`, for the user it locked: true
+ * only for a code of that user's verified factor whose step is newer than the last one accepted anywhere (sign-in,
+ * enrolment, another action), and records that step, so the code is refused everywhere afterwards.
+ */
+export declare function verifyCodeForAction(tx: AnyDatabase, userId: string, code: string): Promise<boolean>;
 /**
  * Links an identity to the signed-in user, the one `withLockedAuth` locked: call it inside that callback, on its `tx`,
  * after the app verified an ID token the user obtained while signed in. `linked` is false when the identity already

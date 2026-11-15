@@ -15,7 +15,7 @@ import { PgTransaction } from 'drizzle-orm/pg-core';
 import { betterAuth, getCurrentAdapter } from 'better-auth';
 import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, isAPIError, sensitiveSessionMiddleware } from 'better-auth/api';
 import { setSessionCookie } from 'better-auth/cookies';
-import { hashPassword, verifyPassword } from 'better-auth/crypto';
+import { hashPassword, symmetricDecrypt, verifyPassword } from 'better-auth/crypto';
 import { twoFactor } from 'better-auth/plugins/two-factor';
 import { account as accountTable, session as sessionTable, transaction, TransactionRolledBackError, user as userTable } from './db.mjs';
 import { isEmailAddress } from './email-message.mjs';
@@ -30,8 +30,9 @@ export const ten98AuthPolicy = Object.freeze({
     /** Seven days, extended at most once a day of use. */
     session: Object.freeze({ expiresInSeconds: 604_800, updateAgeSeconds: 86_400 }),
     /**
-     * TOTP (RFC 6238, SHA-1). `replaySeconds` is the window in which an accepted code is refused again; the app keeps that
-     * ledger. Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
+     * TOTP (RFC 6238, SHA-1). The preset keeps the replay ledger: per user, the last time step a code was accepted for;
+     * a code whose step is at or before it is refused everywhere a TOTP code is taken. `replaySeconds` is how long that
+     * refusal can matter (the ±1-step window). Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
      * `backupCodeInputLength` characters as typed, with the hyphen.
      * The lockout counts failures during sign-in challenges only; session-bound step-up checks are limited per user by the
      * app (`rateLimits.accountSecurityWritesPerUser`).
@@ -563,6 +564,62 @@ function build(options, keys, locking, internal = {}) {
             return legacy ? legacyOk : modernOk;
         },
     } : undefined;
+    /**
+     * The TOTP replay ledger (RFC 6238 section 5.2): one verification row per user, `totp-step:<userId>` (stored hashed like
+     * every identifier), holding the last time step a code was accepted for, never the code. better-auth's verifier says
+     * only whether a code matched, so the preset finds the step itself, with the user's secret (decrypted with better-auth's
+     * own key, as its route does) and the same digits, period and ±1 window. Every read and write runs on the transaction
+     * that holds the user's row, so two submissions of one code are serialised and only the first is accepted.
+     */
+    const ledger = {
+        row: (userId) => `totp-step:${userId}`,
+        async secretOf(store, userId, verifiedOnly) {
+            const row = await store.adapter.findOne({ model: 'twoFactor', where: [{ field: 'userId', value: userId }] });
+            if (!row || (verifiedOnly && row.verified === false))
+                return undefined;
+            return symmetricDecrypt({ key: store.secretConfig, data: row.secret });
+        },
+        async last(store, userId) {
+            const row = await store.adapter.findOne({ model: 'verification', where: [{ field: 'identifier', value: ledger.row(userId) }] });
+            const step = row && new Date(row.expiresAt).getTime() > Date.now() ? Number(row.value) : Number.NEGATIVE_INFINITY;
+            return { row, step: Number.isSafeInteger(step) ? step : Number.NEGATIVE_INFINITY };
+        },
+        // The row expires once no code of that step can match any more: steps up to it then fall outside the window anyway.
+        async record(store, userId, step) {
+            const { row } = await ledger.last(store, userId);
+            const expiresAt = new Date((step + 2) * factor.periodSeconds * 1000);
+            if (row)
+                await store.adapter.update({ model: 'verification', where: [{ field: 'id', value: row.id }], update: { value: String(step), expiresAt } });
+            else
+                await store.internalAdapter.createVerificationValue({ identifier: ledger.row(userId), value: String(step), expiresAt });
+        },
+        /** The step a TOTP code is accepted for now, or undefined when it matches none, or only one at or before the last. */
+        async fresh(store, userId, code, verifiedOnly) {
+            const secret = await ledger.secretOf(store, userId, verifiedOnly);
+            const { step: last } = await ledger.last(store, userId);
+            const step = secret === undefined || typeof code !== 'string' ? undefined : matchedStep(secret, code);
+            return step !== undefined && step > last ? step : undefined;
+        },
+    };
+    /**
+     * A TOTP request (verify-totp, at sign-in or with a session) run through the ledger: a code that is not fresh reaches
+     * better-auth as a code that matches nothing, so it is refused, counted and answered exactly as a wrong code; a fresh
+     * one is recorded once better-auth accepts it.
+     */
+    const throughLedger = async (bound, userId, request, run) => {
+        if (!totpRoute.test(new URL(request.url).pathname))
+            return run(request);
+        const body = await request.clone().json().catch(() => undefined);
+        if (!body || typeof body.code !== 'string')
+            return run(request);
+        const store = await storeOf(bound);
+        const step = await ledger.fresh(store, userId, body.code, false);
+        const sent = step !== undefined ? request : new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify({ ...body, code: notACode }) });
+        const response = await run(sent);
+        if (response.ok && step !== undefined)
+            await ledger.record(store, userId, step);
+        return response;
+    };
     /** The isAccountUsable hook, refusing a closed account by default. */
     const usable = (account) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
     /**
@@ -852,12 +909,30 @@ function build(options, keys, locking, internal = {}) {
             },
         });
         const unmark = markLockedAuth({ email: hold.email, userId: hold.userId }, callbackTx, connection);
+        const lockedUserId = hold.userId;
+        // verifyCodeForAction and linkOidcIdentity find this transaction's code check here, for the user it locked.
+        if (lockedUserId !== undefined && hold.email === undefined) {
+            codeChecks.set(callbackTx, {
+                userId: lockedUserId,
+                async check(code) {
+                    if (!open)
+                        throw closed();
+                    const store = await storeOf(bound);
+                    const step = await ledger.fresh(store, lockedUserId, code, true);
+                    if (step === undefined)
+                        return false;
+                    await ledger.record(store, lockedUserId, step);
+                    return true;
+                },
+            });
+        }
         try {
             return await lockedContext.run(true, () => run(bound, callbackTx));
         }
         finally {
             open = false;
             unmark();
+            codeChecks.delete(callbackTx);
         }
     };
     // Refused before any statement: without the factory there is nothing to bind; a transaction as `db`, or a database on
@@ -1111,7 +1186,7 @@ function build(options, keys, locking, internal = {}) {
                         const [account] = await boundTx.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt }).from(userTable).where(eq(userTable.id, row.id));
                         if (!account || await usable(account) !== true)
                             return challengeRefused();
-                        const verified = await bound.handler(request);
+                        const verified = await throughLedger(bound, account.id, request, sent => bound.handler(sent));
                         // 503 is onAPIError's answer to a deadlock or serialisation failure inside better-auth (see retryable).
                         interrupted = verified.status === 503;
                         if (verified.ok && bound[signedInUser]() !== account.id)
@@ -1149,7 +1224,7 @@ function build(options, keys, locking, internal = {}) {
                 const [row] = await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, current.user.id)).for('no key update');
                 if (!row)
                     return challengeRefused();
-                return bind(tx, { userId: row.id, email: undefined }, bound => bound.handler(request), 'twoFactor');
+                return bind(tx, { userId: row.id, email: undefined }, bound => throughLedger(bound, row.id, request, sent => bound.handler(sent)), 'twoFactor');
             });
         }
         catch (error) {
@@ -1198,6 +1273,41 @@ const disabledRoutes = Object.freeze({
 });
 /** better-auth's password route, in any case and with any trailing slash. */
 const passwordRoute = /\/sign-in\/email\/*$/i;
+/** The TOTP verification route. */
+const totpRoute = /\/two-factor\/verify-totp\/*$/i;
+/** What a code that is not fresh is replaced with: it matches no step, so better-auth refuses and counts it as wrong. */
+const notACode = '------';
+/** The step in better-auth's window (current ±1) a TOTP code matches, the latest if several, or undefined. */
+function matchedStep(secret, code, now = Date.now()) {
+    const { digits, periodSeconds } = ten98AuthPolicy.twoFactor;
+    const counter = Math.floor(now / 1000 / periodSeconds);
+    const given = Buffer.from(code.padEnd(digits, '\u0000').slice(0, 64));
+    let found;
+    for (let step = counter - 1; step <= counter + 1; step++) {
+        const expected = Buffer.from(hotp(secret, step, digits).padEnd(given.length, '\u0000'));
+        if (expected.length === given.length && timingSafeEqual(given, expected) && code.length === digits)
+            found = step;
+    }
+    return found;
+}
+/** RFC 4226 HOTP with HMAC-SHA1 over the secret's text, as better-auth's createOTP computes it. */
+function hotp(secret, counter, digits) {
+    const moving = Buffer.alloc(8);
+    moving.writeBigUInt64BE(BigInt(counter));
+    const digest = createHmac('sha1', secret).update(moving).digest();
+    const at = digest[digest.length - 1] & 15;
+    return String((digest.readUInt32BE(at) & 0x7fffffff) % 10 ** digits).padStart(digits, '0');
+}
+/** The code check of each withLockedAuth callback's transaction, while it runs. */
+const codeChecks = new WeakMap();
+const codeCheckOf = (tx, operation, userId) => {
+    const entry = tx !== null && typeof tx === 'object' ? codeChecks.get(tx) : undefined;
+    if (!entry)
+        throw new TypeError(`${operation} runs inside withLockedAuth, on its transaction, for the signed-in user it locked.`);
+    if (userId !== undefined && userId !== entry.userId)
+        throw new TypeError(`${operation} checks a code for the user withLockedAuth locked.`);
+    return entry;
+};
 /** Every two-factor route, in any case and with any trailing slash. */
 const twoFactorRoute = /\/two-factor\/[^/]+\/*$/i;
 /** What the instance an app holds answers a two-factor request, so a missed route fails loudly in the app's tests. */
@@ -1433,6 +1543,14 @@ export async function signInOidcUser(db, claims, provider, { emailLockKey = 109_
             return { userId: raced, created: false };
         throw error;
     }
+}
+/**
+ * Checks a TOTP code for an app's own account action, inside `withLockedAuth` on its `tx`, for the user it locked: true
+ * only for a code of that user's verified factor whose step is newer than the last one accepted anywhere (sign-in,
+ * enrolment, another action), and records that step, so the code is refused everywhere afterwards.
+ */
+export async function verifyCodeForAction(tx, userId, code) {
+    return codeCheckOf(tx, 'verifyCodeForAction', userId).check(code);
 }
 /**
  * Links an identity to the signed-in user, the one `withLockedAuth` locked: call it inside that callback, on its `tx`,

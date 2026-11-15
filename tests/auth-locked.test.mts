@@ -10,7 +10,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { boolean, integer, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 import { AmbiguousAccountError, createTen98Auth, signInOidcUser, linkOidcIdentity, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError,
-  normaliseOidcIssuer, normaliseOidcIssuerSql, OidcIdentityError, oidcProviderId, revokeProviderSessions, SchemaMismatchError, tokenStorageUpgradeStatements, unlinkOidcIdentity } from '../auth.mjs';
+  normaliseOidcIssuer, normaliseOidcIssuerSql, OidcIdentityError, oidcProviderId, revokeProviderSessions, SchemaMismatchError, tokenStorageUpgradeStatements, unlinkOidcIdentity, verifyCodeForAction } from '../auth.mjs';
 import type { PasswordAttempt, Ten98Auth, Ten98AuthOptions } from '../auth.mjs';
 import { session, transaction, TransactionRolledBackError, user } from '../db.mjs';
 import { createWorkspaceTeam } from '../index.mjs';
@@ -2624,4 +2624,85 @@ test('verifyTwoFactor serves a session-bound two-factor request under the user\'
   } finally { holder.release(); }
   assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', session, { code: totp(totpURI) }))).status, 200);
   assert.equal((await pool!.query<{ on: boolean }>('SELECT "twoFactorEnabled" AS on FROM "user" WHERE id = $1', [id])).rows[0]!.on, true);
+});
+
+// ---- The TOTP replay ledger ----
+const challengeFor = async (email: string) => {
+  const response = await signIn(email);
+  assert.equal((await response.clone().json() as { twoFactorRedirect?: boolean }).twoFactorRedirect, true);
+  return cookieOf(response);
+};
+const complete = (challenge: string, code: string) => auth.verifyTwoFactor(db, post('/two-factor/verify-totp', challenge, { code }));
+const failures = async (userId: string) => (await pool!.query<{ n: number | null }>('SELECT "failedVerificationCount" AS n FROM "twoFactor" WHERE "userId"=$1', [userId])).rows[0]!.n ?? 0;
+
+test('a TOTP code accepted once is refused again: in a second sign-in challenge, at an older step, and after enrolment', { skip }, async () => {
+  const factor = await challenged('replay-steps');
+  // The code that confirmed the enrolment: the first sign-in cannot reuse it.
+  assert.equal((await complete(factor.challenge, factor.enrolCode)).status, 401);
+  const code = totp(factor.uri, 1);
+  assert.equal((await complete(await challengeFor(factor.email), code)).status, 200);
+  // The same code in another challenge of the same user.
+  assert.equal((await complete(await challengeFor(factor.email), code)).status, 401);
+  // An older step still inside the window, after a newer one was accepted.
+  assert.equal((await complete(await challengeFor(factor.email), totp(factor.uri))).status, 401);
+  assert.equal((await complete(await challengeFor(factor.email), totp(factor.uri, -1))).status, 401);
+});
+
+test('a replayed code answers exactly as a wrong one and counts toward the sign-in lockout', { skip }, async () => {
+  const factor = await challenged('replay-answer');
+  const before = await failures(factor.id);
+  const wrong = await answer(await complete(factor.challenge, '000000'));
+  const replayed = await answer(await complete(factor.challenge, factor.enrolCode));
+  assert.equal(wrong.status, 401);
+  assert.deepEqual(replayed, wrong);
+  assert.equal(await failures(factor.id), before + 2);
+  // The challenge still completes with a fresh code.
+  assert.equal((await complete(factor.challenge, totp(factor.uri, 1))).status, 200);
+});
+
+test('verifyCodeForAction shares the ledger with sign-in, in both directions, and runs only inside withLockedAuth', { skip }, async () => {
+  const factor = await challenged('replay-action');
+  const signInCode = totp(factor.uri, 1);
+  assert.equal((await complete(factor.challenge, signInCode)).status, 200);
+  assert.equal(await auth.withLockedAuth(db, factor.id, (_bound, tx) => verifyCodeForAction(tx, factor.id, signInCode)), false);
+  const other = await challenged('replay-action-2');
+  const actionCode = totp(other.uri, 1);
+  assert.equal(await auth.withLockedAuth(db, other.id, (_bound, tx) => verifyCodeForAction(tx, other.id, actionCode)), true);
+  assert.equal(await auth.withLockedAuth(db, other.id, (_bound, tx) => verifyCodeForAction(tx, other.id, actionCode)), false);
+  assert.equal((await complete(other.challenge, actionCode)).status, 401);
+  assert.equal(await auth.withLockedAuth(db, other.id, (_bound, tx) => verifyCodeForAction(tx, other.id, '000000')), false);
+  // Outside withLockedAuth, on another user's lock, or after the callback: refused.
+  await assert.rejects(verifyCodeForAction(db, other.id, actionCode), TypeError);
+  await assert.rejects(auth.withLockedAuth(db, factor.id, (_bound, tx) => verifyCodeForAction(tx, other.id, actionCode)), TypeError);
+  let kept: unknown;
+  await auth.withLockedAuth(db, other.id, async (_bound, tx) => { kept = tx; });
+  await assert.rejects(verifyCodeForAction(kept as never, other.id, totp(other.uri, 1)), TypeError);
+});
+
+test('two concurrent submissions of one code: exactly one is accepted, at sign-in and at enrolment', { skip }, async () => {
+  const factor = await challenged('replay-race');
+  const [one, two] = [await challengeFor(factor.email), await challengeFor(factor.email)];
+  const code = totp(factor.uri, 1);
+  const statuses = (await Promise.all([complete(one, code), complete(two, code)])).map(response => response.status).sort();
+  assert.deepEqual(statuses, [200, 401]);
+  // Enrolment confirmed from two sessions of one account at once, with one code.
+  const email = address('replay-enrol');
+  await account_(email);
+  const [first, second] = [cookieOf(await signIn(email)), cookieOf(await signIn(email))];
+  const { totpURI } = await (await auth.verifyTwoFactor(db, post('/two-factor/enable', first, { password: PASSWORD }))).json() as { totpURI: string };
+  const enrolCode = totp(totpURI);
+  const confirmations = (await Promise.all([first, second].map(session => auth.verifyTwoFactor(db, post('/two-factor/verify-totp', session, { code: enrolCode })))))
+    .map(response => response.status).sort();
+  assert.deepEqual(confirmations, [200, 401]);
+});
+
+test('a backup code is single-use across challenges', { skip }, async () => {
+  const email = address('backup-once');
+  await account_(email);
+  const session = cookieOf(await signIn(email));
+  const enabled = await (await auth.verifyTwoFactor(db, post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string; backupCodes: string[] };
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', session, { code: totp(enabled.totpURI) }))).status, 200);
+  const code = enabled.backupCodes[0]!;
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-backup-code', await challengeFor(email), { code }))).status, 200);
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-backup-code', await challengeFor(email), { code }))).status, 401);
 });
