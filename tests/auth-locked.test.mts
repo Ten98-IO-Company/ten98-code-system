@@ -757,9 +757,12 @@ test('concurrent failures from one known device claim exactly its five attempts;
   const browser = jar().take(await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
   // Refused by the limiter or the verification bound, the attempt never checked a password: its claim is returned.
   assert.equal((await auth.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD, headers: { cookie: browser.header() } }, () => false)).status, 429);
-  const full = authOver(db, { passwordVerification: { concurrency: 1, queue: 0 } });
-  // The first attempt holds the only slot while it hashes; the known device's attempt finds none and gets 503.
-  const busy = full.signInWithPassword(db, { source: SOURCE, email: address('x'), password: 'x' }, allow);
+  const full = authOver(db, { passwordVerification: { concurrency: 1, queue: 0, knownDevices: { concurrency: 1, queue: 0 } } });
+  const holder = address('concurrent');
+  await account_(holder);
+  const holderCookie = jar().take(await full.signInWithPassword(db, { source: SOURCE, email: holder, password: PASSWORD }, allow)).header();
+  // Another known device holds the only lane slot while it hashes; this known device's attempt finds none and gets 503.
+  const busy = full.signInWithPassword(db, { source: SOURCE, email: holder, password: 'x', headers: { cookie: holderCookie } }, allow);
   await delay(80);
   assert.equal((await full.signInWithPassword(db, { source: SOURCE, email, password: 'x', headers: { cookie: browser.header() } }, allow)).status, 503);
   await busy;
@@ -1056,8 +1059,10 @@ test('an account keeps at most five known devices: a sixth browser evicts the ol
   assert.equal((await knownAs(browsers[5]!, email)).known, true);
 });
 
-test('a right password on an unusable account answers at a wrong password\'s cost', { skip }, async () => {
-  for (const target of [auth, authOver(db, { legacyPasswords: true })]) {
+test('a right password on an unusable account answers at a wrong password\'s cost, with the known-device lane on', { skip }, async () => {
+  // The lane is always on; it is configured explicitly here so the parity is checked with it in place.
+  const lane = { knownDevices: { concurrency: 1, queue: 20 } };
+  for (const target of [authOver(db, { passwordVerification: lane }), authOver(db, { legacyPasswords: true, passwordVerification: lane })]) {
     const known = address('parity'), closed = address('parity');
     await account_(known);
     const closedId = await account_(closed);
@@ -1145,4 +1150,99 @@ test('the email index may be lower(email), lower(email::text) on varchar or a un
     assert.equal(await lateAuth.assertSchema(lateDb!), undefined);
     assert.equal(await lateAuth.withLockedAuthByEmail(lateDb!, address('none'), async (_bound, _tx, userId) => userId), undefined);
   } finally { await Promise.all(pools.map(item => item.end())); }
+});
+
+// One shared verification slot and one lane slot, nothing waiting: a flood fills the shared slot at once.
+const narrow = { passwordVerification: { concurrency: 1, queue: 0, knownDevices: { concurrency: 1, queue: 0 } } };
+// Holds the shared slot for one verification (about a quarter of a second) and lets it be taken first.
+async function holdShared(target: Ten98Auth) {
+  const held = target.signInWithPassword(db, { source: 'ip:holder', email: address('holder'), password: 'wrong password guess' }, allow);
+  await delay(40);
+  return held;
+}
+const attempt = (target: Ten98Auth, email: string, password: string, cookie = '', limit: (attempt: PasswordAttempt) => boolean = allow) =>
+  target.signInWithPassword(db, { source: `ip:${randomUUID()}`, email, password, headers: cookie ? { cookie } : {} }, limit);
+
+test('a distributed flood fills the shared queue; a known device still signs in through its lane', { skip }, async () => {
+  const flooded = authOver(db, narrow);
+  const email = address('lane');
+  await account_(email);
+  const browser = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
+  const flood = Array.from({ length: 20 }, () => attempt(flooded, address('flood'), 'wrong password guess').then(response => response.status));
+  await delay(20);
+  const started = performance.now();
+  const signedIn = await attempt(flooded, email, PASSWORD, browser.header());
+  assert.equal(signedIn.status, 200);
+  assert.ok(performance.now() - started < 3000);
+  const statuses = await Promise.all(flood);
+  assert.ok(statuses.filter(status => status === 503).length >= 15, statuses.join(','));
+});
+
+test('without a verified claim, a real account, an unknown email and a foreign cookie answer alike during a flood', { skip }, async () => {
+  const flooded = authOver(db, narrow);
+  const a = address('alike'), b = address('alike');
+  await account_(a);
+  await account_(b);
+  const aCookie = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email: a, password: PASSWORD }, allow)).header();
+  const held = holdShared(flooded);
+  await delay(0);
+  const outcomes = [];
+  for (let round = 0; round < 2; round++) {
+    outcomes.push(await answer(await attempt(flooded, b, PASSWORD)));                      // a real account, no cookie
+    outcomes.push(await answer(await attempt(flooded, address('nobody'), PASSWORD)));      // an unknown email
+    outcomes.push(await answer(await attempt(flooded, address('nobody'), PASSWORD, aCookie))); // A's valid cookie, unknown email
+    outcomes.push(await answer(await attempt(flooded, b, PASSWORD, aCookie)));             // A's valid cookie, B's email
+  }
+  await held;
+  assert.equal(outcomes[0]!.status, 503);
+  for (const outcome of outcomes) assert.deepEqual(outcome, outcomes[0]);
+});
+
+test('a forged or revoked device cookie gets no lane: it is an attempt like any other', { skip }, async () => {
+  const flooded = authOver(db, narrow);
+  const email = address('revoked');
+  const id = await account_(email);
+  const valid = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
+  const forged = jar(); forged.with(`${'A'.repeat(32)}.${'B'.repeat(43)}`);
+  const seen: boolean[] = [];
+  const recording = (entry: PasswordAttempt) => { seen.push(entry.knownDevice); return true; };
+  await flooded.withLockedAuth(db, id, bound => bound.revokeAllSessions());
+  const held = holdShared(flooded);
+  const forgedOutcome = await attempt(flooded, email, PASSWORD, forged.header(), recording);
+  const revokedOutcome = await attempt(flooded, email, PASSWORD, valid.header(), recording);
+  await held;
+  assert.deepEqual([forgedOutcome.status, revokedOutcome.status, seen], [503, 503, [false, false]]);
+});
+
+test('the lane has its own bound: valid cookies beyond it get 503 and take no shared capacity', { skip }, async () => {
+  const flooded = authOver(db, narrow);
+  const first = address('bound'), second = address('bound');
+  await account_(first);
+  await account_(second);
+  const firstCookie = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email: first, password: PASSWORD }, allow)).header();
+  const secondCookie = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email: second, password: PASSWORD }, allow)).header();
+  // One known device holds the lane; the next is refused instead of spilling into the free shared slot.
+  const laneHolder = attempt(flooded, first, 'wrong password guess', firstCookie);
+  await delay(40);
+  const beyond = await attempt(flooded, second, 'wrong password guess', secondCookie);
+  // The shared slot stayed free throughout: an attempt without a claim still gets it while the lane is full.
+  const shared = await attempt(flooded, address('nobody'), 'wrong password guess');
+  assert.deepEqual([beyond.status, shared.status, (await laneHolder).status], [503, 401, 401]);
+  assert.throws(() => authOver(db, { passwordVerification: { knownDevices: { concurrency: 0 } } }), /passwordVerification.knownDevices.concurrency must be/);
+});
+
+test('the limiter runs before the lane too: a refused known device gets 429 while the lane is full, and keeps its attempt', { skip }, async () => {
+  const flooded = authOver(db, narrow);
+  const email = address('lane-order'), other = address('lane-order');
+  const id = await account_(email);
+  await account_(other);
+  const mine = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).header();
+  const theirs = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email: other, password: PASSWORD }, allow)).header();
+  const laneHolder = attempt(flooded, other, 'wrong password guess', theirs);
+  await delay(40);
+  let asked = 0;
+  const refused = await attempt(flooded, email, PASSWORD, mine, entry => { asked++; return entry.knownDevice && false; });
+  assert.deepEqual([refused.status, asked], [429, 1]);
+  assert.equal(await attempts(id), 0);
+  await laneHolder;
 });

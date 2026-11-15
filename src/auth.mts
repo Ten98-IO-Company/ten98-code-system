@@ -290,8 +290,11 @@ export interface Ten98AuthOptions {
    * The bound on concurrent `signInWithPassword` verifications in this process: `concurrency` at once (2 by default,
    * each running two scrypt derivations, which together fill libuv's default four threads), at most `queue` waiting
    * (100), each for at most `waitMs` (15000). Past either bound the attempt is answered 503, never left waiting.
+   * `knownDevices` is the reserved lane for an attempt whose known-device claim was verified (1 at once, 20 waiting,
+   * the same `waitMs` by default): such an attempt uses only the lane, so it never takes shared capacity. Its
+   * verifications share the hashing threads: count its `concurrency` in when sizing `UV_THREADPOOL_SIZE`.
    */
-  passwordVerification?: { concurrency?: number; queue?: number; waitMs?: number };
+  passwordVerification?: { concurrency?: number; queue?: number; waitMs?: number; knownDevices?: { concurrency?: number; queue?: number; waitMs?: number } };
   /** The app's public URL (APP_URL); validated with `appOrigin`. */
   appUrl: string;
   secret: string;
@@ -677,6 +680,8 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   const { lockTimeoutMs = 5000 } = options;
   if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000) throw new TypeError('lockTimeoutMs must be an integer from 1 to 600000.');
   const slots = boundedSlots(options.passwordVerification);
+  const { concurrency: laneConcurrency = 1, queue: laneQueue = 20, waitMs: laneWaitMs = options.passwordVerification?.waitMs } = options.passwordVerification?.knownDevices ?? {};
+  const lane = boundedSlots({ concurrency: laneConcurrency, queue: laneQueue, waitMs: laneWaitMs }, 'passwordVerification.knownDevices');
   void modernDummy();
 
   /**
@@ -832,8 +837,12 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       if (allowed !== true) { await unclaim(); return refusal(429, 'TOO_MANY_ATTEMPTS', 'Too many sign-in attempts. Try again later.'); }
       // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
       if (password.length > ten98AuthPolicy.password.maxLength) return refused();
-      // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads.
-      const release = await slots();
+      // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
+      // known-device claim was verified above (a database read, before anything that differs between a real and an
+      // unknown account) takes the reserved lane and only the lane, so a flood cannot crowd it out and many valid
+      // cookies cannot take shared capacity. Every other attempt (an unknown email, an account without a cookie, a
+      // forged, revoked or foreign cookie) takes the shared queue under one rule, so none can be told apart.
+      const release = claim !== undefined ? await lane() : await slots();
       if (!release) { await unclaim(); return refusal(503, 'SIGN_IN_BUSY', 'Sign-in is busy. Try again shortly.', { 'retry-after': '1' }); }
       let verified: boolean, stored: { id: string; email: string; closedAt: Date | null; password: string | null } | undefined;
       try {
@@ -1058,9 +1067,9 @@ const refused = () => refusal(401, 'INVALID_EMAIL_OR_PASSWORD', 'Invalid email o
  * At most `concurrency` holders at once and `queue` waiting, each for at most `waitMs`. Resolves a release function, or
  * undefined when no slot came in time or the queue is full, so a caller is answered instead of left waiting.
  */
-function boundedSlots({ concurrency = 2, queue = 100, waitMs = 15_000 }: NonNullable<Ten98AuthOptions['passwordVerification']> = {}) {
+function boundedSlots({ concurrency = 2, queue = 100, waitMs = 15_000 }: NonNullable<Ten98AuthOptions['passwordVerification']> = {}, label = 'passwordVerification') {
   for (const [name, value] of Object.entries({ concurrency, queue, waitMs })) {
-    if (!Number.isInteger(value) || value < (name === 'concurrency' ? 1 : 0)) throw new TypeError(`passwordVerification.${name} must be a whole number${name === 'concurrency' ? ' of at least 1' : ''}.`);
+    if (!Number.isInteger(value) || value < (name === 'concurrency' ? 1 : 0)) throw new TypeError(`${label}.${name} must be a whole number${name === 'concurrency' ? ' of at least 1' : ''}.`);
   }
   let active = 0;
   const waiting: (() => void)[] = [];
