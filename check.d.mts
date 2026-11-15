@@ -18,6 +18,15 @@ interface DataPolicy {
     roots: string[];
     baseline: string;
 }
+interface AuthCookiePolicy {
+    /** Modules and the names imported from them that read an auth cookie without the preset's prefix. */
+    imports: Record<string, string[]>;
+    /** Cookie names a string literal may not contain, and prefixes it may not start with. */
+    names: string[];
+    prefixes: string[];
+    /** Calls whose string argument is a cookie name the preset resolves (auth.cookieName('session_token')). */
+    allowedCalls: string[];
+}
 interface Profile {
     dependencies: StringMap;
     devDependencies: StringMap;
@@ -28,6 +37,7 @@ interface Profile {
     sourceLanguage?: SourceLanguagePolicy;
     presentation?: PresentationPolicy;
     data?: DataPolicy;
+    authCookie?: AuthCookiePolicy;
 }
 export interface PackageManifest {
     name?: string;
