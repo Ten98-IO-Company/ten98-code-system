@@ -17,6 +17,8 @@ export const nodeShopifyVerification = current.verifyShopifyCrawlerAccess({}, no
 export const browserShopifyVerification = current.verifyShopifyCrawlerAccess({}, browserShopifyKey);
 
 export const resolveNetworkHostType: (hostname: string, signal: AbortSignal) => Promise<current.NetworkAddress[]> = current.resolveNetworkHost;
+export const resolveOwnershipTxtType: (name: string, options?: current.OwnershipTxtOptions) => Promise<string[][]> = current.resolveOwnershipTxt;
+export const normalizePublicHostnameType: (input: unknown, options?: current.PublicHostnameOptions) => string | null = current.normalizePublicHostname;
 export const normalizeLighthouseReportType: (raw: unknown, expectedUrl: string) => current.NormalizedLighthouseReport | null = current.normalizeLighthouseReport;
 
 export const readChatType: (message: unknown, finishReason: unknown, options: current.OpenRouterChatOptionsV1) => current.OpenRouterAssistantResultV1 = current.readOpenRouterAssistantMessageV1;

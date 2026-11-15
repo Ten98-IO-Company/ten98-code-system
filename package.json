@@ -111,6 +111,8 @@
     "src/cloudflare-email.mts",
     "src/email-message.mts",
     "src/public-hostname.mts",
+    "data/public_suffix_list.dat",
+    "data/public_suffix_list.json",
     "src/provider-fetch.mts",
     "tsconfig.json",
     "database-policy.mjs",

@@ -1,5 +1,7 @@
 * text=auto eol=lf
 *.tgz binary
+# The Public Suffix List ships byte for byte as published; its SHA-256 is pinned.
+data/public_suffix_list.dat -text
 *.gz binary
 *.zip binary
 *.png binary

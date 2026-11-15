@@ -143,6 +143,22 @@ test('public egress proxy security boundaries', { timeout: 30000 }, async t => {
     assert.equal(dials, 0);
   });
 
+  await t.test('admission uses publicNetworkAddress for literal and resolved targets', async t => {
+    const dnsCalls = dnsFixture(t, ['168.63.129.16']);
+    let dials = 0;
+    t.mock.method(net, 'createConnection', () => { dials++; throw new Error('Unexpected dial'); });
+    const p = await proxy(t);
+    for (const target of ['http://[2::1]/', 'http://[3ff::1]/', 'http://168.63.129.16/']) {
+      assert.match(await request(p.port, target), /^HTTP\/1.1 403/, target);
+    }
+    assert.equal(dnsCalls(), 0);
+    assert.match(await request(p.port), /^HTTP\/1.1 403/);
+    t.mock.method(dns.Resolver.prototype, 'resolve4', async () => [publicIp]);
+    t.mock.method(dns.Resolver.prototype, 'resolve6', async () => ['20::1']);
+    assert.match(await request(p.port), /^HTTP\/1.1 403/);
+    assert.equal(dials, 0);
+  });
+
   await t.test('a mismatched connected peer receives zero HTTP origin bytes', async t => {
     const origin = await fixture(t);
     let bytes = 0;
