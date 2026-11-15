@@ -4,7 +4,7 @@ Start with [the feature catalogue](../features/catalog.json) and the canonical `
 
 The catalogue retains `defaultAuthenticatedNodeStack` as its framework-source selector for compatibility; database choice comes from the canonical policy. The engine in an existing source bundle is not the default for a new application.
 
-The source release is [feature-library-2026-10-20](https://github.com/Ten98-IO-Company/ten98-code-system/releases/tag/feature-library-2026-10-20). The published `feature-source-manifest.json` records exact bundle/file hashes, executed checks, skips and verification limits. Verify the chosen bundle against that manifest before adoption. Use Node 24 and the bundle's existing package manager and lockfile.
+The preserved historical source release is [feature-library-2026-10-20](https://github.com/Ten98-IO-Company/ten98-code-system/releases/tag/feature-library-2026-10-20). The published `feature-source-manifest.json` records exact bundle/file hashes, executed checks, skips and verification limits. Verify the chosen bundle against that manifest before adoption. Use Node 24 and the bundle's existing package manager and lockfile. This snapshot predates the later identity, shared-sidebar and displayed-field search changes. The maintained [feature contracts](FEATURE-CONTRACTS.md) describe those boundaries; they do not update the historical archives. Use a refreshed source bundle only after its final app release and exact acceptance evidence are published.
 
 For example, download the existing framework/feature source reference into a fresh working folder; this PostgreSQL implementation is not a ready SQLite adapter:
 
