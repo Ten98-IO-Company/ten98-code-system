@@ -130,6 +130,20 @@ export interface Ten98AuthOptions {
     allowPasswordless?: boolean;
     /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
     cookiePrefix?: string;
+    /**
+     * Whether an account may sign in with its password, asked under the account's lock in `signInWithPassword`; anything
+     * but `true` gets the uniform 401. Defaults to refusing a closed account (`closedAt` set).
+     */
+    isAccountUsable?(account: {
+        id: string;
+        email: string;
+        closedAt: Date | null;
+    }): boolean | Promise<boolean>;
+    /**
+     * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) on the instance the
+     * app holds. It has no rate limit, no lock and no constant-cost check: do not use it outside tests and migrations.
+     */
+    allowRawPasswordSignIn?: boolean;
 }
 export interface Ten98AuthSession {
     session: {
@@ -229,28 +243,36 @@ export interface Ten98Auth {
      * session cookie, or the two-factor challenge, as `/sign-in/email` does.
      */
     signInWithPassword(db: AnyDatabase, input: PasswordSignIn, limit: (attempt: PasswordAttempt) => boolean | Promise<boolean>): Promise<Response>;
+    /**
+     * Resolves when the user table has the unique index on `lower(email)` that the locked lookups rely on, and rejects
+     * otherwise. Call it at start-up; every locked call also checks it once per database and refuses to run without it.
+     */
+    assertEmailIndex(db: AnyDatabase): Promise<void>;
 }
 /** `signInWithPassword`'s input; `headers` are the request's: its origin, its cookies, its user agent and address. */
 export type PasswordSignIn = {
     email: string;
     password: string;
+    source: string;
     rememberMe?: boolean;
     headers?: HeadersInit;
 };
 /**
- * What `signInWithPassword` tells the app's limiter: the normalised email, and whether this browser is a known device of
- * that account. A known device may skip only the account-wide bucket; it never skips per-source or per-pair limits, and
- * it never replaces the password.
+ * What `signInWithPassword` gives the app's limiter, before any hash and before the verification queue: the normalised
+ * email; `source`, the client address the app derived for the request (`clientLimitKey` of its trusted address), so it
+ * counts per source as well as per account; and `knownDevice`, whether this browser is a known device of that account.
+ * A known device may skip only the account-wide bucket: never the per-source or per-pair limits, and never the password.
  */
 export type PasswordAttempt = {
     email: string;
+    source: string;
     knownDevice: boolean;
 };
 /**
  * The transaction-bound instance `withLockedAuth` hands out. It opens no further locked-auth transactions, signs no one
  * in with a password (use `signInWithPassword`), and throws LockedAuthClosedError once the callback has returned.
  */
-export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword'> {
+export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'withLockedAuthByEmail' | 'signInWithPassword' | 'assertEmailIndex'> {
     /** The locked user, or undefined when `withLockedAuthByEmail` found no account. */
     readonly userId: string | undefined;
     /** Deletes every session of the locked user in this transaction (better-auth's `deleteUserSessions`). */
@@ -263,3 +285,13 @@ export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'wit
  * as keyed hashes; the cookie cache stays off and no secondary storage is used, so no token is kept anywhere else.
  */
 export declare function createTen98Auth(options: Ten98AuthOptions): Ten98Auth;
+/** More than one account matches an email: the unique index on lower(email) is missing. Nothing is picked. */
+export declare class AmbiguousAccountError extends Error {
+    readonly code: 'AMBIGUOUS_ACCOUNT';
+    constructor();
+}
+/** The user table has no valid unique index on lower(email), which the locked lookups need to find one account. */
+export declare class MissingEmailIndexError extends Error {
+    readonly code: 'MISSING_EMAIL_INDEX';
+    constructor();
+}

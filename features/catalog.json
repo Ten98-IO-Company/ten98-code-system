@@ -189,7 +189,9 @@
         "tokenStorageUpgradeStatements",
         "LockedAuthTransactionError",
         "LockedAuthUserNotFoundError",
-        "LockedAuthClosedError"
+        "LockedAuthClosedError",
+        "AmbiguousAccountError",
+        "MissingEmailIndexError"
       ],
       "tests": [
         "tests/auth.test.mts",
