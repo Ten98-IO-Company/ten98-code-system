@@ -11,13 +11,21 @@
     "count": 16,
     "reason": "The migration ledger applies migration files as SQL text and takes its advisory locks and schema_version rows on a pg client before any app schema exists."
   },
+  "src/tenancy-scope.mts": {
+    "count": 2,
+    "reason": "The scope helpers set and read transaction-local settings; set_config and current_setting have no Drizzle builder."
+  },
+  "src/tenancy-system.mts": {
+    "count": 2,
+    "reason": "A resolver is a SECURITY DEFINER function call, which has no Drizzle builder; its name is a declared identifier and its argument a bound parameter."
+  },
   "src/tenancy-testing.mts": {
-    "count": 1,
-    "reason": "Test-only: sets the scope on a pg connection the test owns; Drizzle has no builder for set_config."
+    "count": 2,
+    "reason": "Test-only: sets the scope on a pg connection the test owns, and installs the missing-scope policy in a test database; Drizzle has no builder for set_config or DDL."
   },
   "src/tenancy.mts": {
-    "count": 4,
-    "reason": "The policy expression is DDL, which takes no bind parameters; set_config and current_setting have no Drizzle builder; the boot role check reads system catalogues on a pg pool."
+    "count": 3,
+    "reason": "The policy expression is DDL, which takes no bind parameters; the boot role and resolver checks read system catalogues on a pg pool."
   },
   "src/workspace-team.mts": {
     "count": 51,

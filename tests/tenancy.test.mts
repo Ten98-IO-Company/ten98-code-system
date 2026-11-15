@@ -8,7 +8,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { getTableConfig, PgDialect, pgTable, serial, text } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 import { createPool, teamSchema, transaction } from '../db.mjs';
-import { createTenancy, DatabaseRoleError, UnlockedScopeError, WorkspaceAccessError, workspaceNotFound } from '../tenancy.mjs';
+import { createTenancy, DatabaseRoleError, InvalidWorkspaceIdError, UnlockedScopeError, WorkspaceAccessError, workspaceNotFound } from '../tenancy.mjs';
 import * as tenancyTesting from '../tenancy-testing.mjs';
 
 const tenancy = createTenancy({ setting: 'app.workspace_ids', column: 'workspace_id', tables: ['note'] });
@@ -103,6 +103,19 @@ test('read access switches to READ ONLY after the membership check, and the API 
   // begin, membership (with its share lock), SET TRANSACTION READ ONLY, set_config, commit.
   assert.deepEqual(pool.sent, ['begin', 'select', 'set', 'select', 'commit', 'begin', 'select', 'set', 'select', 'commit']);
   assert.equal('setScope' in tenancy, false);
+});
+
+test('a workspace id that is not a UUID throws InvalidWorkspaceIdError before any statement, instead of being dropped', async () => {
+  const pool = new ScriptedPool({}), db = drizzle(pool as never);
+  const invalid = (error: unknown) => error instanceof InvalidWorkspaceIdError && error instanceof TypeError && error.code === 'TENANCY_WORKSPACE_ID_INVALID';
+  for (const id of ['not-a-uuid', `${fakeWorkspace},${fakeWorkspace}`, '', 7, undefined]) {
+    await assert.rejects(tenancy.withWorkspace(db, 'u', id as string, 'read', async () => 'unreached'), invalid, String(id));
+    await assert.rejects(tenancy.withWorkspaces(db, 'u', [fakeWorkspace, id as string], async () => 'unreached'), invalid, String(id));
+  }
+  await assert.rejects(tenancy.withWorkspaces(db, 'u', fakeWorkspace as never, async () => 'unreached'), TypeError);
+  assert.deepEqual([pool.sent, pool.released], [[], []]);
+  // Upper case is the same workspace, in its canonical lower-case form.
+  assert.equal(await tenancy.withWorkspace(db, 'u', fakeWorkspace.toUpperCase(), 'write', async (_tx, access) => access.workspaceId), fakeWorkspace);
 });
 
 test('the exported transaction releases a connection whose BEGIN failed and keeps the callback\'s error', async () => {
@@ -329,7 +342,6 @@ test('a non-member, a missing workspace and a viewer writing get one indistingui
   const attempts = [
     tenancy.withWorkspace(db, fixture.c, fixture.w1, 'read', async () => { ran = true; }),
     tenancy.withWorkspace(db, fixture.c, randomUUID(), 'read', async () => { ran = true; }),
-    tenancy.withWorkspace(db, fixture.c, 'not-a-uuid', 'write', async () => { ran = true; }),
     tenancy.withWorkspace(db, fixture.b, fixture.w1, 'write', async () => { ran = true; }),
   ];
   const errors = await Promise.all(attempts.map(attempt => attempt.then(() => undefined, (error: unknown) => error)));
@@ -341,7 +353,7 @@ test('a non-member, a missing workspace and a viewer writing get one indistingui
 
 test('withWorkspaces reads across the reachable workspaces and leaves the others out silently', { skip }, async () => {
   const db = appDb();
-  const ids = [fixture.w3, fixture.w2, fixture.w1, randomUUID(), 'not-a-uuid'];
+  const ids = [fixture.w3, fixture.w2, fixture.w1, randomUUID()];
   const [access, bodies] = await tenancy.withWorkspaces(db, fixture.a, ids, async (tx, access) =>
     [access.map(item => item.workspaceId), (await tx.select({ body: note.body }).from(note).orderBy(note.id)).map(row => row.body)] as const);
   assert.deepEqual(access, [fixture.w1, fixture.w2], 'in creation order');
@@ -351,7 +363,7 @@ test('withWorkspaces reads across the reachable workspaces and leaves the others
 });
 
 test('the test-only scope setter validates ids, is absent from the tenancy entry and the package root, and sends one parameterised statement', async () => {
-  assert.deepEqual(Object.keys(tenancyTesting), ['setScopeForTesting']);
+  assert.deepEqual(Object.keys(tenancyTesting), ['requireScopeForTesting', 'setScopeForTesting', 'unscopedForTesting']);
   const runtime = await import('../index.mjs');
   assert.equal('setScopeForTesting' in tenancy || 'setScopeForTesting' in runtime, false);
   const sent: unknown[][] = [], client = { query: async (text: string, values?: unknown[]) => { sent.push([text, values]); } };

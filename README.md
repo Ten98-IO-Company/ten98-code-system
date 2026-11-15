@@ -15,7 +15,7 @@ Shared server-side building blocks for Ten98 apps, so every app gets the same te
 ## Get started
 
 - Install a release archive from [GitHub Releases](https://github.com/Ten98-IO-Company/ten98-code-system/releases) into the app's `vendor/` folder and update the manifest and lockfile together: [Usage](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Usage).
-- Import from `@ten98/runtime`, or from an entry point: `/browser`, `/auth`, `/db`, `/tenancy`, `/tenancy/testing`, `/config`, `/email` or `/browser-audit`. Every export is in the [Reference](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Reference).
+- Import from `@ten98/runtime`, or from an entry point: `/browser`, `/auth`, `/db`, `/tenancy`, `/tenancy/testing`, `/tenancy/system`, `/config`, `/email` or `/browser-audit`. Every export is in the [Reference](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Reference).
 - Adopt an entry point or a feature with the [adoption guide](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/docs/FEATURE-ADOPTION.md), which has a checklist per entry point, and the [feature catalogue](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/features/catalog.json).
 - Run `node node_modules/@ten98/runtime/check.mjs .` as the app's `check:architecture` script, first in every `test` and `build` script. [architecture.json](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/architecture.json) declares the shared versions and dependencies.
 - Apps keep their own authorization, storage, credentials and paid-work accounting. The runtime owns only the shared mechanism.

@@ -2,20 +2,23 @@
 // workspace data carries one policy admitting the workspaces listed in a transaction-local setting, and is read and
 // written only inside `withWorkspace` (or, for reads across the caller's own workspaces, `withWorkspaces`). The app
 // configures the setting, column and tables once with `createTenancy` and keeps its routes, roles and how a refusal
-// becomes its response. drizzle-orm and pg are exact, optional peer dependencies.
+// becomes its response. drizzle-orm and pg are exact, optional peer dependencies. Work with no user (jobs, webhooks,
+// verified credentials) uses the separate @ten98/runtime/tenancy/system entry over the same tenancy.
 //
 // Drizzle declares the policy (`policy`) and ENABLE ROW LEVEL SECURITY (`pgTable(...).enableRLS()`). FORCE, the roles
-// and their grants are SQL in the app's custom migration step; `forceRowLevelSecurity` writes the FORCE part.
+// and their grants are SQL in the app's custom migration step; `forceRowLevelSecurity` writes the FORCE part and
+// `resolverFunctions` the declared resolvers.
 import { and, eq, inArray, sql } from 'drizzle-orm';
-import { pgPolicy, PgTransaction, type PgPolicy } from 'drizzle-orm/pg-core';
+import { pgPolicy, type PgPolicy } from 'drizzle-orm/pg-core';
 import type pg from 'pg';
 import type { WorkspaceRole } from './browser.mjs';
-import { membership, transaction, workspace, type AnyDatabase, type ScopedTransaction } from './db.mjs';
+import { membership, workspace, type AnyDatabase, type ScopedTransaction } from './db.mjs';
+import { mechanics, scopeMechanics, workspaceIdOf, type Caller, type LockRecord } from './tenancy-scope.mjs';
 
 export type { ScopedTransaction } from './db.mjs';
+export { InvalidWorkspaceIdError, ScopeNestingError } from './tenancy-scope.mjs';
 
 export type WorkspaceMode = 'read' | 'write';
-type Caller = { scope: string; readOnly: boolean };
 /** The authorized workspace with its name and the caller's role in it. */
 export type WorkspaceAccess = { workspaceId: string; name: string; role: WorkspaceRole };
 // A pg pool, pool client or client.
@@ -36,13 +39,36 @@ export class DatabaseRoleError extends Error {
   }
 }
 
-export interface TenancyOptions<TTable extends string> {
+/**
+ * A narrow SECURITY DEFINER lookup, the only cross-tenant read: one parameterised `SELECT … WHERE … LIMIT 1` on one
+ * table, returning a workspace id, or for a verified resolver the workspace id and the principal it verified.
+ */
+export interface ResolverDeclaration {
+  /** The one argument, such as `{ name: 'token_hash', type: 'text' }`. */
+  parameter: { name: string; type: 'text' | 'uuid' };
+  /** The table the credential is looked up in, which the resolver owner role reads. */
+  table: string;
+  /** The column the argument is matched against, such as `token_hash`. */
+  match: string;
+  /** The table's workspace id column; the tenancy column by default. */
+  workspace?: string;
+  /** For `withVerifiedWorkspace`: the principal's kind, a constant such as `api_key`, and its id column. */
+  principal?: { kind: string; id: string };
+  /** Timestamp columns of the principal's row set to now() each time it resolves, such as `last_used_at`. Needs `principal`. */
+  touch?: readonly string[];
+}
+
+export interface TenancyOptions<TTable extends string, TResolver extends string = string> {
   /** The custom setting that lists the admitted workspace ids, such as `app.workspace_ids`. */
   setting: string;
   /** The workspace id column every scoped table carries, such as `workspace_id`. */
   column: string;
   /** Every table that holds workspace data. */
   tables: readonly TTable[];
+  /** The NOLOGIN, BYPASSRLS role that owns the resolvers and nothing else. Required with `resolvers`. */
+  resolverOwner?: string;
+  /** Every SECURITY DEFINER resolver function, by name. `assertDatabaseRoles` refuses any other function the owner owns. */
+  resolvers?: Readonly<Record<TResolver, ResolverDeclaration>>;
 }
 
 /**
@@ -58,60 +84,69 @@ export class UnlockedScopeError extends Error {
 }
 
 const writers: readonly WorkspaceRole[] = ['owner', 'admin', 'editor'];
-/**
- * The memberships, as user and workspace pairs, that a helper share-locked at the top level of a transaction it opened
- * itself. That check is the transaction's first statement, so no savepoint precedes it and nothing short of the
- * transaction's end releases those locks. Locks taken by nested calls are never recorded: a savepoint or a caller's
- * ROLLBACK TO can release them unseen. Keyed by the transaction objects the helpers hand out, the top-level one and the
- * savepoints helpers open inside it; any other transaction object has no record, so nesting there fails closed.
- *
- * A record is valid only for the transaction that made it: `open` turns false when that transaction ends, however it
- * ends, so a transaction object used afterwards (an un-awaited nested call, say) is refused. `started` is that
- * transaction's `transaction_timestamp()`, so a caller's own ROLLBACK and BEGIN inside it, which would start a new
- * transaction on the same connection under the same objects, is refused too.
- */
-type LockRecord = { readonly pairs: Set<string>; started: string | undefined; open: boolean };
-const held = new WeakMap<object, LockRecord>();
 const pair = (userId: string, workspaceId: string) => `${userId}\u0000${workspaceId}`;
-const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Lowercase names only: they go into SQL text unquoted, and PostgreSQL's stored policy then matches them verbatim.
 const identifier = /^[a-z_][a-z0-9_]*$/;
 const settingName = /^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)+$/;
 // Removes PostgreSQL's deparse formatting (whitespace, parentheses, `::text` casts) from a stored policy, never the expression.
 const deparseNoise = String.raw`[\s()]|::text(\[\])?`;
+const name = (value: unknown): value is string => typeof value === 'string' && identifier.test(value);
+// The one search_path every resolver fixes, as pg_proc.proconfig stores it.
+const resolverSearchPath = 'search_path=pg_catalog, pg_temp';
 
-export function createTenancy<TTable extends string>({ setting, column, tables }: TenancyOptions<TTable>) {
+function checkResolvers(column: string, owner: unknown, resolvers: Readonly<Record<string, ResolverDeclaration>> | undefined): void {
+  if (resolvers === undefined) return;
+  const fail = (message: string): never => { throw new TypeError(`Tenancy resolvers: ${message}`); };
+  if (!resolvers || typeof resolvers !== 'object' || Array.isArray(resolvers)) fail('declare them as an object keyed by function name.');
+  if (!name(owner)) fail('resolverOwner must be a lowercase SQL identifier.');
+  for (const [key, resolver] of Object.entries(resolvers)) {
+    const { parameter, table, match, workspace: ws = column, principal, touch } = (resolver ?? {}) as Partial<ResolverDeclaration>;
+    if (!name(key)) fail(`${key} is not a lowercase SQL identifier.`);
+    if (!parameter || !name(parameter.name) || (parameter.type !== 'text' && parameter.type !== 'uuid')) fail(`${key} needs a parameter with a lowercase name and type text or uuid.`);
+    if (!name(table) || !name(match) || !name(ws)) fail(`${key} needs lowercase table, match and workspace column names.`);
+    if (principal !== undefined && (!principal || !name(principal.kind) || !name(principal.id))) fail(`${key} needs a principal with a lowercase kind and id column.`);
+    if (touch !== undefined && (!Array.isArray(touch) || !touch.length || !touch.every(name) || !principal)) fail(`${key} touches lowercase columns of its principal's row only.`);
+  }
+}
+
+/**
+ * The resolver's DDL. The body is one parameterised statement on one table, its argument bound as `$1`, returning at
+ * most one row of the declared columns. With `touch` it is an UPDATE of the principal's row (VOLATILE), so recording use
+ * happens inside the resolver, before any read-only scope begins.
+ */
+function resolverStatements(key: string, resolver: ResolverDeclaration, column: string, owner: string, applicationRole: string): string[] {
+  const { parameter, table, match, workspace: ws = column, principal, touch } = resolver;
+  const signature = `public."${key}"(${parameter.type})`, from = `public."${table}"`;
+  const returned = [`"${ws}"::uuid`, ...principal ? [`'${principal.kind}'::text`, `"${principal.id}"::text`] : []].join(', ');
+  const lookup = principal && touch
+    ? `UPDATE ${from} SET ${touch.map(item => `"${item}" = now()`).join(', ')} WHERE "${principal.id}" = (SELECT "${principal.id}" FROM ${from} WHERE "${match}" = $1 LIMIT 1) RETURNING ${returned}`
+    : `SELECT ${returned} FROM ${from} WHERE "${match}" = $1 LIMIT 1`;
+  const shape = principal ? `"${parameter.name}" ${parameter.type}, OUT workspace_id uuid, OUT principal_kind text, OUT principal_id text)`
+    : `"${parameter.name}" ${parameter.type}) RETURNS uuid`;
+  return [
+    `CREATE OR REPLACE FUNCTION public."${key}"(${shape} LANGUAGE sql ${touch ? 'VOLATILE' : 'STABLE'} SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $resolver$${lookup}$resolver$;`,
+    `ALTER FUNCTION ${signature} OWNER TO "${owner}";`,
+    `REVOKE ALL ON FUNCTION ${signature} FROM PUBLIC;`,
+    `GRANT EXECUTE ON FUNCTION ${signature} TO "${applicationRole}";`,
+  ];
+}
+
+type ResolverFacts = { name: string; schema: string; kind: string; definer: boolean; set: boolean; language: string; config: string[] | null;
+  arguments: string; result: string; owner: string; executable: boolean; publicExecute: boolean };
+type OwnerFacts = { canlogin: boolean; superuser: boolean; bypass: boolean; member: boolean; owned: string[] };
+
+export function createTenancy<TTable extends string, TResolver extends string = never>({ setting, column, tables, resolverOwner, resolvers }: TenancyOptions<TTable, TResolver>) {
   if (typeof setting !== 'string' || !settingName.test(setting)) throw new TypeError('The tenancy setting must be a lowercase custom setting name such as app.workspace_ids.');
-  if (typeof column !== 'string' || !identifier.test(column)) throw new TypeError('The tenancy column must be a lowercase SQL identifier.');
-  if (!Array.isArray(tables) || !tables.length || !tables.every(table => typeof table === 'string' && identifier.test(table))) throw new TypeError('The tenancy tables must be lowercase SQL identifiers.');
+  if (!name(column)) throw new TypeError('The tenancy column must be a lowercase SQL identifier.');
+  if (!Array.isArray(tables) || !tables.length || !tables.every(name)) throw new TypeError('The tenancy tables must be lowercase SQL identifiers.');
+  checkResolvers(column, resolverOwner, resolvers);
+  const declared: Readonly<Record<string, ResolverDeclaration>> = { ...resolvers };
   // Raw by necessity: a policy is DDL, which takes no bind parameters. Only the two names checked above are interpolated.
   const scope = sql.raw(`${column} = ANY (string_to_array(current_setting('${setting}', true), ','))`);
   // The scope as PostgreSQL stores it in pg_policies once `deparseNoise` is removed.
   const storedScope = `${column}=ANYstring_to_arraycurrent_setting'${setting}',true,','`;
-
-  // Parameterised `sql` statements by necessity: Drizzle has no builder for set_config or current_setting.
-  const setScope = (tx: AnyDatabase, value: string) => tx.execute(sql`SELECT set_config(${setting}, ${value}, true)`);
-  // What a nested call must respect: the caller's scope, to put back, and whether its transaction is READ ONLY.
-  const readCaller = async (tx: AnyDatabase): Promise<Caller> => {
-    const { rows } = (await tx.execute(sql`SELECT current_setting(${setting}, true) AS scope, current_setting('transaction_read_only') AS read_only`)) as unknown as { rows: { scope: string | null; read_only: string }[] };
-    return { scope: rows[0]?.scope ?? '', readOnly: rows[0]?.read_only === 'on' };
-  };
-
-  /**
-   * Runs `run` with row-level security admitting `workspaceIds`. In a transaction of its own the scope lasts to its end.
-   * A nested call (`caller`: a caller's transaction or a savepoint, which may already hold a scope) puts the caller's
-   * scope back when `run` settles, so the caller never goes on in the inner workspace. After an error the transaction
-   * may be aborted and refuse the restore; the caller's ROLLBACK, or the savepoint's, then undoes the inner scope.
-   * Nested calls on one transaction must be awaited in turn: run at once, their scopes and restores interleave.
-   */
-  async function inScope<T>(tx: AnyDatabase, workspaceIds: readonly string[], caller: Caller | undefined, run: () => Promise<T>): Promise<T> {
-    await setScope(tx, workspaceIds.join(','));
-    if (!caller) return run();
-    let result: T;
-    try { result = await run(); } catch (error) { await setScope(tx, caller.scope).catch(() => undefined); throw error; }
-    await setScope(tx, caller.scope);
-    return result;
-  }
+  const scoped = scopeMechanics(setting);
+  const { inScope, scopedTransaction } = scoped;
 
   /**
    * The caller's memberships among `workspaceIds`, taken inside the transaction. Each membership row is share-locked
@@ -124,9 +159,8 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
    * other membership, another user's, or any in a READ ONLY transaction the caller opened itself, throws
    * UnlockedScopeError rather than being read unlocked, where a removal could commit while the callback still reads.
    */
-  async function memberships(tx: AnyDatabase, userId: string, workspaceIds: readonly string[], caller: Caller | undefined,
+  async function memberships(tx: AnyDatabase, userId: string, ids: readonly string[], caller: Caller | undefined,
     record: LockRecord | undefined, locked: LockRecord | undefined): Promise<WorkspaceAccess[]> {
-    const ids = workspaceIds.filter(id => typeof id === 'string' && uuid.test(id)).map(id => id.toLowerCase());
     if (!ids.length || typeof userId !== 'string') return [];
     const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role, started: sql<string>`extract(epoch from transaction_timestamp())::text` })
       .from(membership).innerJoin(workspace, eq(workspace.id, membership.workspaceId))
@@ -138,32 +172,18 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
         record.started = rows[0]?.started;
         for (const item of rows) record.pairs.add(pair(userId, item.workspaceId));
       }
-    } else if (rows.length && (!locked?.open || rows[0]!.started !== locked.started || rows.some(item => !locked.pairs.has(pair(userId, item.workspaceId))))) {
+    } else if (rows.length && (!locked?.open || locked.kind !== 'user' || rows[0]!.started !== locked.started || rows.some(item => !locked.pairs.has(pair(userId, item.workspaceId))))) {
       throw new UnlockedScopeError();
     }
     return rows.map(({ workspaceId, name, role }) => ({ workspaceId, name, role }));
   }
 
-  /**
-   * Runs `body` in the transaction a helper call uses. A transaction of its own starts a fresh record of the
-   * memberships its top-level check locks (`record`). A nested call (the caller's `outer`, or a savepoint when `db` is a
-   * transaction) gets the caller's state and only reads the record; a savepoint a helper opens shares it.
-   */
-  async function scopedTransaction<TDatabase extends AnyDatabase, T>(db: TDatabase, outer: ScopedTransaction<TDatabase> | undefined,
-    body: (tx: ScopedTransaction<TDatabase>, caller: Caller | undefined, record: LockRecord | undefined, locked: LockRecord | undefined) => Promise<T>): Promise<T> {
-    if (outer) return body(outer, await readCaller(outer), undefined, held.get(outer));
-    if (!(db instanceof PgTransaction)) {
-      const record: LockRecord = { pairs: new Set(), started: undefined, open: true };
-      try {
-        return await transaction(db, tx => { held.set(tx, record); return body(tx, undefined, record, record); });
-      } finally { record.open = false; }
-    }
-    const locked = held.get(db);
-    return transaction(db, async tx => { if (locked) held.set(tx, locked); return body(tx, await readCaller(tx), undefined, locked); });
-  }
-
-  return {
+  const tenancy = {
     setting, column, tables,
+    /** The transaction-local settings a system scope records its reason and verified principal in, for triggers and audit. */
+    reasonSetting: scoped.reasonSetting, principalSetting: scoped.principalSetting,
+    /** The declared resolvers, as given to `createTenancy`. */
+    resolvers: declared as Readonly<Record<TResolver, ResolverDeclaration>>,
     /** The policy for a scoped table's Drizzle callback: every command, every role, USING and WITH CHECK the scope. */
     policy(name: string): PgPolicy {
       return pgPolicy(name, { as: 'permissive', for: 'all', to: 'public', using: scope, withCheck: scope });
@@ -176,33 +196,50 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
       return tables.map(table => `ALTER TABLE "${table}" FORCE ROW LEVEL SECURITY;`).join('\n--> statement-breakpoint\n');
     },
     /**
+     * The custom migration step's statements for every declared resolver: the function, SECURITY DEFINER with a fixed
+     * search_path, owned by `resolverOwner`, EXECUTE revoked from PUBLIC and granted to `applicationRole` only. Returned
+     * as text with drizzle-kit breakpoints, never executed here. The owner role, its BYPASSRLS and its SELECT (and, for
+     * `touch`, UPDATE) grants on the looked-up tables stay in the app's custom step.
+     */
+    resolverFunctions(applicationRole: string): string {
+      if (!name(applicationRole) || applicationRole === resolverOwner) throw new TypeError('resolverFunctions needs the application role, a lowercase SQL identifier other than the resolver owner.');
+      return Object.entries(declared).flatMap(([key, resolver]) => resolverStatements(key, resolver, column, resolverOwner!, applicationRole)).join('\n--> statement-breakpoint\n');
+    },
+    /**
      * Authorizes `userId` as a member of `workspaceId` (viewers read; editors, admins and owners write) and runs `run` in
      * one transaction whose row-level security admits that workspace only. `read` makes that transaction READ ONLY once
      * the membership is checked (its share lock cannot be taken in a read-only transaction). `outer` joins a transaction
      * the caller already holds (workspace creation inserts the workspace first), and `db` may itself be a transaction (a
      * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards. Nested in
      * a READ ONLY transaction it admits only this user's memberships that the transaction's top-level helper call locked.
+     * A workspace id that is not a UUID throws InvalidWorkspaceIdError before any statement; nested in a system scope it
+     * throws ScopeNestingError.
      */
     async withWorkspace<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceId: string, mode: WorkspaceMode,
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess) => Promise<T>, outer?: ScopedTransaction<TDatabase>): Promise<T> {
-      return scopedTransaction(db, outer, async (tx, caller, record, locked) => {
-        const [access] = await memberships(tx, userId, [workspaceId], caller, record, locked);
+      const id = workspaceIdOf(workspaceId);
+      return scopedTransaction(db, outer, 'user', async (tx, caller, record, locked) => {
+        const [access] = await memberships(tx, userId, [id], caller, record, locked);
         if (!access || (mode !== 'read' && !writers.includes(access.role))) throw new WorkspaceAccessError();
         if (mode === 'read' && !caller) await tx.setTransaction({ accessMode: 'read only' });
-        return inScope(tx, [access.workspaceId], caller, () => run(tx, access));
+        return inScope(tx, 'user', [access.workspaceId, '', ''], caller, () => run(tx, access));
       });
     },
     /**
      * For reads: runs `run` in one READ ONLY transaction scoped to those of `workspaceIds` the user is a member of. Ids
-     * the user cannot reach are left out silently; `run` receives the ones admitted. Given a transaction as `db` it runs in
-     * a savepoint, as `withWorkspace` does, and restores the caller's scope.
+     * the user is not a member of are left out silently; `run` receives the ones admitted. An id that is not a UUID
+     * throws InvalidWorkspaceIdError before any statement. Given a transaction as `db` it runs in a savepoint, as
+     * `withWorkspace` does, and restores the caller's scope.
      */
     withWorkspaces<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceIds: readonly string[],
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess[]) => Promise<T>): Promise<T> {
-      return scopedTransaction(db, undefined, async (tx, caller, record, locked) => {
-        const access = await memberships(tx, userId, workspaceIds, caller, record, locked);
+      if (!Array.isArray(workspaceIds)) return Promise.reject(new TypeError('withWorkspaces needs an array of workspace ids.'));
+      let ids: string[];
+      try { ids = workspaceIds.map(workspaceIdOf); } catch (error) { return Promise.reject(error); }
+      return scopedTransaction(db, undefined, 'user', async (tx, caller, record, locked) => {
+        const access = await memberships(tx, userId, ids, caller, record, locked);
         if (!caller) await tx.setTransaction({ accessMode: 'read only' });
-        return inScope(tx, access.map(item => item.workspaceId), caller, () => run(tx, access));
+        return inScope(tx, 'user', [access.map(item => item.workspaceId).join(','), '', ''], caller, () => run(tx, access));
       });
     },
     /**
@@ -210,6 +247,11 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
      * is a member of the owner of any public table, and every scoped table (`checked`, by default all of them) forces
      * row-level security with exactly one policy, the workspace policy, for every command and role (USING and WITH
      * CHECK). Without this the policies are silently inert or could be widened by an extra permissive policy.
+     *
+     * With resolvers declared it also checks each one's shape (SECURITY DEFINER, LANGUAGE sql, the fixed search_path,
+     * the declared argument and return, no overload, EXECUTE for this role and not for PUBLIC, owned by `resolverOwner`),
+     * the owner role (NOLOGIN, not a superuser, BYPASSRLS, owning no relation, not a role this one is a member of), and
+     * that the owner owns no function that is not declared. It does not read function bodies; review those by hand.
      */
     async assertDatabaseRoles(pool: Queryable, checked: readonly string[] = tables): Promise<void> {
       // A raw, parameterised statement by necessity: it reads the system catalogues, which have no Drizzle schema, and
@@ -236,9 +278,58 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
         ...role.unforced.length ? [`row-level security is not enabled and forced on ${role.unforced.join(', ')}`] : [],
         ...role.unpolicied.length ? [`the workspace policy is missing, altered or accompanied by another policy on ${role.unpolicied.join(', ')}`] : [],
       ];
+      if (resolverOwner !== undefined) problems.push(...await resolverProblems(pool));
       if (problems.length) throw new DatabaseRoleError(problems);
     },
   };
+
+  // The declared resolvers against the catalogue, and every function their owner owns.
+  async function resolverProblems(pool: Queryable): Promise<string[]> {
+    // A raw, parameterised statement by necessity, as above: it reads pg_proc, pg_roles and pg_class.
+    const { rows } = await pool.query<{ functions: ResolverFacts[]; owner: OwnerFacts | null }>(
+      `SELECT COALESCE((SELECT json_agg(json_build_object('name', p.proname, 'schema', n.nspname, 'kind', p.prokind, 'definer', p.prosecdef,
+           'set', p.proretset, 'language', l.lanname, 'config', p.proconfig, 'arguments', pg_get_function_arguments(p.oid),
+           'result', pg_get_function_result(p.oid), 'owner', o.rolname, 'executable', has_function_privilege(current_user, p.oid, 'EXECUTE'),
+           'publicExecute', p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'))
+           ORDER BY n.nspname, p.proname, p.oid)
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_language l ON l.oid = p.prolang JOIN pg_roles o ON o.oid = p.proowner
+         WHERE (n.nspname = 'public' AND p.proname = ANY ($1::text[])) OR o.rolname = $2), '[]'::json) AS functions,
+         (SELECT json_build_object('canlogin', r.rolcanlogin, 'superuser', r.rolsuper, 'bypass', r.rolbypassrls,
+           'member', pg_has_role(current_user, r.oid, 'MEMBER'),
+           'owned', ARRAY(SELECT c.relname::text FROM pg_class c WHERE c.relowner = r.oid ORDER BY 1))
+          FROM pg_roles r WHERE r.rolname = $2) AS owner`, [Object.keys(declared), resolverOwner]);
+    const { functions, owner } = rows[0]!;
+    const problems: string[] = [];
+    if (!owner) problems.push(`the resolver owner ${resolverOwner} was not found`);
+    else {
+      const wrong = [...owner.canlogin ? ['can log in'] : [], ...owner.superuser ? ['is a superuser'] : [], ...!owner.bypass ? ['lacks BYPASSRLS'] : [],
+        ...owner.member ? ['is a role the application role is a member of'] : [], ...owner.owned.length ? [`owns ${owner.owned.join(', ')}`] : []];
+      if (wrong.length) problems.push(`the resolver owner ${resolverOwner} ${wrong.join(', ')}`);
+    }
+    for (const [key, resolver] of Object.entries(declared)) {
+      const found = functions.filter(item => item.schema === 'public' && item.name === key);
+      if (found.length !== 1) { problems.push(found.length ? `resolver ${key} is overloaded` : `resolver ${key} is missing`); continue; }
+      const fn = found[0]!, expected = resolverShape(resolver);
+      const wrong = [...fn.kind !== 'f' || fn.set || fn.arguments !== expected.arguments || fn.result !== expected.result ? ['has another signature or return'] : [],
+        ...!fn.definer ? ['is not SECURITY DEFINER'] : [], ...fn.language !== 'sql' ? ['is not LANGUAGE sql'] : [],
+        ...fn.config?.length !== 1 || fn.config[0] !== resolverSearchPath ? [`does not fix ${resolverSearchPath} alone`] : [],
+        ...fn.owner !== resolverOwner ? [`is not owned by ${resolverOwner}`] : [], ...!fn.executable ? ['is not executable by this role'] : [],
+        ...fn.publicExecute ? ['is executable by PUBLIC'] : []];
+      if (wrong.length) problems.push(`resolver ${key} ${wrong.join(', ')}`);
+    }
+    const undeclared = functions.filter(item => item.owner === resolverOwner && !(item.schema === 'public' && Object.hasOwn(declared, item.name)));
+    if (undeclared.length) problems.push(`the resolver owner ${resolverOwner} owns undeclared functions ${undeclared.map(item => `${item.schema}.${item.name}(${item.arguments})`).join(', ')}`);
+    return problems;
+  }
+
+  mechanics.set(tenancy, scoped);
+  return tenancy;
 }
 
-export type Tenancy<TTable extends string = string> = ReturnType<typeof createTenancy<TTable>>;
+// How pg_get_function_arguments and pg_get_function_result print a declared resolver.
+function resolverShape({ parameter, principal }: ResolverDeclaration): { arguments: string; result: string } {
+  return principal ? { arguments: `${parameter.name} ${parameter.type}, OUT workspace_id uuid, OUT principal_kind text, OUT principal_id text`, result: 'record' }
+    : { arguments: `${parameter.name} ${parameter.type}`, result: 'uuid' };
+}
+
+export type Tenancy<TTable extends string = string, TResolver extends string = string> = ReturnType<typeof createTenancy<TTable, TResolver>>;

@@ -610,6 +610,36 @@ function testingTenancyImports(sources: readonly [string, string][]): string[] {
     .map(([path]) => `${path}: imports the test-only @ten98/runtime/tenancy/testing, which sets a scope without the membership check; only tests outside the data roots may.`);
 }
 
+// The system-scope entry opens a workspace scope with no membership check, so in the data roots only files the app
+// lists with a reason in its committed system-scope.json may import it (in the same import forms as above), and only
+// files whose entry also says `"write": true` may write `mode: 'write'`. Every entry must name a file that imports it.
+const systemTenancy = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)['"`]@ten98\/runtime\/tenancy\/system['"`]/u;
+const systemWriteMode = /\bmode\s*:\s*['"`]write['"`]/u;
+const systemScopeList = 'system-scope.json';
+function systemTenancyImports(directory: string, sources: readonly [string, string][]): string[] {
+  const file = resolve(directory, systemScopeList), errors: string[] = [];
+  const listed = new Map<string, { write: boolean }>();
+  if (existsSync(file)) {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [`${systemScopeList} must map each file to { "reason" }, with "write": true where it opens write-mode verified scopes.`];
+    for (const [path, entry] of Object.entries(parsed as Record<string, unknown>)) {
+      const { reason, write } = (entry ?? {}) as { reason?: unknown; write?: unknown };
+      if (typeof reason !== 'string' || !reason.trim()) errors.push(`${systemScopeList}: ${path} needs a "reason" saying why it opens a scope with no user.`);
+      if (write !== undefined && typeof write !== 'boolean') errors.push(`${systemScopeList}: ${path} has a "write" that is not true or false.`);
+      listed.set(path, { write: write === true });
+    }
+  }
+  const importing = sources.filter(([, text]) => systemTenancy.test(text));
+  for (const [path, text] of importing) {
+    const entry = listed.get(path);
+    if (!entry) errors.push(`${path}: imports @ten98/runtime/tenancy/system, which opens a scope with no membership check; list the file with a reason in ${systemScopeList}.`);
+    else if (!entry.write && systemWriteMode.test(text)) errors.push(`${path}: opens a write-mode verified scope; its ${systemScopeList} entry needs "write": true.`);
+  }
+  const importers = new Set(importing.map(([path]) => path));
+  for (const path of listed.keys()) if (!importers.has(path)) errors.push(`${systemScopeList}: ${path} does not import @ten98/runtime/tenancy/system from the data roots; remove the entry.`);
+  return errors;
+}
+
 // One allowlist entry: how many raw statements the file may hold and why they cannot be typed Drizzle queries.
 type Allowance = { count: number; reason: string };
 
@@ -641,7 +671,7 @@ export function checkDataAccess(directory: string, packageName: string): string[
   directory = resolve(directory);
   const { allowed, errors } = readAllowlist(directory, policy);
   const sources = dataSources(directory, policy);
-  return [...errors, ...testingTenancyImports(sources), ...rawStatementRises(rawStatementCounts(sources), allowed, policy.baseline)];
+  return [...errors, ...testingTenancyImports(sources), ...systemTenancyImports(directory, sources), ...rawStatementRises(rawStatementCounts(sources), allowed, policy.baseline)];
 }
 
 // Lowers or removes allowlist entries and keeps their reasons; a rise is refused. A missing allowlist is recorded once

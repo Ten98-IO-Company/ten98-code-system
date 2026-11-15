@@ -244,7 +244,9 @@
         "workspaceNotFound",
         "WorkspaceAccessError",
         "DatabaseRoleError",
-        "UnlockedScopeError"
+        "UnlockedScopeError",
+        "InvalidWorkspaceIdError",
+        "ScopeNestingError"
       ],
       "tests": [
         "tests/tenancy.test.mts"
@@ -264,14 +266,37 @@
         "pg": "8.23.0"
       },
       "exports": [
-        "setScopeForTesting"
+        "setScopeForTesting",
+        "requireScopeForTesting",
+        "unscopedForTesting"
       ],
       "tests": [
         "tests/tenancy.test.mts"
       ],
       "version": "v0.27.1",
       "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/120",
-      "boundary": "Test-only scope setter for database guard tests on a connection and transaction the test owns. The architecture check refuses imports of it from an app's data roots."
+      "boundary": "Test-only scope setter for database guard tests on a connection and transaction the test owns, and a test-database switch that makes a missing scope raise. The architecture check refuses imports of it from an app's data roots."
+    },
+    "tenancySystem": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/tenancy/system",
+      "entrypoints": [
+        "tenancy-system.mjs",
+        "tenancy-system.d.mts"
+      ],
+      "peerDependencies": {
+        "drizzle-orm": "0.45.2",
+        "pg": "8.23.0"
+      },
+      "exports": [
+        "createSystemScope"
+      ],
+      "tests": [
+        "tests/tenancy-system.test.mts"
+      ],
+      "version": "unreleased",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/160",
+      "boundary": "System scopes for work with no user (jobs, webhooks, operator tools) and verified scopes for credentials resolved by declared SECURITY DEFINER resolvers, each share-locking the workspace row under the same policies. The architecture check allows imports only from files listed with a reason in the app's system-scope.json. Apps keep their resolver owner role, its grants, resolver review and every decision about which credential reaches which workspace."
     },
     "config": {
       "package": "@ten98/runtime",

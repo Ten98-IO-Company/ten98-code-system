@@ -168,8 +168,39 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
       assert.equal(refused.status, 1, statement);
       assert.match(refused.stderr, /src\/server\/report\.ts: imports the test-only @ten98\/runtime\/tenancy\/testing/, statement);
     }
+    // The system-scope entry only from files system-scope.json lists with a reason; write mode only with "write": true.
+    const system = '@ten98/runtime/tenancy/system', scopes = join(app, 'system-scope.json');
+    for (const statement of [`import { createSystemScope } from '${system}'`, `import * as scope from "${system}"`, `import '${system}'`,
+      `const scope = await import('${system}')`, `const scope = require('${system}')`]) {
+      writeFileSync(source, `${statement};\n`);
+      const refused = run();
+      assert.equal(refused.status, 1, statement);
+      assert.match(refused.stderr, /src\/server\/report\.ts: imports @ten98\/runtime\/tenancy\/system, which opens a scope with no membership check/, statement);
+    }
+    writeFileSync(source, `import { createSystemScope } from '${system}';\nawait scope.withVerifiedWorkspace(db, { resolver: 'api_key', credential, reason: 'api', mode: 'write' }, run);\n`);
+    for (const [entries, expected] of [
+      [{ 'src/server/report.ts': {} }, /system-scope\.json: src\/server\/report\.ts needs a "reason"/],
+      [{ 'src/server/report.ts': { reason: ' ' } }, /system-scope\.json: src\/server\/report\.ts needs a "reason"/],
+      [{ 'src/server/report.ts': { reason: 'API keys.' } }, /report\.ts: opens a write-mode verified scope; its system-scope\.json entry needs "write": true/],
+      [{ 'src/server/report.ts': { reason: 'API keys.', write: 'yes' } }, /report\.ts has a "write" that is not true or false/],
+      [{ 'src/server/report.ts': { reason: 'API keys.', write: true }, 'src/server/gone.ts': { reason: 'Old job.' } }, /system-scope\.json: src\/server\/gone\.ts does not import/],
+      [[], /system-scope\.json must map each file/],
+    ] as const) {
+      writeFileSync(scopes, JSON.stringify(entries));
+      const refused = run();
+      assert.equal(refused.status, 1, JSON.stringify(entries));
+      assert.match(refused.stderr, expected, JSON.stringify(entries));
+    }
+    writeFileSync(scopes, JSON.stringify({ 'src/server/report.ts': { reason: 'API key requests write their own usage.', write: true } }));
+    assert.equal(run().status, 0, run().stderr);
+    writeFileSync(source, `import { createSystemScope } from '${system}';\nawait scope.withSystemWorkspace(db, { workspaceId, reason: 'billing-job' }, run);\n`);
+    writeFileSync(scopes, JSON.stringify({ 'src/server/report.ts': { reason: 'The billing job runs with no user.' } }));
+    assert.equal(run().status, 0, run().stderr);
+    rmSync(scopes);
     writeFileSync(source, "import { createTenancy } from '@ten98/runtime/tenancy';\n");
     mkdirSync(join(app, 'tests'), { recursive: true });
+    // Tests outside the data roots may import both entries unlisted.
+    writeFileSync(join(app, 'tests/system.test.ts'), `import { createSystemScope } from '${system}';\n`);
     writeFileSync(join(app, 'tests/guards.test.ts'), `import { setScopeForTesting } from '${testing}';\n`);
     assert.equal(run().status, 0, run().stderr);
     const allowlist = join(app, 'raw-statements.json'), recorded = () => JSON.parse(readFileSync(allowlist, 'utf8'));
