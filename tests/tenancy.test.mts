@@ -146,10 +146,23 @@ test('the exported transaction refuses a database it cannot run safely instead o
   const Minified = class a extends ScriptedPool {}, minified = new Minified({});
   assert.equal(await transaction(drizzle(minified as never), async () => 'done'), 'done');
   assert.deepEqual([minified.sent, minified.released], [['begin', 'commit'], [false]]);
-  // A single client is Drizzle's own transaction on that client: nothing to check out or release.
-  const sent: string[] = [], client = { query: async (config: string | { text: string }) => { sent.push(typeof config === 'string' ? config : config.text); return { rows: [], fields: [] }; } };
-  assert.equal(await transaction(drizzle(client as never), async () => 'done'), 'done');
+  // A checked-out client is Drizzle's own transaction on that client: nothing to check out or release.
+  const sent: string[] = [], query = async (config: string | { text: string }) => { sent.push(typeof config === 'string' ? config : config.text); return { rows: [], fields: [] }; };
+  assert.equal(await transaction(drizzle({ query, release: () => undefined } as never), async () => 'done'), 'done');
   assert.deepEqual(sent, ['begin', 'commit']);
+  // A wrapped pool (query and connect, no totalCount, no release) is refused: its statements could run on different backends.
+  await assert.rejects(transaction(drizzle({ query, connect: async () => ({ query, release: () => undefined }) } as never), async () => 'unreached'), refusedDatabase);
+  await assert.rejects(transaction(drizzle({ query } as never), async () => 'unreached'), refusedDatabase);
+  assert.deepEqual(sent, ['begin', 'commit']);
+});
+
+test('the exported transaction sends SET TRANSACTION only for a config that sets something', async () => {
+  const pool = new ScriptedPool({});
+  for (const config of [undefined, {}, { accessMode: undefined }]) assert.equal(await transaction(drizzle(pool as never), async () => 'done', config), 'done');
+  assert.deepEqual(pool.sent, ['begin', 'commit', 'begin', 'commit', 'begin', 'commit']);
+  const configured = new ScriptedPool({});
+  await transaction(drizzle(configured as never), async () => undefined, { accessMode: 'read only' });
+  assert.deepEqual(configured.sent, ['begin', 'set', 'commit']);
 });
 
 // Integration tests on real PostgreSQL, opt-in: set TEN98_TEST_DATABASE_URL to a disposable server (a superuser URL; each
@@ -515,6 +528,20 @@ test('locks released by a rollback the helper did not make never admit a later n
   });
   // Documented limit, failing closed: the caller's own Drizzle savepoint has no record, though the lock is held.
   await assert.rejects(tenancy.withWorkspaces(db, fixture.a, [fixture.w1], tx => tx.transaction(own => tenancy.withWorkspace(own, fixture.a, fixture.w1, 'read', visible))), unlocked);
+});
+
+test('a REPEATABLE READ read-only transaction of the caller never admits a membership its snapshot still shows after removal', { skip }, async () => {
+  const db = appDb(), visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note)).map(row => row.id);
+  try {
+    await db.transaction(async outer => {
+      await outer.execute(sql`SELECT 1`); // takes the snapshot, in which A is still a member of W2
+      await root!.query('DELETE FROM membership WHERE workspace_id = $1 AND user_id = $2', [fixture.w2, fixture.a]);
+      await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w2, 'read', visible, outer), unlocked);
+      await assert.rejects(tenancy.withWorkspaces(outer, fixture.a, [fixture.w2], visible), unlocked);
+    }, { isolationLevel: 'repeatable read', accessMode: 'read only' });
+  } finally {
+    await root!.query("INSERT INTO membership(workspace_id, user_id, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING", [fixture.w2, fixture.a]);
+  }
 });
 
 // Last: this changes D's membership.

@@ -56,13 +56,20 @@ export function sharedDatabase(options) {
 }
 const isPool = (client) => client instanceof pg.Pool
     || (client instanceof Object && typeof client.connect === 'function' && typeof client.totalCount === 'number');
-const isClient = (client) => client instanceof pg.Client || (client instanceof Object && typeof client.query === 'function');
+// A single connection: a pg Client (a pool's checked-out client is one), or a client-shaped object that can be released
+// as checked-out clients are. A wrapper with `query` and `connect` but no `release` may be a pool, whose statements can
+// run on different backends, so it is refused rather than given a transaction that is not one.
+const isClient = (client) => client instanceof pg.Client
+    || (client instanceof Object && typeof client.query === 'function' && typeof client.release === 'function');
+// Drizzle writes `SET TRANSACTION` with nothing after it for a config that sets nothing, which PostgreSQL refuses.
+const setsSomething = (config) => config !== undefined && Object.values(config).some(value => value !== undefined);
 /**
  * `db.transaction` without drizzle-orm 0.45.2's connection leak. Its node-postgres transaction sends BEGIN before its
  * `try`, so a failed BEGIN never releases the pooled connection, and a failed ROLLBACK replaces the error that caused
  * it. Over a pool this checks the connection out and runs BEGIN, COMMIT and ROLLBACK itself. It always releases the
  * connection, and discards it when BEGIN, COMMIT or ROLLBACK failed or the server ended it (its state is then
- * unknown). It throws the callback's own error, or a failed COMMIT's. While the connection is checked out it has an
+ * unknown; a COMMIT refused for a constraint or serialisation failure also discards a usable connection, which costs
+ * only a reconnect). It throws the callback's own error, or a failed COMMIT's. While the connection is checked out it has an
  * `error` listener, so a backend the server terminates fails the transaction instead of crashing the process.
  *
  * Given a transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. Any other
@@ -86,7 +93,7 @@ export async function transaction(db, run, config) {
         const tx = new NodePgTransaction(pooled.dialect, new NodePgSession(connection, pooled.dialect, schema, options), schema);
         try {
             await tx.execute(sql `begin`);
-            if (config)
+            if (setsSomething(config))
                 await tx.setTransaction(config);
         }
         catch (error) {
