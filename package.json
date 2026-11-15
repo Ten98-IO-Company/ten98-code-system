@@ -35,6 +35,10 @@
     "./tenancy": {
       "types": "./tenancy.d.mts",
       "import": "./tenancy.mjs"
+    },
+    "./tenancy/testing": {
+      "types": "./tenancy-testing.d.mts",
+      "import": "./tenancy-testing.mjs"
     }
   },
   "files": [
@@ -132,7 +136,10 @@
     "src/db.mts",
     "tenancy.mjs",
     "tenancy.d.mts",
-    "src/tenancy.mts"
+    "src/tenancy.mts",
+    "tenancy-testing.mjs",
+    "tenancy-testing.d.mts",
+    "src/tenancy-testing.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",

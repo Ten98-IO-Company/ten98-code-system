@@ -9,6 +9,7 @@ import { getTableConfig, PgDialect, pgTable, serial, text } from 'drizzle-orm/pg
 import pg from 'pg';
 import { createPool, teamSchema, transaction } from '../db.mjs';
 import { createTenancy, DatabaseRoleError, WorkspaceAccessError, workspaceNotFound } from '../tenancy.mjs';
+import * as tenancyTesting from '../tenancy-testing.mjs';
 
 const tenancy = createTenancy({ setting: 'app.workspace_ids', column: 'workspace_id', tables: ['note'] });
 const scopeText = "workspace_id = ANY (string_to_array(current_setting('app.workspace_ids', true), ','))";
@@ -332,6 +333,35 @@ test('withWorkspaces reads across the reachable workspaces and leaves the others
   assert.deepEqual(bodies, ['one', 'two edited']);
   assert.deepEqual(await tenancy.withWorkspaces(db, fixture.b, ids, async (tx, access) => [access.length, (await tx.select().from(note)).length]), [1, 1]);
   assert.deepEqual(await tenancy.withWorkspaces(db, randomUUID(), ids, async (tx, access) => [access.length, (await tx.select().from(note)).length]), [0, 0], 'an empty scope admits nothing');
+});
+
+test('the test-only scope setter validates ids, is absent from the tenancy entry and the package root, and sends one parameterised statement', async () => {
+  assert.deepEqual(Object.keys(tenancyTesting), ['setScopeForTesting']);
+  const runtime = await import('../index.mjs');
+  assert.equal('setScopeForTesting' in tenancy || 'setScopeForTesting' in runtime, false);
+  const sent: unknown[][] = [], client = { query: async (text: string, values?: unknown[]) => { sent.push([text, values]); } };
+  for (const ids of [['not-a-uuid'], [`${fakeWorkspace},${fakeWorkspace}`], [fakeWorkspace, 7], 'x']) {
+    await assert.rejects(tenancyTesting.setScopeForTesting(client, tenancy, ids as never), TypeError);
+  }
+  await tenancyTesting.setScopeForTesting(client, tenancy, [fakeWorkspace.toUpperCase(), fakeWorkspace]);
+  await tenancyTesting.setScopeForTesting(client, tenancy, []);
+  assert.deepEqual(sent, [['SELECT set_config($1, $2, true)', ['app.workspace_ids', `${fakeWorkspace},${fakeWorkspace}`]], ['SELECT set_config($1, $2, true)', ['app.workspace_ids', '']]]);
+});
+
+test('the test-only scope setter scopes a raw connection as the application role, to any workspaces, for its transaction only', { skip }, async () => {
+  const client = await appPool().connect();
+  const workspaces = async () => (await client.query<{ workspace_id: string }>('SELECT workspace_id FROM note ORDER BY id')).rows.map(row => row.workspace_id);
+  try {
+    await client.query('BEGIN');
+    // Every workspace, including W3, of which the role's users hold no membership the helpers would check.
+    await tenancyTesting.setScopeForTesting(client, tenancy, [fixture.w1, fixture.w2, fixture.w3]);
+    assert.deepEqual(await workspaces(), [fixture.w1, fixture.w2, fixture.w3]);
+    await tenancyTesting.setScopeForTesting(client, tenancy, []);
+    assert.deepEqual(await workspaces(), []);
+    await tenancyTesting.setScopeForTesting(client, tenancy, [fixture.w2]);
+    await client.query('COMMIT');
+    assert.deepEqual(await workspaces(), [], 'the scope ends with the transaction');
+  } finally { await client.query('ROLLBACK').catch(() => undefined); client.release(); }
 });
 
 test('read access runs READ ONLY; a caller\'s own transaction keeps its access mode', { skip }, async () => {

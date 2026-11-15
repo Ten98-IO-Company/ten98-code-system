@@ -719,7 +719,9 @@
           "db.mjs": "Generated PostgreSQL pool and Drizzle entry from src/db.mts, exported as ./db only; needs the optional drizzle-orm and pg peers.",
           "db.d.mts": "Generated declarations from src/db.mts.",
           "tenancy.mjs": "Generated row-level security tenancy entry from src/tenancy.mts, exported as ./tenancy only; needs the optional drizzle-orm and pg peers.",
-          "tenancy.d.mts": "Generated declarations from src/tenancy.mts."
+          "tenancy.d.mts": "Generated declarations from src/tenancy.mts.",
+          "tenancy-testing.mjs": "Generated test-only scope setter from src/tenancy-testing.mts, exported as ./tenancy/testing only, never from ./tenancy or the root.",
+          "tenancy-testing.d.mts": "Generated declarations from src/tenancy-testing.mts."
         },
         "compilerProjects": [
           "tsconfig.json",
