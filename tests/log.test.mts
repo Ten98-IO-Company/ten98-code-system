@@ -97,7 +97,7 @@ test('bigint fields are written as strings and a circular field does not throw',
   log.info('loop', { requestId: 'abcdefgh', circular });
   const [charged, loop] = records();
   assert.equal(charged!.amountMinor, '12345678901234567');
-  assert.deepEqual({ ...loop, time: undefined }, { time: undefined, level: 'info', service: 'discover', message: 'loop', requestId: 'abcdefgh', logError: 'fields could not be serialised' });
+  assert.deepEqual({ ...loop, time: undefined }, { time: undefined, level: 'info', service: 'discover', message: 'loop', requestId: 'abcdefgh', circular: { self: '[circular]' } });
 });
 
 test('requestId keeps a valid incoming x-request-id and replaces anything else with a new UUID', () => {
@@ -145,11 +145,15 @@ test('credentials embedded in a URL are removed from any string value, whatever 
     plain: 'https://example.com/a@b',
   });
   const line = records()[0]!, text = JSON.stringify(line);
-  for (const secret of ['p4ss', 't0ken', 'hunter2', 'user@', 'S3CR', 'CRET']) assert.doesNotMatch(text, new RegExp(secret), secret);
+  for (const secret of ['p4ss', 't0ken', 'hunter2', 'user@', 'S3CR@T']) assert.doesNotMatch(text, new RegExp(secret), secret);
   assert.match(text, /postgres:\/\/\[redacted\]@db\.internal:5432\/app/);
-  for (const name of ['atSign', 'space', 'slash']) assert.equal(line[name], 'postgres://[redacted]@h/db', name);
-  // Taking the last @ over-redacts a URL with an @ in its path: the price of catching the passwords above.
-  assert.equal(line.plain, 'https://[redacted]@b');
+  // A raw @ inside the authority is covered: everything to its last @ goes.
+  assert.equal(line.atSign, 'postgres://[redacted]@h/db');
+  // Documented limit: a raw space or / ends the authority (such a URL is already invalid), so the password is written.
+  assert.equal(line.space, 'postgres://app:S3 CRET@h/db');
+  assert.equal(line.slash, 'postgres://app:S3/CRET@h/db');
+  // An @ in a path is not a credential.
+  assert.equal(line.plain, 'https://example.com/a@b');
 });
 
 test('a long hostile string is scanned in linear time and cut to length (check of PR 138)', () => {
@@ -181,4 +185,71 @@ test('a log call never throws: throwing getters, unserialisable values and a fai
   assert.equal(lines.length, 4);
   const failing = createLogger({ service: 's', write: () => { throw new Error('sink down'); } });
   assert.doesNotThrow(() => failing.error('lost'));
+});
+
+test('names fail closed: every secret name from the three checks is redacted (second check of PR 138)', () => {
+  const { log, records } = capture();
+  const names = ['PGPASSWORD', 'dbpassword', 'DBPASS', 'userpassword', 'sessionid', 'PHPSESSID', 'JSESSIONID', 'accesstoken', 'refreshtoken',
+    'authtoken', 'clientsecret', 'privatekey', 'secretkey', 'connectionstring', 'databaseurl', 'setcookie', 'cardnumber', 'password1',
+    'password2', 'key1', 'token2', 'secret2', 'apiKey2', 'TOKEN_V2', 'password_confirmation', 'passwordConfirmation', 'passwordPlain',
+    'tokenValue', 'secretValue', 'clientSecretValue', 'cookieValue', 'bearerValue', 'jwtRaw', 'credentialsJson', 'secret_old', 'hmacSecretOld',
+    'otpCode', 'signatureHex', 'stripeSk', 'creditCard', 'recoveryCodes', 'resetLink', 'magicLink', 'pässword', 'пароль', 'sk', 'sid'];
+  log.info('config', Object.fromEntries(names.map(name => [name, 'visible-secret'])));
+  const line = records()[0]!;
+  for (const name of names) assert.equal(line[name], '[redacted]', name);
+  assert.doesNotMatch(JSON.stringify(line), /visible-secret/);
+});
+
+test('the harmless list is exact, extendable by the app, and cannot allow a secret', () => {
+  const { log, records } = capture();
+  log.info('ordinary', { keywords: ['a', 'b'], footprint: 3, authority: 'x' });
+  assert.deepEqual({ ...records()[0], time: undefined }, { time: undefined, level: 'info', service: 'discover', message: 'ordinary', keywords: ['a', 'b'], footprint: 3, authority: 'x' });
+  // A near miss of a harmless name stays redacted: the list matches whole names only.
+  log.info('near', { keywordToken: 'x', rankKeyword: 'y' });
+  assert.deepEqual([records()[1]!.keywordToken, records()[1]!.rankKeyword], ['[redacted]', '[redacted]']);
+  const lines: string[] = [], ranked = createLogger({ service: 's', allow: ['rankKeyword', 'rank-keyword'], write: line => { lines.push(line); } });
+  ranked.info('rank', { rankKeyword: 'shoes', rank_keyword: 'boots', password: 'visible-secret' });
+  assert.deepEqual([JSON.parse(lines[0]!).rankKeyword, JSON.parse(lines[0]!).rank_keyword, JSON.parse(lines[0]!).password], ['shoes', 'boots', '[redacted]']);
+  for (const secret of ['password', 'apiKey', 'sessionId', 'DATABASE_URL', 'sid', 'key', 'myPasswordField', 'cookieJar', '']) {
+    assert.throws(() => createLogger({ service: 's', allow: [secret] }), TypeError, secret);
+  }
+});
+
+test('ordinary strings are written unchanged: stack frames, scoped package URLs and a URL before an email address', () => {
+  const { log, records } = capture();
+  const ordinary = {
+    frame: 'at load (file:///srv/app/node_modules/@ten98/runtime/log.mjs:12:3)',
+    npm: 'https://registry.npmjs.org/@ten98/ui', unpkg: 'https://unpkg.com/@ten98/ui@0.39.0/dist/x.js',
+    sentence: 'see https://example.com/docs and write to me@example.org', query: 'https://example.com/?next=a@b', fragment: 'https://example.com/#me@x',
+  };
+  log.info('ordinary', ordinary);
+  const line = records()[0]!;
+  for (const [name, value] of Object.entries(ordinary)) assert.equal(line[name], value, name);
+  // Userinfo alone, such as a token used as the user, is still a credential.
+  log.info('userinfo', { github: 'https://ghp_abc123@github.com/org/repo', ssh: 'ssh://git@github.com/org/repo.git', boxed: new String('postgres://app:p4ss@h/db') });
+  assert.deepEqual([records()[1]!.github, records()[1]!.ssh, records()[1]!.boxed], ['https://[redacted]@github.com/org/repo', 'ssh://[redacted]@github.com/org/repo.git', 'postgres://[redacted]@h/db']);
+  // Far from the scheme (no 256-character bound any more).
+  log.info('far', { url: `postgres://app:${'p'.repeat(600)}@h/db` });
+  assert.equal(records()[2]!.url, 'postgres://[redacted]@h/db');
+});
+
+test('hostile keys and shapes stay within time, size and depth bounds', () => {
+  const { log, lines, records } = capture();
+  const started = performance.now();
+  log.info('long key', { [`A${'B'.repeat(1_000_000)}`]: 'x' });
+  log.info('huge key', { [`${'PASSWORD'.repeat(1_250_000)}`]: 'visible-secret' });
+  log.info('many keys', Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [`K${i}${'X'.repeat(2000)}`, i])));
+  log.info('wide', Object.fromEntries(Array.from({ length: 10_000 }, (_, i) => [`f${i}`, 'v'.repeat(8192)])));
+  let deep: Record<string, unknown> = { leaf: 1 };
+  for (let i = 0; i < 100; i++) deep = { next: deep };
+  log.info('deep', { deep });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 2000, `took ${elapsed.toFixed(0)} ms`);
+  for (const line of lines) assert.ok(line.length < 140_000, `line of ${line.length} characters`);
+  assert.doesNotMatch(lines.join(''), /visible-secret/);
+  const [longKey, , manyKeys, wide] = records();
+  assert.ok(Object.keys(longKey!).some(key => key.length === 257 && key.endsWith('…')));
+  assert.equal(manyKeys!['…'], '1800 more fields');
+  assert.match(String(wide!['…']), /more fields$/u);
+  assert.match(lines[4]!, /\[depth limit\]/u);
 });

@@ -1,56 +1,77 @@
 const SEVERITY = { debug: 10, info: 20, warn: 30, error: 40 };
 const CORE = new Set(['time', 'level', 'service', 'message', 'requestId']);
+const REQUEST_ID = /^[A-Za-z0-9._-]{8,128}$/u;
+// Every bound has a marker, so a cut never passes silently.
+const MAX_KEY = 256, MAX_STRING = 8192, MAX_DEPTH = 8, MAX_FIELDS = 200, MAX_LINE = 65_536;
 /**
- * Field names are split into lowercase segments at case changes and separators (`sessionId` → session, id;
- * `x-api-key` → x, api, key; `DATABASE_URL` → database, url). A name is secret when its LAST segment is a secret
- * word, or when two adjacent segments form a secret pair, so `accessToken`, `apiKey`, `sessionId` and `databaseUrl`
- * are redacted while `tokenCount`, `keyword`, `authorId` and `otpEnabled` are not. Deliberate choices: `tokens`
- * (usually a list of tokens) and any name ending in `key`, `primaryKey` included, are redacted, because a name cannot
- * tell an id key from a secret key.
+ * Names fail closed. A field is redacted when its normalised name (cut to 256 characters, accents removed,
+ * lowercased, `-`, `_`, `.` and whitespace dropped) contains any secret fragment, unless the exact normalised name is
+ * on the harmless list (the defaults below plus the logger's `allow`). So `PGPASSWORD`, `password_confirmation`,
+ * `apiKey2` and `JSESSIONID` are redacted, while `keyword` and `tokenCount` are written. `tokens` and `primaryKey` are
+ * redacted deliberately: a name cannot tell a list of tokens or an id key from a secret.
  */
-const SECRET_WORDS = new Set(['password', 'passwords', 'passwd', 'pass', 'pwd', 'passphrase', 'secret', 'secrets', 'token', 'tokens', 'auth',
-    'authorization', 'cookie', 'cookies', 'key', 'keys', 'apikey', 'credential', 'credentials', 'session', 'sid', 'jwt', 'bearer', 'signature',
-    'otp', 'dsn', 'cvv', 'mnemonic', 'seed', 'psk', 'csrf', 'hmac', 'salt']);
-const SECRET_PAIRS = new Set(['session id', 'session token', 'database url', 'connection string', 'card number', 'private key', 'secret key',
-    'access key', 'api key', 'cookie header', 'auth header', 'authorization header', 'set cookie']);
-const segments = (name) => name.replace(/([a-z0-9])([A-Z])/gu, '$1 $2').replace(/([A-Z]+)([A-Z][a-z])/gu, '$1 $2')
-    .split(/[-_.\s]+/u).filter(Boolean).map(part => part.toLowerCase());
-const secretName = (name) => {
-    const parts = segments(name);
-    if (!parts.length)
-        return false;
-    if (SECRET_WORDS.has(parts.at(-1)))
+const SECRET_FRAGMENTS = ['pass', 'pwd', 'secret', 'token', 'auth', 'cookie', 'key', 'credential', 'session', 'sessid', 'jwt', 'bearer',
+    'signature', 'otp', 'dsn', 'databaseurl', 'connectionstring', 'private', 'cvv', 'cardnumber', 'creditcard', 'mnemonic', 'seed', 'psk',
+    'csrf', 'hmac', 'salt', 'recoverycode', 'resetlink', 'magiclink', 'stripesk', 'пароль'];
+const SECRET_EXACT = new Set(['sid', 'sk']);
+const HARMLESS = ['author', 'authorid', 'authors', 'authorname', 'authority', 'passed', 'bypass', 'compass', 'keyboard', 'monkey',
+    'sessioncount', 'tokencount', 'otpenabled', 'signaturevalid', 'isprivate', 'keyset', 'keyword', 'keywords', 'turkey', 'hotpath',
+    'passengercount', 'authenticated', 'footprint'];
+// Names an app can never allow: any name containing one of these is a secret whatever the app says.
+const NEVER_ALLOW = ['password', 'passwd', 'passphrase', 'secret', 'apikey', 'accesstoken', 'refreshtoken', 'authtoken', 'sessionid',
+    'sessid', 'cookie', 'authorization', 'bearer', 'jwt', 'dsn', 'connectionstring', 'databaseurl', 'privatekey', 'secretkey', 'cvv',
+    'cardnumber', 'creditcard', 'mnemonic', 'hmac', 'пароль'];
+function normalise(name) {
+    const capped = name.length > MAX_KEY ? name.slice(0, MAX_KEY) : name;
+    let out = '';
+    for (const character of capped.normalize('NFKD').toLowerCase()) {
+        if (character === '-' || character === '_' || character === '.' || /\s|\p{M}/u.test(character))
+            continue;
+        out += character;
+    }
+    return out;
+}
+const containsAny = (text, fragments) => fragments.some(fragment => text.includes(fragment));
+const isSecretName = (name, harmless) => {
+    const plain = normalise(name);
+    if (SECRET_EXACT.has(plain))
         return true;
-    for (let i = 1; i < parts.length; i++)
-        if (SECRET_PAIRS.has(`${parts[i - 1]} ${parts[i]}`))
-            return true;
-    return false;
+    return !harmless.has(plain) && containsAny(plain, SECRET_FRAGMENTS);
 };
-// Strings are scanned and written up to this many characters; a longer one ends with a truncation marker.
-const MAX_STRING = 8192;
-const SCHEME_CHARACTER = /[a-z0-9+.-]/iu;
+const writtenKey = (name) => (name.length > MAX_KEY ? `${name.slice(0, MAX_KEY)}…` : name);
+const isSchemeCharacter = (code) => (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code === 43 || code === 45 || code === 46;
+const isLetter = (code) => (code >= 97 && code <= 122) || (code >= 65 && code <= 90);
+// Characters that end a URL authority (the part between `://` and the path).
+const AUTHORITY_END = new Set(['/', '?', '#', '"', "'", '<', '>', '\\', '`']);
 /**
- * Removes credentials embedded in URLs, whatever the field is called, in time linear in the string. For each `://`
- * preceded by a scheme (a letter, then letters, digits, `+`, `.`, `-`, at most 32 characters), everything from `//` to
- * the LAST `@` within the next 256 characters (stopping at a line break or the next `://`) is replaced. Taking the last
- * `@` catches a password that itself holds `@`, a space or `/`; it over-redacts a URL with an `@` in its path.
+ * Removes the userinfo of URL authorities, in time linear in the string. For each `://` preceded by a scheme (a
+ * letter, then letters, digits, `+`, `.`, `-`, at most 32 characters), the authority runs to the first `/`, `?`, `#`,
+ * quote, angle bracket, backslash or whitespace, or the next `://`; everything from `//` to the LAST `@` inside it is
+ * replaced. Paths, scoped package URLs, stack frames and a following email address stay as they were. When the string
+ * was cut (`truncated`) and an authority runs to the cut, it is redacted whole, since its `@` may lie beyond.
  */
-function withoutUrlCredentials(text) {
+function withoutUrlCredentials(text, truncated) {
     let out = '', from = 0;
     for (let at = text.indexOf('://'); at !== -1; at = text.indexOf('://', at + 3)) {
-        let start = at;
-        while (start > 0 && at - start < 32 && SCHEME_CHARACTER.test(text[start - 1]))
-            start--;
-        // No scheme, or a `://` inside a span already redacted.
-        if (start === at || !/[a-z]/iu.test(text[start]) || at < from)
+        if (at < from)
             continue;
-        const next = text.indexOf('://', at + 3), limit = Math.min(text.length, at + 3 + 256, next === -1 ? Infinity : next);
-        let end = -1;
-        for (let i = at + 3; i < limit; i++) {
-            if (text[i] === '\n' || text[i] === '\r')
+        let start = at;
+        while (start > 0 && at - start < 32 && isSchemeCharacter(text.charCodeAt(start - 1)))
+            start--;
+        if (start === at || !isLetter(text.charCodeAt(start)))
+            continue;
+        let end = -1, i = at + 3;
+        for (; i < text.length; i++) {
+            const character = text[i];
+            if (AUTHORITY_END.has(character) || character.trim() === '' || (character === ':' && text.startsWith('//', i + 1)))
                 break;
-            if (text[i] === '@')
+            if (character === '@')
                 end = i;
+        }
+        if (i === text.length && truncated) {
+            out += `${text.slice(from, at + 3)}[redacted]`;
+            from = text.length;
+            break;
         }
         if (end === -1)
             continue;
@@ -60,54 +81,99 @@ function withoutUrlCredentials(text) {
     return from === 0 ? text : out + text.slice(from);
 }
 const safeString = (value) => {
-    // Scan a bounded prefix (a credential span is at most 256 characters past its `://`), then cut it to length.
-    const scanned = withoutUrlCredentials(value.length > MAX_STRING + 300 ? value.slice(0, MAX_STRING + 300) : value);
-    return scanned.length > MAX_STRING ? `${scanned.slice(0, MAX_STRING)}…[truncated ${value.length - MAX_STRING} characters]` : scanned;
+    if (value.length <= MAX_STRING)
+        return withoutUrlCredentials(value, false);
+    return `${withoutUrlCredentials(value.slice(0, MAX_STRING), true)}…[truncated ${value.length - MAX_STRING} characters]`;
 };
-const REQUEST_ID = /^[A-Za-z0-9._-]{8,128}$/u;
-function record(level, service, message, fields) {
-    const line = { time: new Date().toISOString(), level, service, message };
-    if (fields.requestId !== undefined)
-        line.requestId = fields.requestId;
-    // The core names above always describe the call; a field with one of those names is not written.
-    for (const [name, value] of Object.entries(fields))
-        if (!CORE.has(name))
-            line[name] = value;
-    return line;
-}
-// Applied at every depth, so a secret inside a nested object (a headers map) is redacted too.
-function replacer(name, value) {
-    if (name && secretName(name))
-        return '[redacted]';
-    // JSON.stringify passes the returned object's strings back through here, so their URL credentials are removed too.
-    if (value instanceof Error)
-        return { name: value.name, message: value.message, stack: value.stack };
-    if (typeof value === 'bigint')
-        return value.toString();
+const charge = (budget, text) => { budget.left -= text.length; return text; };
+/**
+ * Builds the plain value that is written, within the bounds: strings scanned and cut, names redacted, at most
+ * MAX_DEPTH levels and MAX_FIELDS fields or items per object, and about MAX_LINE characters for the whole line, each
+ * cut marked. A getter that throws propagates to the caller, which writes the line's core instead.
+ */
+function sanitise(value, harmless, depth, seen, budget) {
+    if (budget.left <= 0)
+        return '[line limit]';
     if (typeof value === 'string')
-        return safeString(value);
-    return value;
-}
-// The line's core alone, for when the fields cannot be read or serialised: String() keeps it serialisable, and a
-// request id is kept only when it is a plain string.
-const coreLine = (level, service, message, requestId, reason) => `${JSON.stringify({ time: new Date().toISOString(), level, service: String(service), message: String(message),
-    ...(typeof requestId === 'string' ? { requestId } : {}), logError: reason }, replacer)}\n`;
-function serialise(line) {
+        return charge(budget, safeString(value));
+    if (typeof value === 'bigint')
+        return charge(budget, value.toString());
+    if (typeof value === 'number' || typeof value === 'boolean' || value === null) {
+        budget.left -= 8;
+        return value;
+    }
+    if (typeof value !== 'object')
+        return undefined;
+    if (value instanceof String)
+        return charge(budget, safeString(value.valueOf()));
+    if (depth >= MAX_DEPTH)
+        return charge(budget, '[depth limit]');
+    if (seen.has(value))
+        return charge(budget, '[circular]');
+    seen.add(value);
     try {
-        return `${JSON.stringify(line, replacer)}\n`;
+        if (value instanceof Error) {
+            return { name: sanitise(value.name, harmless, depth + 1, seen, budget), message: sanitise(value.message, harmless, depth + 1, seen, budget),
+                stack: sanitise(value.stack, harmless, depth + 1, seen, budget) };
+        }
+        if (value instanceof Date)
+            return Number.isNaN(value.getTime()) ? null : charge(budget, value.toISOString());
+        const toJSON = value.toJSON;
+        if (typeof toJSON === 'function')
+            return sanitise(toJSON.call(value), harmless, depth + 1, seen, budget);
+        if (Array.isArray(value)) {
+            const out = [], length = Math.min(value.length, MAX_FIELDS);
+            for (let i = 0; i < length && budget.left > 0; i++)
+                out.push(sanitise(value[i], harmless, depth + 1, seen, budget) ?? null);
+            if (out.length < value.length)
+                out.push(`…[${value.length - out.length} more items]`);
+            return out;
+        }
+        const keys = Object.keys(value), out = {};
+        let written = 0;
+        for (; written < keys.length && written < MAX_FIELDS && budget.left > 0; written++) {
+            const key = keys[written], name = charge(budget, writtenKey(key));
+            const item = isSecretName(key, harmless) ? '[redacted]' : sanitise(value[key], harmless, depth + 1, seen, budget);
+            if (item !== undefined)
+                out[name] = item;
+        }
+        if (written < keys.length)
+            out['…'] = `${keys.length - written} more fields`;
+        return out;
     }
-    catch {
-        // A circular or unserialisable field must not turn a log call into a thrown error; keep the line's core.
-        return coreLine(line.level, line.service, line.message, line.requestId, 'fields could not be serialised');
+    finally {
+        seen.delete(value);
     }
 }
+function record(level, service, message, fields, harmless) {
+    const budget = { left: MAX_LINE }, seen = new Set();
+    const line = { time: new Date().toISOString(), level, service: safeString(String(service)), message: charge(budget, safeString(String(message))) };
+    const id = sanitise(fields.requestId, harmless, 1, seen, budget);
+    if (id !== undefined)
+        line.requestId = id;
+    const rest = sanitise(Object.fromEntries(Object.entries(fields).filter(([name]) => !CORE.has(name))), harmless, 0, seen, budget);
+    const text = JSON.stringify({ ...line, ...rest });
+    // The budget keeps a line near MAX_LINE; a line far over it (many small values) is replaced by its core.
+    return text.length > MAX_LINE * 2 ? coreLine(level, service, message, id, 'line too large') : `${text}\n`;
+}
+// The line's core alone, for when the fields cannot be read: a request id is kept only when it is a plain string.
+const coreLine = (level, service, message, requestId, reason) => `${JSON.stringify({ time: new Date().toISOString(), level, service: safeString(String(service)), message: safeString(String(message)),
+    ...(typeof requestId === 'string' ? { requestId: safeString(requestId) } : {}), logError: reason })}\n`;
 /**
  * A logger never throws: a field getter that throws, an unserialisable value or a failing `write` costs at most that
- * line's fields (or the line), never the caller's request.
+ * line's fields (or the line), never the caller's request. A message whose `toString` throws writes no line.
  */
-export function createLogger({ service, level = 'info', write = line => { process.stdout.write(line); } }) {
+export function createLogger({ service, level = 'info', write = line => { process.stdout.write(line); }, allow = [] }) {
     if (!Object.hasOwn(SEVERITY, level))
         throw new TypeError(`Unknown log level: ${String(level)}`);
+    const harmless = new Set(HARMLESS);
+    for (const name of allow) {
+        const plain = typeof name === 'string' ? normalise(name) : '';
+        if (!plain || SECRET_EXACT.has(plain) || SECRET_FRAGMENTS.includes(plain) || containsAny(plain, NEVER_ALLOW)) {
+            throw new TypeError(`The log allow list cannot include ${JSON.stringify(String(name)).slice(0, 80)}: it names a secret.`);
+        }
+        harmless.add(plain);
+    }
     const threshold = SEVERITY[level];
     const safeWrite = (line) => { try {
         write(line);
@@ -119,7 +185,7 @@ export function createLogger({ service, level = 'info', write = line => { proces
                 return;
             let line;
             try {
-                line = serialise(record(at, service, message, { ...bound, ...fields }));
+                line = record(at, service, message, { ...bound, ...fields }, harmless);
             }
             catch {
                 try {

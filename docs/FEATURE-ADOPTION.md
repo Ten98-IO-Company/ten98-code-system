@@ -125,19 +125,24 @@ The application still owns its zod wire schema (accept a decimal string, then pa
 Runtime 0.28.0 adds `@ten98/runtime/log`. `createLogger({ service, level = 'info', write })` returns `debug`, `info`, `warn`, `error` and `child(fields)`; each call writes one JSON line with `time` (ISO), `level`, `service`, `message`, `requestId` when one is given, then the fields. A field named like a core key is not written. An `Error` at any depth is written as `name`, `message` and `stack`, and a bigint as a string.
 
 Redaction:
-- **By field name, at any depth.** The name is split into lowercase segments at case changes and separators: `sessionId` → session, id; `x-api-key` → x, api, key; `DATABASE_URL` → database, url. The field is written as `[redacted]` when either:
-  - its last segment is a secret word: password, pass, passwd, pwd, passphrase, secret, token, auth, authorization, cookie, key, apikey, credential, session, sid, jwt, bearer, signature, otp, dsn, cvv, mnemonic, seed, psk, csrf, hmac or salt, or the plural of one; or
-  - two adjacent segments form a secret pair: session id, session token, database url, connection string, card number, private key, secret key, access key, api key, set cookie, or a cookie, auth or authorization header.
-
-  So `accessToken`, `clientSecret` and `databaseUrl` are redacted, while `tokenCount`, `keyword`, `authorId`, `otpEnabled` and `isPrivate` are not. Two choices are deliberate:
-  - `tokens` is redacted, because it is usually a list of tokens;
-  - every name ending in `key`, `primaryKey` included, is redacted, because a name cannot tell an id key from a secret key.
-
-  Numbers and booleans under a secret name are redacted too.
-- **By value, whatever the field is called.** Credentials embedded in a URL are removed from every string, the message and error stacks included. For each `scheme://`, everything up to the last `@` within the next 256 characters is replaced, which catches a password that holds `@`, a space or `/`. A URL with an `@` in its path is over-redacted as a result.
-- **Length.** A string is scanned in linear time and written up to 8,192 characters, then ends with `…[truncated N characters]`. A credential that straddles the cut is still redacted.
+- **By field name, at any depth. Names fail closed.** Each name is normalised: cut to 256 characters, accents removed, lowercased, and `-`, `_`, `.` and whitespace dropped. The field is written as `[redacted]` when the normalised name contains any secret fragment, unless the exact normalised name is on the harmless list.
+  - The fragments are: pass, pwd, secret, token, auth, cookie, key, credential, session, sessid, jwt, bearer, signature, otp, dsn, databaseurl, connectionstring, private, cvv, cardnumber, creditcard, mnemonic, seed, psk, csrf, hmac, salt, recoverycode, resetlink, magiclink, stripesk and пароль. The exact names `sid` and `sk` are secrets as well.
+  - So `PGPASSWORD`, `password_confirmation`, `apiKey2`, `JSESSIONID` and `tokenValue` are redacted.
+  - The harmless list holds author, authorid, authors, authorname, authority, passed, bypass, compass, keyboard, monkey, sessioncount, tokencount, otpenabled, signaturevalid, isprivate, keyset, keyword, keywords, turkey, hotpath, passengercount, authenticated and footprint. It matches whole names only, so `rankKeyword` is redacted unless the app passes it in `createLogger({ allow })`.
+  - `allow` refuses, with a TypeError, a name that is itself a secret. No app setting removes a secret fragment.
+  - Two choices are deliberate: `tokens` and `primaryKey` are redacted, because a name cannot tell a list of tokens or an id key from a secret.
+  - Numbers and booleans under a secret name are redacted too.
+- **By value, whatever the field is called.** The userinfo of a URL authority is removed from every string, the message and error stacks included. The authority runs from `scheme://` to the first `/`, `?`, `#`, quote, angle bracket, backslash or whitespace. Everything up to its last `@` is replaced, so a raw `@` in a password is covered. Paths, scoped package URLs (`unpkg.com/@scope/pkg`), stack frames (`file:///…/node_modules/@scope/…`) and an email address later in the sentence are left unchanged. Userinfo with no password, such as `git@` or a token used as the user, is redacted too.
+- **Bounds, each cut marked.**
+  - Keys are cut to 256 characters and strings to 8,192.
+  - Nesting is cut at 8 levels (`[depth limit]`), and objects and arrays at 200 fields or items (`…: N more fields`).
+  - A line is cut at about 64 KiB (`[line limit]`), and a line far over that is replaced by its core with `logError: 'line too large'`.
+  - Every scan is linear, and a cut never leaves half a credential.
+  - `String` objects are scanned like strings, and a circular field is written as `[circular]`.
 
 Known limits, written as given:
+- a raw space or `/` in a URL password, which ends the authority (such a URL is already invalid);
+- a password holding `://` or a line break;
 - scheme-less `user:pass@host`;
 - keyword DSNs (`password=…`);
 - secrets in a query string;
@@ -147,7 +152,7 @@ Known limits, written as given:
 - the names `code`, `pin`, `hash`, `sig`, `nonce` and `pw`;
 - a message whose `toString` throws, which writes no line.
 
-A logger call never throws. A circular or unserialisable field writes the line's core with `logError`. A field getter that throws writes the core with `logError: 'fields could not be read'`. A failing `write` drops the line. `requestId(request)` returns a valid incoming `x-request-id` (`^[A-Za-z0-9._-]{8,128}$`) or a new UUID; bind it with `log.child({ requestId })` for the request's lines. Use this in place of `console.log` and app-local loggers in services; operator CLI output, such as the ready, migrate and restore summaries a `cli.ts` prints, stays plain stdout and does not go through the logger.
+A logger call never throws. A field getter that throws writes the core with `logError: 'fields could not be read'`. A failing `write` drops the line. `requestId(request)` returns a valid incoming `x-request-id` (`^[A-Za-z0-9._-]{8,128}$`) or a new UUID; bind it with `log.child({ requestId })` for the request's lines. Use this in place of `console.log` and app-local loggers in services; operator CLI output, such as the ready, migrate and restore summaries a `cli.ts` prints, stays plain stdout and does not go through the logger.
 
 The application still owns the level it reads from its environment, which fields it logs, echoing the request id in its response, and where standard output goes. Redaction covers the names above and credentials in URLs. Any other secret placed in a message, or in a field with an innocent name, is written as given, so don't put secrets there. Package tests do not establish consumer adoption; record each consumer's imports and checks in its adoption issue.
 
