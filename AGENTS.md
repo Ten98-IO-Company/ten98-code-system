@@ -6,7 +6,7 @@ Before implementing a repeated feature, inspect features/catalog.json and follow
 
 Apply DRY, KISS and Ponytail: trace all callers, reuse native features, remove duplicate implementations, and add no speculative framework or dependency. Keep application authorization, storage, identity controllers and paid-work accounting in their apps until a concrete migration preserves their contracts.
 
-Use bounded parallel workers with disjoint files: at most two implementation workers and one independent reviewer, twelve minutes per implementation task, two failed repair attempts and 120 seconds per command. Record the task, base, allowlist, acceptance cases and actual checks. Stop on unrelated edits or original failures. No paid calls, deployment or push without task authorization.
+Use parallel workers with disjoint files, each on its own branch: there is no fixed number of workers. One integration owner merges, and each piece gets its own independent check. Allow twelve minutes per implementation task, two failed repair attempts and 120 seconds per command. Record the task, base, allowlist, acceptance cases and actual checks. Stop on unrelated edits or original failures. No paid calls, deployment or push without task authorization.
 
 For a shared change, run pnpm test with Node 24, inspect pnpm pack and run affected consumers' required checks. Nontrivial logic needs a regression that fails without the fix. Architecture checks establish declared versions and dependencies only. Never report missing sources, synthetic fixtures or skipped live acceptance as production verification.
 
