@@ -509,6 +509,81 @@ function createStartUses(program: AstNode[], aliases: Set<string> = new Set()): 
   return uses;
 }
 
+const ERROR_COMPONENT_KEYS = new Set(['errorComponent', 'defaultErrorComponent']);
+const ERROR_TEXT = new Set(['message', 'stack', 'cause', 'name', 'toString']);
+const keyName = (node: AstNode | undefined): string | undefined => node?.type === 'Identifier' ? node.name : typeof node?.value === 'string' ? node.value : undefined;
+// An expression without its parentheses, TypeScript assertions and optional chain.
+const bare = (node: AstNode | undefined): AstNode | undefined =>
+  node && ['ParenthesizedExpression', 'TSAsExpression', 'TSSatisfiesExpression', 'TSNonNullExpression', 'TSTypeAssertion', 'ChainExpression'].includes(node.type) ? bare(node.expression) : node;
+const isFunction = (node: AstNode | undefined): boolean => node?.type === 'ArrowFunctionExpression' || node?.type === 'FunctionExpression' || node?.type === 'FunctionDeclaration';
+
+// Where a function passed as errorComponent or defaultErrorComponent, in any object literal, reads its error's text:
+// .message, .stack, .cause, .name or .toString, destructured or not, a spread of it, or a String() or template literal of
+// it. The error is the `error` prop, taken in the parameter or from the props object in the body. The function is
+// written inline or named from a top-level declaration in the same file. Each finding is `<line>: <what>`.
+function errorComponentReads(program: AstNode[], text: string): string[] {
+  const declared = new Map<string, AstNode>();
+  for (const statement of program) {
+    const node = statement.type === 'ExportNamedDeclaration' || statement.type === 'ExportDefaultDeclaration' ? statement.declaration : statement;
+    if (node?.type === 'FunctionDeclaration' && node.id) declared.set(node.id.name, node);
+    if (node?.type === 'VariableDeclaration') for (const declarator of node.declarations) if (declarator.id.type === 'Identifier' && isFunction(bare(declarator.init))) declared.set(declarator.id.name, bare(declarator.init)!);
+  }
+  const findings: string[] = [];
+  const at = (node: AstNode, what: string): void => { findings.push(`line ${text.slice(0, node.start).split('\n').length}: ${what}`); };
+  const walk = (node: unknown, visit: (node: AstNode) => void): void => {
+    if (Array.isArray(node)) return node.forEach(child => walk(child, visit));
+    if (!node || typeof node !== 'object' || typeof (node as AstNode).type !== 'string') return;
+    visit(node as AstNode);
+    for (const value of Object.values(node)) if (value && typeof value === 'object') walk(value, visit);
+  };
+  const inspect = (component: AstNode): void => {
+    const errors = new Set<string>(), props = new Set<string>();
+    // `{ error }`, `{ error: e }` or `{ error: { message } }` from the props; the rest of the props under another name.
+    const fromProps = (pattern: AstNode): void => {
+      for (const property of pattern.properties) {
+        if (property.type === 'RestElement') { if (property.argument.type === 'Identifier') props.add(property.argument.name); continue; }
+        if (keyName(property.key) !== 'error') continue;
+        const value = property.value.type === 'AssignmentPattern' ? property.value.left : property.value;
+        if (value.type === 'Identifier') errors.add(value.name);
+        else if (value.type === 'ObjectPattern') destructured(value);
+      }
+    };
+    const destructured = (pattern: AstNode): void => {
+      for (const property of pattern.properties) {
+        if (property.type === 'RestElement') at(property, 'copies the rest of the error');
+        else if (ERROR_TEXT.has(keyName(property.key) ?? '')) at(property, `reads error.${keyName(property.key)}`);
+      }
+    };
+    const parameter = component.params[0]?.type === 'AssignmentPattern' ? component.params[0].left : component.params[0];
+    if (parameter?.type === 'ObjectPattern') fromProps(parameter);
+    else if (parameter?.type === 'Identifier') props.add(parameter.name);
+    const isError = (node: AstNode | undefined): boolean => {
+      const expression = bare(node);
+      return expression?.type === 'Identifier' ? errors.has(expression.name)
+        : expression?.type === 'MemberExpression' && !expression.computed && bare(expression.object)?.type === 'Identifier' && props.has(bare(expression.object)!.name) && keyName(expression.property) === 'error';
+    };
+    // `const { error } = props` names the error before it is used.
+    walk(component.body, node => {
+      if (node.type === 'VariableDeclarator' && node.id.type === 'ObjectPattern' && bare(node.init)?.type === 'Identifier' && props.has(bare(node.init)!.name)) fromProps(node.id);
+    });
+    walk(component.body, node => {
+      const member = node.type === 'MemberExpression' ? (node.computed ? node.property.type === 'Literal' : node.property.type === 'Identifier') && keyName(node.property) : undefined;
+      if (member && ERROR_TEXT.has(member) && isError(node.object)) at(node, `reads error.${member}`);
+      else if (node.type === 'VariableDeclarator' && node.id.type === 'ObjectPattern' && isError(node.init)) destructured(node.id);
+      else if ((node.type === 'SpreadElement' || node.type === 'JSXSpreadAttribute') && isError(node.argument)) at(node, 'spreads the error');
+      else if (node.type === 'TemplateLiteral' && node.expressions.some(isError)) at(node, 'puts the error in a template literal');
+      else if (node.type === 'CallExpression' && bare(node.callee)?.type === 'Identifier' && bare(node.callee)!.name === 'String' && isError(node.arguments[0])) at(node, 'converts the error with String()');
+    });
+  };
+  walk(program, node => {
+    if (node.type !== 'Property' || !ERROR_COMPONENT_KEYS.has(keyName(node.key) ?? '') || node.computed) return;
+    const value = bare(node.value);
+    const component = isFunction(value) ? value : value?.type === 'Identifier' ? declared.get(value.name) : undefined;
+    if (component) inspect(component);
+  });
+  return [...new Set(findings)];
+}
+
 // The app's source files outside artifact folders, as forward-slash paths from the app.
 function appSources(directory: string, roots: string[], skip: Set<string>): string[] {
   const files: string[] = [];
@@ -528,8 +603,9 @@ function appSources(directory: string, roots: string[], skip: Set<string>): stri
 /**
  * A TanStack Start app takes its error and CSRF defaults from @ten98/runtime/start: src/start.ts exports
  * `startInstance = createStart(() => ten98StartOptions(...))`, src/client.tsx calls `hydrateTen98Start(...)` at its
- * top level, and no other source file uses createStart. It applies when the manifest's dependencies list Start, or the
- * profile requires it and no open transition waives it. Parser-backed; the adoption guide lists what it does not see.
+ * top level, no other source file uses createStart, and no errorComponent reads its error's text. It applies when the
+ * manifest's dependencies list Start, or the profile requires it and no open transition waives it. Parser-backed; the
+ * adoption guide lists what it does not see.
  */
 export function checkStartEntry(directory: string, manifest: PackageManifest, { parseAst = resolveParseAst(directory) }: { parseAst?: ParseAst } = {}): string[] {
   const resolved = resolveProfile(String(manifest.name));
@@ -587,10 +663,15 @@ export function checkStartEntry(directory: string, manifest: PackageManifest, { 
   }
   const policy = resolved?.profile.sourceLanguage;
   for (const name of appSources(directory, policy?.roots ?? ['src'], new Set([START_FILE, ...policy?.artifactDirectories ?? []]))) {
-    // Every form counted contains the name, so files without it need no parse.
-    const program = readFileSync(resolve(directory, name), 'utf8').includes('createStart') ? parse(name) : undefined;
-    const uses = program && createStartUses(program);
-    if (uses && uses.specifiers + uses.calls) errors.push(`${name}: createStart belongs in ${START_FILE} only, as createStart(() => ten98StartOptions(...)).`);
+    // Every form either rule counts contains its name, so files without one need no parse.
+    const text = readFileSync(resolve(directory, name), 'utf8');
+    const program = /createStart|rrorComponent/u.test(text) ? parse(name) : undefined;
+    if (!program) continue;
+    const uses = createStartUses(program);
+    if (uses.specifiers + uses.calls) errors.push(`${name}: createStart belongs in ${START_FILE} only, as createStart(() => ten98StartOptions(...)).`);
+    for (const finding of errorComponentReads(program, text)) {
+      errors.push(`${name} ${finding}: an errorComponent also renders on the server with the original error, so it shows publicErrorMessage(error) and reads nothing else of the error.`);
+    }
   }
   return errors;
 }

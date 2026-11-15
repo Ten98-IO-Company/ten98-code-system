@@ -143,6 +143,39 @@ test('the rule applies to apps that ship Start, and not to a waived profile or t
   assert.deepEqual(app({}, { name: '@ten98/runtime', devDependencies: { '@tanstack/react-start': '1.168.61' }, peerDependencies: { '@tanstack/react-start': '1.168.61' } }), []);
 });
 
+test("an errorComponent or defaultErrorComponent that reads its error's text is refused", needsParser, () => {
+  const ROUTE = "import { createFileRoute, createRoute, createRouter } from '@tanstack/react-router';\n";
+  const refusals: [string, string][] = [
+    ['reads error.message', "export const Route = createFileRoute('/x')({ errorComponent: ({ error }) => <p>{error.message}</p> });\n"],
+    ['reads error.stack', "export const Route = createFileRoute('/x')({ errorComponent: ({ error: failure }: { error: Error }) => <p>{failure?.stack}</p> });\n"],
+    ['reads error.cause', "export const Route = createRoute({ errorComponent: (props: { error: Error }) => <p>{String(props.error!.cause)}</p> } as never);\n"],
+    ['reads error.name', "export const Route = createFileRoute('/x')({ errorComponent: function Failure({ error }) { const { name } = error; return <p>{name}</p>; } });\n"],
+    ['reads error.toString', "export const Route = createFileRoute('/x')({ errorComponent: ({ error }) => <p>{error.toString()}</p> });\n"],
+    ['reads error.message',"export const Route = createFileRoute('/x')({ errorComponent: ({ error: { message } }) => <p>{message}</p> });\n"],
+    ['reads error.message',"export const Route = createFileRoute('/x')({ errorComponent: ({ error }) => <p>{(error as Error)['message']}</p> });\n"],
+    ['spreads the error', "function RouteError({ error }: { error: Error }) { return <p {...error} />; }\nexport const router = createRouter({ routeTree: {} as never, defaultErrorComponent: RouteError });\n"],
+    ['spreads the error',"const Failure = (props: { error: Error }) => <Details value={{ ...props.error }} />;\nexport const Route = createFileRoute('/x')({ errorComponent: Failure });\n"],
+    ['puts the error in a template literal', "const errorComponent = ({ error }: { error: Error }) => <p>{`Failed: ${error}`}</p>;\nexport const Route = createFileRoute('/x')({ errorComponent });\n"],
+    ['converts the error with String()', "export const Route = createFileRoute('/x')({ errorComponent(props: { error: Error }) { const { error } = props; return <p>{String(error)}</p>; } });\n"],
+    ['copies the rest of the error', "export const Route = createFileRoute('/x')({ errorComponent: ({ error }) => { const { ...fields } = error; return <p>{Object.keys(fields)}</p>; } });\n"],
+  ];
+  for (const [finding, body] of refusals) {
+    refused({ 'src/routes/failure.tsx': ROUTE + body }, new RegExp(`^src/routes/failure\\.tsx line \\d+: ${finding.replace(/[.()]/gu, '\\$&')}: an errorComponent also renders on the server with the original error, so it shows publicErrorMessage\\(error\\)`, 'u'));
+  }
+  // The shown sentence, the planned shared screen, and other components and props that read a message are fine.
+  assert.deepEqual(app({
+    ...passing,
+    'src/routes/fine.tsx': `${ROUTE}import { publicErrorMessage } from '@ten98/runtime/start';
+export const Route = createFileRoute('/fine')({
+  errorComponent: ({ error, reset }) => <RouteErrorScreen message={publicErrorMessage(error)} onRetry={reset} />,
+  notFoundComponent: ({ data }: { data: { message: string } }) => <p>{data.message}</p>,
+  component: () => { const error = new Error('local'); return <p>{error.message}</p>; },
+});
+export const router = createRouter({ routeTree: {} as never, defaultErrorComponent: ({ error, info }) => <p title={info?.componentStack}>{publicErrorMessage(error)}</p> });
+`,
+  }), []);
+});
+
 test('the CLI runs the Start entry check on a Start app', needsParser, () => {
   // The CLI reads the canonical declaration beside check.mjs, so a copy of both declares a profile that needs Start
   // and nothing else. The app sits under work/, where it resolves this package's parser as an installed app would.
