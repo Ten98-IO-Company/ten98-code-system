@@ -40,6 +40,10 @@
       "types": "./tenancy-testing.d.mts",
       "import": "./tenancy-testing.mjs"
     },
+    "./tenancy/system": {
+      "types": "./tenancy-system.d.mts",
+      "import": "./tenancy-system.mjs"
+    },
     "./config": {
       "types": "./config.d.mts",
       "import": "./config.mjs"
@@ -148,6 +152,12 @@
     "tenancy-testing.mjs",
     "tenancy-testing.d.mts",
     "src/tenancy-testing.mts",
+    "tenancy-scope.mjs",
+    "tenancy-scope.d.mts",
+    "src/tenancy-scope.mts",
+    "tenancy-system.mjs",
+    "tenancy-system.d.mts",
+    "src/tenancy-system.mts",
     "config.mjs",
     "config.d.mts",
     "src/config.mts",
