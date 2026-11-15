@@ -30,6 +30,7 @@ declare const csrfMiddleware: () => import("@tanstack/react-start").RequestMiddl
  * The text an error component may show. An errorComponent also renders on the server with the original error, so it
  * shows this, never `error.message`: a PublicError's message, the fixed sentence with the reference for an error the
  * browser received as a reference, and the fixed sentence alone for anything else, the server's originals included.
+ * It always returns a string.
  */
 export declare function publicErrorMessage(error: unknown): string;
 /**

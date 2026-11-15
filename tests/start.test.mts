@@ -146,6 +146,24 @@ test('an errorComponent showing publicErrorMessage never renders the original me
   for (const other of [undefined, null, 'hidden', { message: 'hidden', reference: rebuilt.reference }, new Error('hidden')]) assert.equal(publicErrorMessage(other), 'Something went wrong.');
 });
 
+test('publicErrorMessage always returns a string, and shows a reference only for an error rebuilt from one', () => {
+  const [adapter] = ten98StartOptions({ reporter: () => {} }).serializationAdapters;
+  const rebuilt = adapter.fromSerializable(adapter.toSerializable(new Error('hidden'))) as Error & { reference: string };
+  const shown = `Something went wrong. Reference ${rebuilt.reference}.`;
+  assert.equal(publicErrorMessage(rebuilt), shown);
+  // A server original with a reference-shaped field of its own, and a rebuilt error whose field was changed afterwards.
+  assert.equal(publicErrorMessage(Object.assign(new Error('hidden'), { reference: crypto.randomUUID() })), 'Something went wrong.');
+  rebuilt.reference = crypto.randomUUID();
+  assert.equal(publicErrorMessage(rebuilt), shown);
+  assert.equal(publicErrorMessage(adapter.fromSerializable({ reference: '<img src=x>' })), 'Something went wrong.');
+  // A PublicError whose message is not a string, or cannot be read.
+  for (const descriptor of [{ value: 42 }, { value: undefined }, { value: { toString: () => 'hidden' } }, { get: () => { throw new Error('hidden'); } }]) {
+    const error = new PublicError(PUBLIC_MESSAGE);
+    Object.defineProperty(error, 'message', descriptor);
+    assert.equal(publicErrorMessage(error), 'Something went wrong.');
+  }
+});
+
 test('hydrateTen98Start hydrates the document with StrictMode and StartClient inside startTransition, with the root callbacks', () => {
   // A child process, so node:test's module mocks replace hydrateRoot and wrap startTransition for start.mjs alone.
   const probe = `

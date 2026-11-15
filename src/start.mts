@@ -57,21 +57,31 @@ function referenceFor(error: Error, reporter: ServerErrorReporter | undefined): 
   return reference;
 }
 
+const FIXED_MESSAGE = 'Something went wrong.';
+// The errors this module rebuilt from a reference, with that reference. publicErrorMessage reads the reference from
+// here, never from the error, so an original server error with a reference-shaped field of its own never shows it.
+const received = new WeakMap<Error, string>();
+
 /** What the browser receives in place of an error that is not a PublicError. */
 function referencedError(reference: unknown): Error & { reference: string } {
-  const shown = typeof reference === 'string' && REFERENCE.test(reference) ? reference : 'unavailable';
-  return Object.assign(new Error(`Something went wrong. Reference ${shown}.`), { name: 'Error', reference: shown });
+  const valid = typeof reference === 'string' && REFERENCE.test(reference), shown = valid ? reference : 'unavailable';
+  const error = Object.assign(new Error(`${FIXED_MESSAGE} Reference ${shown}.`), { name: 'Error', reference: shown });
+  if (valid) received.set(error, shown);
+  return error;
 }
 
 /**
  * The text an error component may show. An errorComponent also renders on the server with the original error, so it
  * shows this, never `error.message`: a PublicError's message, the fixed sentence with the reference for an error the
  * browser received as a reference, and the fixed sentence alone for anything else, the server's originals included.
+ * It always returns a string.
  */
 export function publicErrorMessage(error: unknown): string {
-  if (error instanceof PublicError) return error.message;
-  const reference = error instanceof Error ? (error as { reference?: unknown }).reference : undefined;
-  return typeof reference === 'string' && REFERENCE.test(reference) ? `Something went wrong. Reference ${reference}.` : 'Something went wrong.';
+  try {
+    if (error instanceof PublicError) return typeof error.message === 'string' ? error.message : FIXED_MESSAGE;
+    const reference = error instanceof Error ? received.get(error) : undefined;
+    return reference ? `${FIXED_MESSAGE} Reference ${reference}.` : FIXED_MESSAGE;
+  } catch { return FIXED_MESSAGE; }
 }
 
 /**
