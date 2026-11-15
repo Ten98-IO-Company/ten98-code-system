@@ -101,7 +101,7 @@ function storedIdentifier(keys, identifier) {
 // limiter to spare it the account-wide bucket. Each is a verification row `known-device:<deviceId>` (value: the user id,
 // expiresAt: its 90 days) with one `known-device-attempt:<deviceId>` row per attempt it was trusted for since its last
 // success; at 5 it is no longer trusted. Both prefixes are kept in storage, so a user's rows go with one prefix filter.
-const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts: 5, entries: 5, devices: 5, cookieLength: 1024 };
+const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts: 5, entries: 5, devices: 5, cookieLength: 1024, claims: { concurrency: 2, queue: 8, waitMs: 1000 } };
 const devicePrefix = 'known-device', deviceRow = (deviceId) => `known-device:${deviceId}`, attemptRow = (deviceId) => `known-device-attempt:${deviceId}`;
 const deviceEntryPattern = /^([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/;
 /** The tag binding a device id to one account: HMAC over userId ‖ deviceId (NUL-separated; neither contains NUL). */
@@ -412,7 +412,23 @@ function build(options, keys, locking, internal = {}) {
     } : undefined;
     /** The isAccountUsable hook, refusing a closed account by default. */
     const usable = (account) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
-    const usableUser = (user) => usable({ id: user.id, email: user.email, closedAt: user.closedAt ?? null });
+    /**
+     * The account an isAccountUsable check outside signInWithPassword reads (a reset, by id or lower-cased email): one
+     * indexed read of the user row's id, email and closedAt, never joined, so it costs the same whether or not a row
+     * exists. Through the adapter, whose user model must map closed_at as closedAt: without it the select throws, so the
+     * check fails loudly instead of being skipped (instanceSchema refuses such an adapter at start-up).
+     */
+    const storedAccount = async (adapter, where) => {
+        const found = await adapter
+            .findOne({ model: 'user', where: [where], select: ['id', 'email', 'closedAt'] });
+        if (found && found.closedAt === undefined)
+            throw new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
+        return found;
+    };
+    const refusedAccount = async (adapter, where) => {
+        const found = await storedAccount(adapter, where);
+        return found !== null && await usable({ id: found.id, email: found.email, closedAt: found.closedAt ?? null }) !== true;
+    };
     const auth = betterAuth({
         database: protectTokens(database, keys), baseURL: origin, secret, appName, trustedOrigins: [origin],
         // better-auth skips these checks when NODE_ENV=test or TEST is set unless they are pinned.
@@ -424,7 +440,7 @@ function build(options, keys, locking, internal = {}) {
         logger: { disabled: true },
         onAPIError: { onError(error) { if (isAPIError(error))
                 throw error; throw APIError.fromStatus('INTERNAL_SERVER_ERROR'); } },
-        user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false } } },
+        user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false, defaultValue: () => null } } },
         session: { expiresIn: session.expiresInSeconds, updateAge: session.updateAgeSeconds, cookieCache: { enabled: false } },
         plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
         emailAndPassword: {
@@ -453,13 +469,12 @@ function build(options, keys, locking, internal = {}) {
                 // An account isAccountUsable refuses (by default a closed one) gets no reset. The request is handed to better-auth's
                 // route with an address no account has (a reset token no row has), so it takes the route's own unknown-email (invalid
                 // token) path, after the same validation and origin checks: the same answer, no token, nothing sent.
-                const { internalAdapter } = context.context;
+                const { adapter, internalAdapter } = context.context;
                 const body = (context.body ?? {});
                 // A body the route's own schema rejects is left to the route, so its 400 stays the same for every account.
                 if (context.path === '/request-password-reset' && sendResetPassword && typeof body.email === 'string' && resetBody.safeParse(body).success) {
-                    // Every request makes this lookup, so a refused account costs what an unknown email does.
-                    const found = await internalAdapter.findUserByEmail(body.email, { includeAccounts: true });
-                    if (found && await usableUser(found.user) !== true) {
+                    // Every request makes this one read, so an existing account costs what an unknown email does.
+                    if (await refusedAccount(adapter, { field: 'email', value: body.email.toLowerCase() })) {
                         return { context: { body: { ...body, email: `${randomBytes(12).toString('hex')}@unusable-account.invalid` } } };
                     }
                 }
@@ -468,8 +483,7 @@ function build(options, keys, locking, internal = {}) {
                     if (typeof token !== 'string' || !token)
                         return;
                     const row = await internalAdapter.findVerificationValue(`reset-password:${token}`);
-                    const user = row ? await internalAdapter.findUserById(row.value) : null;
-                    if (user && await usableUser(user) !== true) {
+                    if (row && await refusedAccount(adapter, { field: 'id', value: row.value })) {
                         return { context: { body: { ...body, token: randomBytes(18).toString('base64url') } } };
                     }
                 }
@@ -538,6 +552,7 @@ function build(options, keys, locking, internal = {}) {
     const slots = boundedSlots(options.passwordVerification);
     const { concurrency: laneConcurrency = 1, queue: laneQueue = 20, waitMs: laneWaitMs = options.passwordVerification?.waitMs } = options.passwordVerification?.knownDevices ?? {};
     const lane = boundedSlots({ concurrency: laneConcurrency, queue: laneQueue, waitMs: laneWaitMs }, 'passwordVerification.knownDevices');
+    const claims = boundedSlots(device.claims, 'knownDeviceClaims');
     void modernDummy();
     /**
      * Binds an instance to the transaction for `run`. The callback gets its own transaction object over a guarded view of
@@ -628,7 +643,21 @@ function build(options, keys, locking, internal = {}) {
         const outside = {};
         if (await getCurrentAdapter(outside) !== outside)
             throw new TypeError('withLockedAuth cannot run inside a better-auth request or hook.');
+        await instanceSchema(db);
+    };
+    /** The database schema, then the adapter's user model: it must map closed_at as closedAt, which the reset checks read. */
+    let adapterChecked;
+    const instanceSchema = async (db) => {
         await schemaOf(db);
+        adapterChecked = recheckable(adapterChecked, async () => {
+            try {
+                await storedAccount((await storeOf(auth)).adapter, { field: 'id', value: '' });
+            }
+            catch {
+                throw new SchemaMismatchError(['closedAt (closed_at) in the adapter\'s user model']);
+            }
+        });
+        return adapterChecked.check;
     };
     // Parameterised raw statements by necessity: Drizzle has no builder for set_config or advisory locks. The timeout comes
     // first, so the lock statements that follow cannot wait forever.
@@ -655,6 +684,19 @@ function build(options, keys, locking, internal = {}) {
         const entries = deviceEntries(cookieFrom(headers, store.createAuthCookie(device.cookie).name));
         if (!entries.length)
             return undefined;
+        // At most `device.claims` claims at once in this process (each one pool read, then one short locked transaction)
+        // and a few waiting; past that the browser counts as not known, so its cookie never holds more of the pool than that.
+        const release = await claims();
+        if (!release)
+            return undefined;
+        try {
+            return await claimed(db, address, entries);
+        }
+        finally {
+            release();
+        }
+    };
+    const claimed = async (db, address, entries) => {
         const [account] = await db.select({ id: userTable.id }).from(userTable).where(sql `lower(${userTable.email}) = lower(${address})`).limit(1);
         const entry = account ? deviceFor(keys, account.id, entries) : undefined;
         if (!account || !entry)
@@ -794,7 +836,7 @@ function build(options, keys, locking, internal = {}) {
             return response.status === 401 ? refused() : response;
         },
         assertEmailIndex: db => emailIndex(db),
-        assertSchema: db => schemaOf(db),
+        assertSchema: db => instanceSchema(db),
         async verifyTwoFactor(db, request) {
             await ready(db, () => undefined);
             if (!(request instanceof Request) || !challengeRoute.test(new URL(request.url).pathname))
@@ -919,58 +961,65 @@ export class SchemaMismatchError extends Error {
         this.missing = missing;
     }
 }
+/** How long a failed start-up check is answered from memory before it runs again. */
+const recheckMs = 2000;
+/**
+ * The check in `entry`, or a new run of `run`: a pass (or a run in flight) is kept for good; a failure is answered from
+ * memory for `recheckMs`, then checked again, so fixing the schema needs no restart and a wrong one costs one query per
+ * interval, not one per attempt.
+ */
+function recheckable(entry, run) {
+    if (entry && Date.now() < entry.retryAt)
+        return entry;
+    const fresh = { check: run(), retryAt: Number.POSITIVE_INFINITY };
+    fresh.check.catch(() => { fresh.retryAt = Date.now() + recheckMs; });
+    return fresh;
+}
 const schemaChecks = new WeakMap();
 /** The tables and columns, then the email index; cached per database like the index check. */
 function schemaOf(db) {
-    let check = schemaChecks.get(db);
-    if (!check) {
-        // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
-        check = db.execute(sql `SELECT t.name, a.attname AS "column" FROM unnest(string_to_array(${Object.keys(schemaTables).join(',')}, ',')) AS t(name)
+    const entry = recheckable(schemaChecks.get(db), () => 
+    // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
+    db.execute(sql `SELECT t.name, a.attname AS "column" FROM unnest(string_to_array(${Object.keys(schemaTables).join(',')}, ',')) AS t(name)
         LEFT JOIN pg_attribute a ON a.attrelid = to_regclass(quote_ident(t.name)) AND a.attnum > 0 AND NOT a.attisdropped`)
-            .then(result => {
-            const found = new Map();
-            for (const { name, column } of result.rows) {
-                const columns = found.get(name) ?? new Set();
-                if (column)
-                    columns.add(column);
-                found.set(name, columns);
-            }
-            const missing = Object.entries(schemaTables).flatMap(([table, columns]) => {
-                const present = found.get(table);
-                const label = table === 'user' ? '"user"' : table;
-                if (!present?.size)
-                    return [`table ${label}`];
-                return columns.filter(column => !present.has(column)).map(column => `${label}.${column}`);
-            });
-            if (missing.length)
-                throw new SchemaMismatchError(missing);
-        })
-            .then(() => emailIndex(db));
-        check.catch(() => schemaChecks.delete(db));
-        schemaChecks.set(db, check);
-    }
-    return check;
+        .then(result => {
+        const found = new Map();
+        for (const { name, column } of result.rows) {
+            const columns = found.get(name) ?? new Set();
+            if (column)
+                columns.add(column);
+            found.set(name, columns);
+        }
+        const missing = Object.entries(schemaTables).flatMap(([table, columns]) => {
+            const present = found.get(table);
+            const label = table === 'user' ? '"user"' : table;
+            if (!present?.size)
+                return [`table ${label}`];
+            return columns.filter(column => !present.has(column)).map(column => `${label}.${column}`);
+        });
+        if (missing.length)
+            throw new SchemaMismatchError(missing);
+    })
+        .then(() => emailIndex(db)));
+    schemaChecks.set(db, entry);
+    return entry.check;
 }
-// One check per database object. Only a pass is remembered: a refusal, or a failed query, is checked again on the next
-// call, so fixing the schema needs no restart.
+// One check per database object, kept like the schema check: a pass for good, a refusal for `recheckMs`.
 const emailIndexChecks = new WeakMap();
 function emailIndex(db) {
-    let check = emailIndexChecks.get(db);
-    if (!check) {
-        // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
-        check = db.execute(sql `SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${`"${getTableName(userTable)}"`})
+    const entry = recheckable(emailIndexChecks.get(db), () => 
+    // Parameterised raw statement by necessity: it reads the system catalogue, which has no Drizzle schema.
+    db.execute(sql `SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = to_regclass(${`"${getTableName(userTable)}"`})
         AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indnatts = 1 AND (
           -- lower(email) on a text column, or lower(email::text) on a varchar one
           pg_get_expr(i.indexprs, i.indrelid) IN ('lower(email)', 'lower((email)::text)')
           -- or a plain unique index on a citext email column, which compares case-insensitively itself
           OR (i.indexprs IS NULL AND EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
             WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[0] AND a.attname = 'email' AND t.typname = 'citext')))) AS indexed`)
-            .then(result => { if (result.rows[0]?.indexed !== true)
-            throw new MissingEmailIndexError(); });
-        check.catch(() => emailIndexChecks.delete(db));
-        emailIndexChecks.set(db, check);
-    }
-    return check;
+        .then(result => { if (result.rows[0]?.indexed !== true)
+        throw new MissingEmailIndexError(); }));
+    emailIndexChecks.set(db, entry);
+    return entry.check;
 }
 /** Both verifiers on every attempt, one of them against a dummy; true only for a stored hash the password matches. */
 async function verifyStoredPassword(hash, candidate, legacyAccepted) {
