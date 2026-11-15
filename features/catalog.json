@@ -166,7 +166,7 @@
         "tests/lighthouse-report.test.mts"
       ],
       "boundary": "Reusable mechanisms. Apps keep their routes, transactions and provider accounting; createWorkspaceTeam runs inside the app's transaction over the shipped workspace-team.sql schema. The separate auth entry holds the identity policy. Shopify exports parse and verify supplied signature bytes and select fixed same-origin headers only; apps retain key lookup, encrypted storage, current authority, domain proof, request identity, queueing, rotation and crawl transport. Public-network primitives classify addresses, compare socket peers and resolve both DNS families; callers retain complete-answer admission, connection pinning and authorization. Lighthouse normalization handles bounded supplied reports only; apps own execution, request identity, storage and UI.",
-      "version": "v0.22.0"
+      "version": "v0.28.0"
     },
     "auth": {
       "package": "@ten98/runtime",
@@ -194,6 +194,130 @@
         "Discover: pass cookiePrefix: 'better-auth' (keeps current sessions and the two_factor cookie name its tests read) and allowPasswordless: true (its router proves a fresh OIDC sign-in first).",
         "Campaign: pass legacyPasswords: true; sessions reset once at cutover."
       ]
+    },
+    "db": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/db",
+      "entrypoints": [
+        "db.mjs",
+        "db.d.mts"
+      ],
+      "peerDependencies": {
+        "drizzle-orm": "0.45.2",
+        "pg": "8.23.0"
+      },
+      "exports": [
+        "createPool",
+        "sharedDatabase",
+        "pgTypes",
+        "transaction",
+        "teamSchema",
+        "user",
+        "account",
+        "workspace",
+        "membership",
+        "workspaceInvitation",
+        "workspaceTwoFactorRequirement",
+        "instanceOperator",
+        "instanceOperatorAudit"
+      ],
+      "tests": [
+        "tests/db.test.mts"
+      ],
+      "version": "v0.27.0",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/116",
+      "boundary": "One pg pool per process with the int8 and DATE parsers, the Drizzle team tables, and transaction(db, run), which runs BEGIN, COMMIT and ROLLBACK itself and always releases or discards its connection. Apps keep their own schema, migrations, queries and transaction boundaries."
+    },
+    "tenancy": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/tenancy",
+      "entrypoints": [
+        "tenancy.mjs",
+        "tenancy.d.mts"
+      ],
+      "peerDependencies": {
+        "drizzle-orm": "0.45.2",
+        "pg": "8.23.0"
+      },
+      "exports": [
+        "createTenancy",
+        "workspaceNotFound",
+        "WorkspaceAccessError",
+        "DatabaseRoleError",
+        "UnlockedScopeError"
+      ],
+      "tests": [
+        "tests/tenancy.test.mts"
+      ],
+      "version": "v0.27.0",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/123",
+      "boundary": "Forced row-level security policies, scoped Drizzle transactions that set the workspace scope only after a share-locked membership check, and a start-up role check. Apps keep their grants and roles (custom migration step), membership semantics and every authorization decision above the row."
+    },
+    "tenancyTesting": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/tenancy/testing",
+      "entrypoints": [
+        "tenancy-testing.mjs",
+        "tenancy-testing.d.mts"
+      ],
+      "peerDependencies": {
+        "pg": "8.23.0"
+      },
+      "exports": [
+        "setScopeForTesting"
+      ],
+      "tests": [
+        "tests/tenancy.test.mts"
+      ],
+      "version": "v0.27.1",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/120",
+      "boundary": "Test-only scope setter for database guard tests on a connection and transaction the test owns. The architecture check refuses imports of it from an app's data roots."
+    },
+    "config": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/config",
+      "entrypoints": [
+        "config.mjs",
+        "config.d.mts"
+      ],
+      "peerDependencies": {
+        "zod": "4.6.6"
+      },
+      "exports": [
+        "readEnvironment",
+        "readSecret",
+        "loadConfig"
+      ],
+      "tests": [
+        "tests/config.test.mts"
+      ],
+      "version": "v0.28.0",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/123",
+      "boundary": "Reads NAME or NAME_FILE, refuses short secrets, and parses a zod object with key-only error messages (code CONFIG_INVALID). zod is needed for loadConfig only. Apps keep their own getConfig and its schema."
+    },
+    "email": {
+      "package": "@ten98/runtime",
+      "entrypoint": "@ten98/runtime/email",
+      "entrypoints": [
+        "email.mjs",
+        "email.d.mts"
+      ],
+      "peerDependencies": {
+        "zod": "4.6.6",
+        "nodemailer": "10.1.4"
+      },
+      "exports": [
+        "sendTransactionalEmail",
+        "getEmailStatus",
+        "EmailDeliveryError",
+        "withEmailTransportsForTests"
+      ],
+      "tests": [
+        "tests/email.test.mts"
+      ],
+      "version": "v0.28.0",
+      "adoption": "https://github.com/Ten98-IO-Company/ten98-code-system/issues/123",
+      "boundary": "One plain-text transactional message over SES, Cloudflare or SMTP in one bounded attempt, with a required suppression decision and a uniform 503 failure. nodemailer is needed for SMTP only. Apps keep message text, the suppression list and its feedback webhook, rate limits and what the user is told."
     },
     "presentation": {
       "package": "@ten98/ui",

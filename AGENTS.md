@@ -14,6 +14,8 @@ Update the canonical architecture declaration instead of copying its versions in
 
 Track defects and migration work in this repository's GitHub Issues and linked Project. Write documentation to the wiki, not to docs/ or the README; keep the README to what the project is, who it's for, community and legal links. Keep only files that tools read (catalog, architecture declaration, adoption guide) in the repository, and inline explanations in code comments. Put audit history, progress reports and historical evidence in GitHub instead of adding app-owned ledgers.
 
+This repository is public. Report a security defect that no release has fixed yet through a private security advisory or a session message, never in an issue, PR, comment, commit message or the wiki. Describe the fix in neutral terms ("check the signed-in account is the locked account") and keep reproductions, measurements and exploit steps private until a release fixes it. An upstream defect stays private until the upstream release fixes it.
+
 Make decisions at the lowest level that has the authority and the facts. Owners decide in-scope, reversible work themselves. The manager coordinates across sessions. The decision council answers high-level questions in issues labelled `decision`. The user decides anything irreversible or outward.
 
 Same feature, same experience: the same features across both apps should look the same and work the same. Shared pieces land here first; before approving a change, check how both Campaign and Discover use it (https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Development#same-feature-same-experience).

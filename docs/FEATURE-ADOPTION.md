@@ -14,9 +14,9 @@ Entry-point paths in the catalogue are navigation aids, not a list of independen
 
 Use imports for `@ten98/runtime` primitives and `@ten98/ui` presentation. A URL validator is not OIDC sign-in; a transport wrapper is not a paid-work lifecycle; a grant predicate is not transactional tenant authorization. Follow the catalogue's full source reference when adopting those features.
 
-The Shopify crawler-access mechanism in the 0.21.0 source candidate provides `parseShopifyCrawlerAccess`, `shopifyCrawlerHeadersFor` and `verifyShopifyCrawlerAccess`. Import those functions instead of copying signature parsing, expiry or header selection into an app. The helper performs no key lookup or network request: the owning app supplies a public verification key and retains domain proof, encrypted credentials, current authorization, revision binding, request recovery, scheduling and safe crawl transport. Selecting headers is not authorization to crawl. Recheck a selected credential after waits and before native dispatch; expired, revoked or unreadable selected access must stop its request. The pinned upstream MIT attribution is in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). Track complete consumer adoption and remaining live-provider/release checks in [issue102](https://github.com/Ten98-IO-Company/ten98-code-system/issues/102); a local archive is not a published release.
+Runtime 0.22.0 provides the Shopify crawler-access mechanism: `parseShopifyCrawlerAccess`, `shopifyCrawlerHeadersFor` and `verifyShopifyCrawlerAccess`. Import those functions instead of copying signature parsing, expiry or header selection into an app. The helper performs no key lookup or network request: the owning app supplies a public verification key and retains domain proof, encrypted credentials, current authorization, revision binding, request recovery, scheduling and safe crawl transport. Selecting headers is not authorization to crawl. Recheck a selected credential after waits and before native dispatch; expired, revoked or unreadable selected access must stop its request. The pinned upstream MIT attribution is in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). Track complete consumer adoption and remaining live-provider/release checks in [issue102](https://github.com/Ten98-IO-Company/ten98-code-system/issues/102).
 
-The 0.22.0 source candidate promotes Discover's `addressKey` and `publicNetworkAddress` policy, plus `pinnedNetworkPeer` and bounded, cancellable dual-family `resolveNetworkHost`. Import these mechanisms without creating another app-local address policy. DNS results are evidence, not admission: reject the whole set if any target is nonpublic, pin an admitted address and verify the connected peer before forwarding. Applications still own URL scope, authority and transport. `normalizeLighthouseReport` consumes the pinned local Lighthouse 13.6.0 navigation report, binds its requested URL, and projects bounded scores, lab measurements and audit details with explicit missing/error/truncation evidence. It performs no browser or provider work. Track actual imports, removal of duplicates, real isolated-browser acceptance and remaining release work in [issue 103](https://github.com/Ten98-IO-Company/ten98-code-system/issues/103); package tests alone do not establish a working renderer.
+Runtime 0.22.0 also promotes Discover's `addressKey` and `publicNetworkAddress` policy, plus `pinnedNetworkPeer` and bounded, cancellable dual-family `resolveNetworkHost`. Import these mechanisms without creating another app-local address policy. DNS results are evidence, not admission: reject the whole set if any target is nonpublic, pin an admitted address and verify the connected peer before forwarding. Applications still own URL scope, authority and transport. `normalizeLighthouseReport` consumes the pinned local Lighthouse 13.6.0 navigation report, binds its requested URL, and projects bounded scores, lab measurements and audit details with explicit missing/error/truncation evidence. It performs no browser or provider work. Track actual imports, removal of duplicates, real isolated-browser acceptance and remaining release work in [issue 103](https://github.com/Ten98-IO-Company/ten98-code-system/issues/103); package tests alone do not establish a working renderer.
 
 For stack-bound features, first run the unmodified reference with its own documented setup and tests. Then trace the caller through route admission, session/token identity, authorization, validation, transaction, provider boundary, receipt and rendered outcome. Adopt the complete flow into the same supported stack or make a controlled adaptation with explicit migrations and compatibility tests. Copying one handler while omitting its schema, lock, worker or authority recheck is incomplete.
 
@@ -25,6 +25,39 @@ Record the source repository and tag, the commit, the source path and the reason
 Verification must include the feature's listed tests and actual UI/API/persistence path, plus relevant negative cases: wrong tenant/role, revocation after a wait, expired/reused capability, malformed/incomplete response, failed transaction, stale draft, unmount/navigation, keyboard/narrow layout and uncertain provider outcome. Run network/provider scenarios only in approved isolated fixtures. Synthetic checks are evidence for their fixture scope; they establish no live-provider certification or production deployment.
 
 Before claiming adoption complete, preserve existing accounts/data and error contracts, pass the consumer's architecture/type/test/build gates, obtain independent review, and record the exact source tag and commit, commands, results, skips and remaining gaps in GitHub. The catalogue's issue statuses are a snapshot: consult issues [#4](https://github.com/Ten98-IO-Company/ten98-code-system/issues/4) through [#8](https://github.com/Ten98-IO-Company/ten98-code-system/issues/8) before choosing a reference. Current static dependency checks do not prove complete feature adoption.
+
+## Entry-point checklists
+
+Each framework entry point takes its libraries as exact optional peers, so the app lists each one in its own `dependencies` with its lockfile entry. pnpm does not install optional peers. The sections below hold the details. Release notes are on [GitHub Releases](https://github.com/Ten98-IO-Company/ten98-code-system/releases). Record each consumer's imports and checks in its adoption issue.
+
+**`@ten98/runtime/db`** (0.27.0; peers `drizzle-orm` 0.45.2 and `pg` 8.23.0)
+- Open the pool once per process with `sharedDatabase({ key, connectionString, schema })`, keyed by app (for example `ten98-books.database`), so bundler copies of a module share it.
+- Replace `db.transaction` with `transaction(db, run)` everywhere. Pass a pool-backed database or a single `pg.Client` from the same copy of pg; anything else is refused.
+- Use `teamSchema` and the shipped `workspace-team.sql` for the team tables rather than redeclaring them.
+- Commit `raw-statements.json`, with a reason for every entry, and lower it as raw statements become typed queries.
+
+**`@ten98/runtime/tenancy`** (0.27.0; same peers)
+- Call `createTenancy({ setting, column, tables })` once, add `policy(name)` to each scoped table's Drizzle callback, and put `forceRowLevelSecurity()`, the roles and every `GRANT` in a custom migration step.
+- Connect as a non-owner role without BYPASSRLS, and call `assertDatabaseRoles(pool)` at start-up and in a database test.
+- Reach scoped tables only through `withWorkspace` and `withWorkspaces`. Await nested calls on one transaction in turn.
+- Map `WorkspaceAccessError` to a not-found response and `UnlockedScopeError` to a bare 500. A `DatabaseRoleError` stops start-up.
+- Before adopting read-only reads, check that no read callback writes.
+
+**`@ten98/runtime/tenancy/testing`** (0.27.1; peer `pg`)
+- Import `setScopeForTesting(client, tenancy, workspaceIds)` only from tests outside the app's data roots; the architecture check refuses it inside them.
+- Call it on a connection and transaction the test owns, as the application role, with UUIDs only.
+
+**`@ten98/runtime/config`** (0.28.0; peer `zod` 4.6.6 for `loadConfig` only)
+- Replace the app's `environmentValue` and `secret` helpers with `readEnvironment` and `readSecret`, and keep the app's own `getConfig`, built on `loadConfig`.
+- Map `code: 'CONFIG_INVALID'` to a 503 wherever the app mapped `ENOENT` or `EACCES` from configuration (discover's `api.ts:1383`), in the same change.
+- Campaign points `SESSION_SECRET_FILE` at its generated `DATA_DIR/session-secret` or at a Compose secret, so existing sessions stay valid.
+
+**`@ten98/runtime/email`** (0.28.0; peer `zod` 4.6.6, plus `nodemailer` 10.1.4 for SMTP)
+- Pass `isSuppressed` at every send site. Discover has two, `account-security.ts:242` and `api.ts:138`. An app with no suppression list passes `false`. Books gains the `ses` and `cloudflare` transports, and has no suppression list for them.
+- Map `CONFIG_INVALID` to 503, as for `./config`.
+- Discover's two email test changes: the expected Cloudflare value becomes `'unconfirmed'`, and `isSuppressed` moves from the test seam to the send option.
+
+`@ten98/runtime/auth` gains its checklist with the 0.29.0 release. Until then the shipped preset is described in the catalogue's `auth` entry.
 
 ## Row-level security with Drizzle
 
@@ -107,7 +140,7 @@ Runtime 0.26.0 adds `parseMoney`, `formatMoney`, `addMoney`, `subtractMoney`, `c
 
 `parseMoney` is the wire boundary: it refuses grouping, exponent notation, more fraction digits than the exponent and any amount outside the PostgreSQL `bigint` range (`MONEY_MIN` to `MONEY_MAX`). Arithmetic does not bound its results, so call `assertMoneyInRange` on every computed amount (a total, a converted or taxed amount, an allocation part) before persisting it. `multiplyMoney` and `percentOfMoney` round `half-up`, `half-even` or `down`, symmetrically in sign; `allocateMoney` always sums to the total.
 
-The next release adds `convertMoney(amount, fromExponent, rate, toExponent, rounding)` and `rateOfAmounts(target, targetExponent, source, sourceExponent, places, rounding)` for multi-currency lines. A conversion rate is target units per source unit, above zero, with at most 10 fraction digits; a derived rate has exactly `places` digits (0 to 10) and is refused only for a zero source. Each function rounds once on exact integers, so a PostgreSQL guard recomputes the same result with the `div(numeric, numeric)` function on `numeric` integers, never `numeric` division followed by `round`. PostgreSQL has no `div` operator, and `10 ^ b` on integer literals is double precision, so write powers as `power(10::numeric, b)`. `div` truncates toward zero, so apply it to absolute values and restore the sign; the plain form is exact only for positive amounts. With `F` the source amount, `B` the target amount, `R` the rate's integer units, `p` its places and `f`, `b` the exponents, half-up is:
+Runtime 0.27.1 adds `convertMoney(amount, fromExponent, rate, toExponent, rounding)` and `rateOfAmounts(target, targetExponent, source, sourceExponent, places, rounding)` for multi-currency lines. A conversion rate is target units per source unit, above zero, with at most 10 fraction digits; a derived rate has exactly `places` digits (0 to 10) and is refused only for a zero source. Each function rounds once on exact integers, so a PostgreSQL guard recomputes the same result with the `div(numeric, numeric)` function on `numeric` integers, never `numeric` division followed by `round`. PostgreSQL has no `div` operator, and `10 ^ b` on integer literals is double precision, so write powers as `power(10::numeric, b)`. `div` truncates toward zero, so apply it to absolute values and restore the sign; the plain form is exact only for positive amounts. With `F` the source amount, `B` the target amount, `R` the rate's integer units, `p` its places and `f`, `b` the exponents, half-up is:
 
 ```sql
 -- Rate entered: the converted amount.
@@ -128,12 +161,8 @@ Runtime 0.28.0 adds `@ten98/runtime/email`, extracted from discover's and books'
 
 Changes from the apps: `sendTransactionalEmail(message, env)` becomes `sendTransactionalEmail(message, { env, isSuppressed })`, suppression applies to every transport rather than SES only, a delivered Cloudflare receipt resolves `'unconfirmed'` instead of discover's `'provider-reported-delivered'`, and `EMAIL_TRANSPORT`, `EMAIL_SMTP_TLS`, `EMAIL_SMTP_PORT`, `EMAIL_SES_REGION` and `EMAIL_SES_CONFIGURATION_SET` now accept `_FILE` too. The application still owns its message text, the suppression list and its feedback webhook, rate limits, and what it tells the user.
 
-Adoption checklist for each app:
-- `zod` 4.6.6, and `nodemailer` 10.1.4 if it sends over SMTP, both kept in the app's own dependencies. pnpm does not install optional peers.
-- `isSuppressed` at every send site. Discover has two, `account-security.ts:242` and `api.ts:138`. An app with no list passes `false`. Books gains the `ses` and `cloudflare` transports, and has no suppression list for them.
-- `CONFIG_INVALID` mapped to 503, as described under Environment configuration.
-- Discover's two email test changes:
-  - the expected Cloudflare value becomes `'unconfirmed'`;
-  - `isSuppressed` moves from the test seam to the send option.
+The adoption checklist is under [Entry-point checklists](#entry-point-checklists). Package tests use injected transports only.
 
-Package tests use injected transports only. Record each consumer's imports and checks in its adoption issue.
+## Logging
+
+The runtime has no shared logger yet; apps keep their own. The planned `./log` entry ([#142](https://github.com/Ten98-IO-Company/ten98-code-system/issues/142)) wraps pino with path-based redaction: values at listed paths are hidden, a secret under a name nobody listed is written, and values are never scanned, so a password inside a database URL or a token inside a message is written as given. Whichever logger an app uses, log the fields you mean to log, never whole configuration objects, request bodies, request headers or errors that carry configuration.
