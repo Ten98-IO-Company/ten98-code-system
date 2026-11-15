@@ -47,6 +47,10 @@
     "./email": {
       "types": "./email.d.mts",
       "import": "./email.mjs"
+    },
+    "./log": {
+      "types": "./log.d.mts",
+      "import": "./log.mjs"
     }
   },
   "files": [
@@ -153,7 +157,13 @@
     "src/config.mts",
     "email.mjs",
     "email.d.mts",
-    "src/email.mts"
+    "src/email.mts",
+    "log.mjs",
+    "log.d.mts",
+    "src/log.mts",
+    "database-error.mjs",
+    "database-error.d.mts",
+    "src/database-error.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
@@ -176,6 +186,7 @@
     "drizzle-orm": "0.45.2",
     "nodemailer": "10.1.4",
     "pg": "8.23.0",
+    "pino": "10.4.0",
     "typescript": "7.0.2",
     "vite": "8.3.4",
     "zod": "4.6.6"
@@ -185,6 +196,7 @@
     "drizzle-orm": "0.45.2",
     "nodemailer": "10.1.4",
     "pg": "8.23.0",
+    "pino": "10.4.0",
     "zod": "4.6.6"
   },
   "peerDependenciesMeta": {
@@ -198,6 +210,9 @@
       "optional": true
     },
     "pg": {
+      "optional": true
+    },
+    "pino": {
       "optional": true
     },
     "zod": {
