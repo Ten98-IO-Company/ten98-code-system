@@ -76,3 +76,52 @@ export async function resolveNetworkHost(hostname, signal) {
         resolver.cancel();
     }
 }
+// Public recursive resolvers (Cloudflare, then Google; IPv4, then IPv6) for ownership proofs, so a split-horizon system
+// resolver can never answer for an internal zone.
+const ownershipDnsServers = Object.freeze(['1.1.1.1', '8.8.8.8', '2606:4700:4700::1111', '2001:4860:4860::8888']);
+const txtLimits = Object.freeze({ tryMs: 3000, deadlineMs: 5000, records: 64, chunks: 256, bytes: 65536 });
+const txtLimit = () => Object.assign(new Error('The TXT answer exceeds its bounds.'), { code: 'ETXTLIMIT' });
+/** TXT records for an ownership proof, from pinned public resolvers rather than the system resolver. One try per server,
+ * at most 5 seconds, 64 records, 256 strings per record and 64 KiB in all; a larger answer rejects with code ETXTLIMIT,
+ * the deadline with ETIMEOUT. DNS errors keep their codes (ENODATA, ENOTFOUND). An abort rejects with the signal's reason. */
+export async function resolveOwnershipTxt(name, options = {}) {
+    const { servers = ownershipDnsServers, signal } = options;
+    if (typeof name !== 'string' || !name || name.length > 253 || !Array.isArray(servers) || !servers.length)
+        throw new TypeError('A DNS name and at least one resolver are required.');
+    signal?.throwIfAborted();
+    const resolver = new Resolver({ timeout: txtLimits.tryMs, tries: 1 });
+    resolver.setServers(servers);
+    let timer;
+    const cancel = () => resolver.cancel();
+    signal?.addEventListener('abort', cancel, { once: true });
+    try {
+        let records;
+        try {
+            records = await Promise.race([resolver.resolveTxt(name), new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(Object.assign(new Error('DNS lookup timed out.'), { code: 'ETIMEOUT' })), txtLimits.deadlineMs);
+                })]);
+        }
+        catch (error) {
+            signal?.throwIfAborted();
+            throw error;
+        }
+        signal?.throwIfAborted();
+        if (records.length > txtLimits.records)
+            throw txtLimit();
+        let bytes = 0;
+        for (const chunks of records) {
+            if (chunks.length > txtLimits.chunks)
+                throw txtLimit();
+            for (const chunk of chunks)
+                bytes += Buffer.byteLength(chunk);
+        }
+        if (bytes > txtLimits.bytes)
+            throw txtLimit();
+        return records;
+    }
+    finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', cancel);
+        resolver.cancel();
+    }
+}

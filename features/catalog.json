@@ -135,6 +135,7 @@
         "publicNetworkAddress",
         "pinnedNetworkPeer",
         "resolveNetworkHost",
+        "resolveOwnershipTxt",
         "normalizeLighthouseReport"
       ],
       "tests": [
