@@ -169,7 +169,7 @@ export function createMigrationLedger({ directory, files, lockKey }: {
         candidate.release();
         waiting = 'another process to finish database migrations';
       } catch { candidate?.release(true); }
-      if (Date.now() >= deadline) throw startupError('MIGRATION_TIMEOUT', `Database migrations could not start within ${seconds(timeoutMs)} while waiting for ${waiting}. Nothing was applied.`);
+      if (deadline - Date.now() < Math.min(retryIntervalMs, 50)) throw startupError('MIGRATION_TIMEOUT', `Database migrations could not start within ${seconds(timeoutMs)} while waiting for ${waiting}. Nothing was applied.`);
       if (Date.now() >= nextLog) { log(`Waiting for ${waiting} before applying database migrations.`); nextLog = Date.now() + progressIntervalMs; }
       await delay(Math.min(retryIntervalMs, Math.max(0, deadline - Date.now())));
     }
