@@ -631,6 +631,7 @@
         "drizzle-orm": "0.45.2",
         "nodemailer": "10.1.4",
         "pg": "8.23.0",
+        "pino": "10.4.0",
         "zod": "4.6.6"
       },
       "sharedDependencies": [],
@@ -643,6 +644,7 @@
         "drizzle-orm": "0.45.2",
         "nodemailer": "10.1.4",
         "pg": "8.23.0",
+        "pino": "10.4.0",
         "zod": "4.6.6"
       },
       "checkScripts": [
@@ -731,7 +733,11 @@
           "config.mjs": "Generated environment and secret reader from src/config.mts, exported as ./config only; loadConfig needs the optional zod peer.",
           "config.d.mts": "Generated declarations from src/config.mts.",
           "email.mjs": "Generated transactional email sender from src/email.mts, exported as ./email only; needs the optional zod peer, and the optional nodemailer peer for SMTP, imported on first SMTP send.",
-          "email.d.mts": "Generated declarations from src/email.mts."
+          "email.d.mts": "Generated declarations from src/email.mts.",
+          "log.mjs": "Generated structured logger from src/log.mts, exported as ./log only; needs the optional pino peer.",
+          "log.d.mts": "Generated declarations from src/log.mts.",
+          "database-error.mjs": "Generated database error reducer from src/database-error.mts, imported by log.mjs; imports no library.",
+          "database-error.d.mts": "Generated declarations from src/database-error.mts."
         },
         "compilerProjects": [
           "tsconfig.json",

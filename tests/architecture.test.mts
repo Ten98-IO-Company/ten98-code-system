@@ -111,7 +111,7 @@ const campaign = (): AppManifestFixture => ({
 
 test('architecture accepts independent manifests with reviewed tools and mandatory gates', () => {
   assert.deepEqual(checkManifest(campaign()), []);
-  const runtime = { name: '@ten98/runtime', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' }, devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', typescript: '7.0.2', vite: '8.3.4', zod: '4.6.6' }, peerDependencies: { 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', zod: '4.6.6' }, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && tsc --project tsconfig.json', typecheck: 'npm run check:architecture && tsc --project tsconfig.json --noEmit' } };
+  const runtime = { name: '@ten98/runtime', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' }, devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', pino: '10.4.0', typescript: '7.0.2', vite: '8.3.4', zod: '4.6.6' }, peerDependencies: { 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', pino: '10.4.0', zod: '4.6.6' }, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && tsc --project tsconfig.json', typecheck: 'npm run check:architecture && tsc --project tsconfig.json --noEmit' } };
   assert.deepEqual(checkManifest(runtime), []);
 });
 

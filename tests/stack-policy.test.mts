@@ -168,6 +168,19 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
       assert.equal(refused.status, 1, statement);
       assert.match(refused.stderr, /src\/server\/report\.ts: imports the test-only @ten98\/runtime\/tenancy\/testing/, statement);
     }
+    // A log call never passes a whole configuration, environment, headers or body object; a field of one passes.
+    for (const statement of ['log.info(config)', "log.error('boot', getConfig())", "logger.warn('in', req.headers)", "log.info('in', { headers: request.headers })",
+      "log.debug('in', req.body)", "log.info('env', { ...process.env })", "log.info('in', { headers })", "log.error('x', { body, id })", "log . info ( 'x' , (config) )",
+      "log.info('x', { cfg: config,\n  id })", 'log.child({ config })']) {
+      writeFileSync(source, `${statement};\n`);
+      const refused = run();
+      assert.equal(refused.status, 1, statement);
+      assert.match(refused.stderr, /src\/server\/report\.ts: a log call passes a whole configuration, environment, headers or body object/, statement);
+    }
+    writeFileSync(source, ["log.info('config loaded', { port: config.port, host: getConfig().host });", "log.info('in', { agent: req.headers['user-agent'], length: request.body?.length });",
+      "log.info('in', { requestId: requestId(request), size: count(body) });", "// log.info(config)", "log.info('bad request body, headers or config');", "console.log(config);",
+      "log.child({ requestId: requestId(request) });", "catalog.info(config);", ''].join('\n'));
+    assert.equal(run().status, 0, run().stderr);
     writeFileSync(source, "import { createTenancy } from '@ten98/runtime/tenancy';\n");
     mkdirSync(join(app, 'tests'), { recursive: true });
     writeFileSync(join(app, 'tests/guards.test.ts'), `import { setScopeForTesting } from '${testing}';\n`);
