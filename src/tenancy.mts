@@ -45,15 +45,28 @@ export interface TenancyOptions<TTable extends string> {
   tables: readonly TTable[];
 }
 
+/**
+ * A scoped call nested in a READ ONLY transaction named a membership that this transaction does not hold share-locked,
+ * so a removal could commit while its callback still read the workspace. Thrown instead of reading it unlocked.
+ */
+export class UnlockedScopeError extends Error {
+  readonly code = 'TENANCY_SCOPE_UNLOCKED' as const;
+  constructor() {
+    super('A scoped call nested in a READ ONLY transaction may admit only memberships the transaction\'s own helper call share-locked. Open the outer call for the same user over those workspaces (withWorkspaces), or make it a write call.');
+    this.name = 'UnlockedScopeError';
+  }
+}
+
 const writers: readonly WorkspaceRole[] = ['owner', 'admin', 'editor'];
-const unlockedScope = 'A scoped call nested in a READ ONLY transaction may admit only workspaces whose membership a tenancy helper share-locked earlier in that transaction. Open the outer call over those workspaces (withWorkspaces), or make it a write call.';
-// The membership rows tenancy helpers share-locked in each transaction, keyed by the transaction objects they use.
-const held = new WeakMap<object, Set<string>>();
-const locksOf = (tx: object): Set<string> => {
-  let locks = held.get(tx);
-  if (!locks) held.set(tx, locks = new Set());
-  return locks;
-};
+/**
+ * The memberships, as user and workspace pairs, that a helper share-locked at the top level of a transaction it opened
+ * itself. That check is the transaction's first statement, so no savepoint precedes it and nothing short of the
+ * transaction's end releases those locks. Locks taken by nested calls are never recorded: a savepoint or a caller's
+ * ROLLBACK TO can release them unseen. Keyed by the transaction objects the helpers hand out, the top-level one and the
+ * savepoints helpers open inside it; any other transaction object has no record, so nesting there fails closed.
+ */
+const held = new WeakMap<object, ReadonlySet<string>>();
+const pair = (userId: string, workspaceId: string) => `${userId}\u0000${workspaceId}`;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Lowercase names only: they go into SQL text unquoted, and PostgreSQL's stored policy then matches them verbatim.
 const identifier = /^[a-z_][a-z0-9_]*$/;
@@ -100,43 +113,42 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
    * workspace transaction and cannot commit between this check and its writes. The workspace row is not locked: team
    * changes lock it first, and tenant transactions must not queue behind them or hold them up.
    *
-   * A READ ONLY transaction refuses the lock, so there the check fails closed: it admits only memberships a helper
-   * already share-locked in this transaction (`locks`), which a removal must still wait for. Any other membership,
-   * including every one in a READ ONLY transaction the caller opened itself, is refused rather than read unlocked,
-   * where a removal could commit while the callback still reads that workspace.
+   * A READ ONLY transaction refuses the lock, so there the check fails closed: it admits only this user's memberships
+   * that the transaction's own top-level helper call share-locked (`held`), which a removal must still wait for. Any
+   * other membership, another user's, or any in a READ ONLY transaction the caller opened itself, throws
+   * UnlockedScopeError rather than being read unlocked, where a removal could commit while the callback still reads.
    */
-  async function memberships(tx: AnyDatabase, userId: string, workspaceIds: readonly string[], locks: Set<string>, readOnly: boolean): Promise<WorkspaceAccess[]> {
+  async function memberships(tx: AnyDatabase, userId: string, workspaceIds: readonly string[], caller: Caller | undefined,
+    record: Set<string> | undefined, locked: ReadonlySet<string> | undefined): Promise<WorkspaceAccess[]> {
     const ids = workspaceIds.filter(id => typeof id === 'string' && uuid.test(id)).map(id => id.toLowerCase());
     if (!ids.length || typeof userId !== 'string') return [];
     const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role })
       .from(membership).innerJoin(workspace, eq(workspace.id, membership.workspaceId))
       .where(and(eq(membership.userId, userId), inArray(membership.workspaceId, ids)))
       .orderBy(workspace.createdAt, workspace.id);
-    if (!readOnly) {
+    if (!caller?.readOnly) {
       const access = await query.for('share', { of: membership });
-      for (const item of access) locks.add(item.workspaceId);
+      if (record) for (const item of access) record.add(pair(userId, item.workspaceId));
       return access;
     }
     const access = await query;
-    if (access.some(item => !locks.has(item.workspaceId))) throw new Error(unlockedScope);
+    if (access.some(item => !locked?.has(pair(userId, item.workspaceId)))) throw new UnlockedScopeError();
     return access;
   }
 
   /**
-   * Runs `body` in the transaction a helper call uses, with the caller's state when it is nested and the memberships
-   * share-locked so far. A transaction of its own, or the caller's `outer`, records its locks directly. A savepoint (a
-   * transaction passed as `db`) works on a copy that joins its parent's only once the savepoint is released, because
-   * rolling a savepoint back releases the row locks taken inside it.
+   * Runs `body` in the transaction a helper call uses. A transaction of its own starts a fresh record of the
+   * memberships its top-level check locks (`record`). A nested call (the caller's `outer`, or a savepoint when `db` is a
+   * transaction) gets the caller's state and only reads the record; a savepoint a helper opens shares it.
    */
   async function scopedTransaction<TDatabase extends AnyDatabase, T>(db: TDatabase, outer: ScopedTransaction<TDatabase> | undefined,
-    body: (tx: ScopedTransaction<TDatabase>, caller: Caller | undefined, locks: Set<string>) => Promise<T>): Promise<T> {
-    if (outer) return body(outer, await readCaller(outer), locksOf(outer));
-    if (!(db instanceof PgTransaction)) return transaction(db, tx => body(tx, undefined, locksOf(tx)));
-    const locks = new Set(held.get(db));
-    const result = await transaction(db, async tx => { held.set(tx, locks); return body(tx, await readCaller(tx), locks); });
-    const parent = locksOf(db);
-    for (const id of locks) parent.add(id);
-    return result;
+    body: (tx: ScopedTransaction<TDatabase>, caller: Caller | undefined, record: Set<string> | undefined, locked: ReadonlySet<string> | undefined) => Promise<T>): Promise<T> {
+    if (outer) return body(outer, await readCaller(outer), undefined, held.get(outer));
+    if (!(db instanceof PgTransaction)) {
+      return transaction(db, tx => { const record = new Set<string>(); held.set(tx, record); return body(tx, undefined, record, record); });
+    }
+    const locked = held.get(db);
+    return transaction(db, async tx => { if (locked) held.set(tx, locked); return body(tx, await readCaller(tx), undefined, locked); });
   }
 
   return {
@@ -158,12 +170,12 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
      * the membership is checked (its share lock cannot be taken in a read-only transaction). `outer` joins a transaction
      * the caller already holds (workspace creation inserts the workspace first), and `db` may itself be a transaction (a
      * savepoint): the caller then owns commit, rollback and access mode, and gets its own scope back afterwards. Nested in
-     * a READ ONLY transaction it admits only a membership a helper share-locked earlier in that transaction.
+     * a READ ONLY transaction it admits only this user's memberships that the transaction's top-level helper call locked.
      */
     async withWorkspace<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceId: string, mode: WorkspaceMode,
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess) => Promise<T>, outer?: ScopedTransaction<TDatabase>): Promise<T> {
-      return scopedTransaction(db, outer, async (tx, caller, locks) => {
-        const [access] = await memberships(tx, userId, [workspaceId], locks, caller?.readOnly ?? false);
+      return scopedTransaction(db, outer, async (tx, caller, record, locked) => {
+        const [access] = await memberships(tx, userId, [workspaceId], caller, record, locked);
         if (!access || (mode !== 'read' && !writers.includes(access.role))) throw new WorkspaceAccessError();
         if (mode === 'read' && !caller) await tx.setTransaction({ accessMode: 'read only' });
         return inScope(tx, [access.workspaceId], caller, () => run(tx, access));
@@ -176,8 +188,8 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
      */
     withWorkspaces<TDatabase extends AnyDatabase, T>(db: TDatabase, userId: string, workspaceIds: readonly string[],
       run: (tx: ScopedTransaction<TDatabase>, access: WorkspaceAccess[]) => Promise<T>): Promise<T> {
-      return scopedTransaction(db, undefined, async (tx, caller, locks) => {
-        const access = await memberships(tx, userId, workspaceIds, locks, caller?.readOnly ?? false);
+      return scopedTransaction(db, undefined, async (tx, caller, record, locked) => {
+        const access = await memberships(tx, userId, workspaceIds, caller, record, locked);
         if (!caller) await tx.setTransaction({ accessMode: 'read only' });
         return inScope(tx, access.map(item => item.workspaceId), caller, () => run(tx, access));
       });

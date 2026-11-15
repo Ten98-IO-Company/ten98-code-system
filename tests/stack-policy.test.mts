@@ -154,6 +154,19 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
       assert.equal(refused.status, 1, statement);
       assert.match(refused.stderr, /src\/server\/report\.ts: raw statement count 1 exceeds the allowlist \(0 in raw-statements\.json\)/, statement);
     }
+    // Production code never imports the test-only scope setter, in any import form; a test outside the data roots may.
+    const testing = '@ten98/runtime/tenancy/testing';
+    for (const statement of [`import { setScopeForTesting } from '${testing}'`, `import * as scope from "${testing}"`, `import '${testing}'`,
+      `const scope = await import('${testing}')`, `const scope = require('${testing}')`]) {
+      writeFileSync(source, `${statement};\n`);
+      const refused = run();
+      assert.equal(refused.status, 1, statement);
+      assert.match(refused.stderr, /src\/server\/report\.ts: imports the test-only @ten98\/runtime\/tenancy\/testing/, statement);
+    }
+    writeFileSync(source, "import { createTenancy } from '@ten98/runtime/tenancy';\n");
+    mkdirSync(join(app, 'tests'), { recursive: true });
+    writeFileSync(join(app, 'tests/guards.test.ts'), `import { setScopeForTesting } from '${testing}';\n`);
+    assert.equal(run().status, 0, run().stderr);
     const allowlist = join(app, 'raw-statements.json'), recorded = () => JSON.parse(readFileSync(allowlist, 'utf8'));
     // Each entry needs a count and a reason; a bare count or an empty reason is refused.
     for (const [entry, expected] of [

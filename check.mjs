@@ -556,8 +556,9 @@ function countRawStatements(text) {
     }
     return count;
 }
-function rawStatementCounts(directory, policy) {
-    const counts = {};
+// Each source file under the data roots, as its forward-slash path from the app and its text.
+function dataSources(directory, policy) {
+    const sources = [];
     const walk = (folder) => {
         if (!existsSync(folder))
             return;
@@ -566,15 +567,29 @@ function rawStatementCounts(directory, policy) {
             if (entry.isDirectory())
                 walk(file);
             else if (entry.isFile() && /\.(?:[cm]?[jt]s|[jt]sx)$/u.test(entry.name) && !/\.d\.[cm]?ts$/u.test(entry.name)) {
-                const found = countRawStatements(readFileSync(file, 'utf8'));
-                if (found)
-                    counts[relative(directory, file).replaceAll('\\', '/')] = found;
+                sources.push([relative(directory, file).replaceAll('\\', '/'), readFileSync(file, 'utf8')]);
             }
         }
     };
     for (const root of policy.roots)
         walk(resolve(directory, root));
+    return sources;
+}
+function rawStatementCounts(sources) {
+    const counts = {};
+    for (const [path, text] of sources) {
+        const found = countRawStatements(text);
+        if (found)
+            counts[path] = found;
+    }
     return counts;
+}
+// The test-only tenancy entry sets a scope without the membership check, so production code (the data roots) never
+// imports it: as `from`, a bare or dynamic `import`, or `require`. Tests live outside the data roots.
+const testingTenancy = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)['"`]@ten98\/runtime\/tenancy\/testing['"`]/u;
+function testingTenancyImports(sources) {
+    return sources.filter(([, text]) => testingTenancy.test(text))
+        .map(([path]) => `${path}: imports the test-only @ten98/runtime/tenancy/testing, which sets a scope without the membership check; only tests outside the data roots may.`);
 }
 function readAllowlist(directory, policy) {
     const file = resolve(directory, policy.baseline);
@@ -606,7 +621,8 @@ export function checkDataAccess(directory, packageName) {
         return [];
     directory = resolve(directory);
     const { allowed, errors } = readAllowlist(directory, policy);
-    return [...errors, ...rawStatementRises(rawStatementCounts(directory, policy), allowed, policy.baseline)];
+    const sources = dataSources(directory, policy);
+    return [...errors, ...testingTenancyImports(sources), ...rawStatementRises(rawStatementCounts(sources), allowed, policy.baseline)];
 }
 // Lowers or removes allowlist entries and keeps their reasons; a rise is refused. A missing allowlist is recorded once
 // from current counts. New entries are written with an empty reason, which the check refuses until someone writes it,
@@ -616,7 +632,7 @@ export function updateRawStatementBaseline(directory, packageName) {
     if (!policy)
         return [];
     directory = resolve(directory);
-    const { allowed, exists } = readAllowlist(directory, policy), counts = rawStatementCounts(directory, policy);
+    const { allowed, exists } = readAllowlist(directory, policy), counts = rawStatementCounts(dataSources(directory, policy));
     if (exists) {
         const rises = rawStatementRises(counts, allowed, policy.baseline);
         if (rises.length)
