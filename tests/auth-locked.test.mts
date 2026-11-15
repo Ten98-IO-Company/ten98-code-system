@@ -255,8 +255,10 @@ test('after its callback returns, a locked instance and its transaction refuse e
   let late: Promise<unknown> | undefined;
   await auth.withLockedAuth(db, id, async (bound, tx) => {
     kept = { bound, tx };
-    // Not awaited: it runs after the callback has returned.
+    // Not awaited: it runs after the callback has returned. Handled at once, so a COMMIT slower than the delay never
+    // leaves its rejection unhandled; assert.rejects below still checks it.
     late = delay(50).then(() => oidcSession(bound, id));
+    late.catch(() => undefined);
   });
   await assert.rejects(late!, closed);
   assert.throws(() => oidcSession(kept!.bound, id), closed);
