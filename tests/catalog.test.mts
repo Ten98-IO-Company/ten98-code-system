@@ -36,6 +36,24 @@ test('every auth-entry export and test file the catalogue names exists', async (
   assert.deepEqual(catalog.portableImports.auth.tests.filter(path => !existsSync(new URL(`../${path}`, import.meta.url))), []);
 });
 
+test('every subpath entry the catalogue names exports what it lists and is a package export', async () => {
+  const manifest: { exports: Record<string, unknown> } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const entries = Object.entries(catalog.portableImports as unknown as Record<string, { package: string; entrypoint?: string; entrypoints?: string[]; exports?: string[]; tests?: string[] }>)
+    .filter(([, entry]) => entry.package === '@ten98/runtime' && entry.entrypoint);
+  assert.ok(entries.length >= 6);
+  const problems: string[] = [];
+  for (const [key, entry] of entries) {
+    const subpath = `.${entry.entrypoint!.slice('@ten98/runtime'.length)}`;
+    if (!(subpath in manifest.exports)) problems.push(`${key}: ${subpath} is not a package export`);
+    for (const file of [...(entry.entrypoints ?? []), ...(entry.tests ?? [])]) if (!existsSync(new URL(`../${file}`, import.meta.url))) problems.push(`${key}: missing ${file}`);
+    const module = entry.entrypoints?.find(file => file.endsWith('.mjs') && !file.includes('capsule'));
+    if (!module) continue;
+    const exported = new Set(Object.keys(await import(`../${module}`)));
+    for (const name of entry.exports ?? []) if (!exported.has(name)) problems.push(`${key}: ${name} is not exported by ${module}`);
+  }
+  assert.deepEqual(problems, []);
+});
+
 test('every implementation names a declared source', () => {
   const unknown = catalog.features.flatMap(feature => feature.implementations.filter(impl => !catalog.sources[impl.source]).map(impl => `${feature.id}:${impl.source}`));
   assert.deepEqual(unknown, []);

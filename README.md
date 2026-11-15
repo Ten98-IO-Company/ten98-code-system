@@ -7,37 +7,20 @@ Shared server-side building blocks for Ten98 apps, so every app gets the same te
 ## Why Code System
 
 - **Fix once, fixed everywhere.** Workspace roles, safe network reads, database migrations, client addresses behind proxies, Amazon SES email and its bounce and complaint feedback are written, reviewed and tested in one place.
-- **No hidden dependencies.** The runtime has no third-party runtime dependencies. Apps install it from an immutable, checksummed release archive.
+- **No hidden dependencies.** The root entry has no third-party runtime dependencies. Entry points that wrap a library (`./db`, `./tenancy`, `./config`, `./email`, `./auth`) take it as an exact optional peer, which the app installs itself. Apps install the runtime from an immutable, checksummed release archive.
 - **Consistent stack.** One checker keeps Node, TypeScript, React and dependency versions aligned across apps, and blocks new untyped source.
-- **Reuse before rebuilding.** A [feature catalogue](features/catalog.json) points to the maintained implementation of features that already exist in a Ten98 app.
+- **Reuse before rebuilding.** A [feature catalogue](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/features/catalog.json) points to the maintained implementation of features that already exist in a Ten98 app.
 - Open source under the MIT licence.
 
 ## Get started
 
-- Install a release archive from [GitHub Releases](https://github.com/Ten98-IO-Company/ten98-code-system/releases) into the app's `vendor/` folder, and update the manifest and lockfile together.
-- Import functions from `@ten98/runtime`. Their types ship with the package. Browser code imports from `@ten98/runtime/browser`, which has the workspace roles and response readers and needs no Node built-ins.
-- Identity uses `@ten98/runtime/auth`, a better-auth preset with the shared policy. Install `better-auth@1.7.7` (an exact, optional peer) and set `skipLibCheck` in the app's TypeScript config, because better-auth's own type files reference Bun modules. Apps keep their routes, transactions, first-boot claim, OIDC flow and rate limiters. Cookie names default to an origin-derived prefix; an app that already uses better-auth passes its current `cookiePrefix` (Discover: `'better-auth'`) so existing sessions continue.
-- Workspaces, members, invitations and instance operators use `createWorkspaceTeam` from `@ten98/runtime` over the common schema shipped as `workspace-team.sql`. Each method runs inside the app's transaction (READ COMMITTED, REPEATABLE READ or SERIALIZABLE; roll back on any error).
-- Shopify crawler access uses `parseShopifyCrawlerAccess`, `shopifyCrawlerHeadersFor` and `verifyShopifyCrawlerAccess` for bounded signature parsing, exact-origin expiry checks and verification with a supplied Ed25519 public key. These helpers perform no network calls or credential storage; apps retain authorization and transport safeguards.
-- Public-network checks use `addressKey`, `publicNetworkAddress`, `pinnedNetworkPeer` and `resolveNetworkHost`. Resolution returns both DNS families; the caller admits the complete answer set before connecting and verifies the actual connected peer.
-- Money uses `bigint` minor units with no floating point. The functions are `parseMoney`, `formatMoney`, `addMoney`, `subtractMoney`, `compareMoney`, `multiplyMoney`, `percentOfMoney`, `convertMoney`, `rateOfAmounts` and `allocateMoney`, from `@ten98/runtime` or `@ten98/runtime/browser`.
-  - The currency exponent is 0, 2 or 3, so BHD, KWD and OMR use 3.
-  - Parsing refuses more fraction digits than the exponent, and amounts outside the PostgreSQL `bigint` range (`MONEY_MIN` to `MONEY_MAX`). Call `assertMoneyInRange` on a computed amount before storing it.
-  - Rates and percentages are decimal strings, rounded `half-up` (away from zero), `half-even` or `down` (toward zero). All three modes are symmetric for negative amounts.
-  - `convertMoney` converts between currencies at a decimal-string rate, and `rateOfAmounts` gives the rate two amounts imply with a fixed number of places. Each rounds once, so PostgreSQL can recompute both with `div` on `numeric` integers for positive amounts; for signed values apply `div` to absolute values and restore the sign, as in `sign(F) * div(2 * abs(F) * R * power(10::numeric, b) + power(10::numeric, p + f), 2 * power(10::numeric, p + f))`. Neither result is range-checked: call `assertMoneyInRange` before storing.
-  - Allocation by weights always sums to the total.
-  - Apps keep currency selection, display locale and ledger postings.
-- `normalizeLighthouseReport` validates and reduces a supplied local Lighthouse report. It preserves unavailable measurements, errors and coverage limits; it does not run a browser or authorize a website request.
-- Isolated browser execution uses the server-only `@ten98/runtime/browser-audit` entry. It provides `createBrowserAuditControl` and `createPublicEgressProxy`; the capsule runs separately with `node node_modules/@ten98/runtime/browser-audit-capsule.mjs`. See the [complete deployment and authority contract](docs/FEATURE-ADOPTION.md#isolated-browser-audit). This candidate does not establish production or consumer acceptance.
-- Run `node node_modules/@ten98/runtime/check.mjs .` as the app's `check:architecture` script, first in every `test` and `build` script. [architecture.json](architecture.json) declares the shared versions and dependencies.
+- Install a release archive from [GitHub Releases](https://github.com/Ten98-IO-Company/ten98-code-system/releases) into the app's `vendor/` folder and update the manifest and lockfile together: [Usage](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Usage).
+- Import from `@ten98/runtime`, or from an entry point: `/browser`, `/auth`, `/db`, `/tenancy`, `/tenancy/testing`, `/config`, `/email` or `/browser-audit`. Every export is in the [Reference](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Reference).
+- Adopt an entry point or a feature with the [adoption guide](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/docs/FEATURE-ADOPTION.md), which has a checklist per entry point, and the [feature catalogue](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/features/catalog.json).
+- Run `node node_modules/@ten98/runtime/check.mjs .` as the app's `check:architecture` script, first in every `test` and `build` script. [architecture.json](https://github.com/Ten98-IO-Company/ten98-code-system/blob/main/architecture.json) declares the shared versions and dependencies.
 - Apps keep their own authorization, storage, credentials and paid-work accounting. The runtime owns only the shared mechanism.
 
-Installation, configuration and guides are in the [wiki](https://github.com/Ten98-IO-Company/ten98-code-system/wiki):
-
-- [Development](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Development): work on the runtime locally, run the tests and contribute code.
-- [Usage](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Usage): install a release in an app and run the architecture check.
-- [Releases](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Releases): cut, verify and upgrade a release.
-- [Reference](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Reference): every exported function and what it guarantees.
+More in the [wiki](https://github.com/Ten98-IO-Company/ten98-code-system/wiki): [Development](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Development) to work on the runtime, and [Releases](https://github.com/Ten98-IO-Company/ten98-code-system/wiki/Releases) to cut, verify and upgrade a release.
 
 ## Community
 
