@@ -57,6 +57,14 @@ Each framework entry point takes its libraries as exact optional peers, so the a
 - Map `CONFIG_INVALID` to 503, as for `./config`.
 - Discover's two email test changes: the expected Cloudflare value becomes `'unconfirmed'`, and `isSuppressed` moves from the test seam to the send option.
 
+**Shared-flow register and the ratchet rules** (the first runtime minor after 0.29.0; needs `@ten98/ui` 0.40.0 or later)
+- Take `@ten98/ui` 0.40.0 or later first; with an older release the check fails closed.
+- Record the register once with `node node_modules/@ten98/runtime/check.mjs --record-shared-flows .`.
+- Write every reason and review trigger, and change each feature the app doesn't have to `absent`.
+- Name the app's leave-guard adapter in `leaveGuardAdapter`, if it has one. Without it, every `useBlocker` import counts toward `router-blocker`.
+- Re-record the baseline once with `--update-presentation-baseline`, and review the diff of both files.
+- The details are under [Shared-flow register](#shared-flow-register).
+
 `@ten98/runtime/auth` gains its checklist with the 0.29.0 release. Until then the shipped preset is described in the catalogue's `auth` entry.
 
 ## Row-level security with Drizzle
@@ -104,7 +112,140 @@ Each allowlist entry is `"path": { "count": n, "reason": "…" }`, and the check
 
 ## Presentation ratchet
 
-Apps whose profile has a `presentation` policy keep a committed `presentation-baseline.json`. The architecture check parses each file under the policy's roots and refuses any file whose count rises for a rule: `element` (host tags), `styling` (`className` and `style`), `inner-html`, `create-element` and `stylesheet`. `node node_modules/@ten98/runtime/check.mjs --update-presentation-baseline .` lowers the baseline as screens move onto `@ten98/ui`, and refuses to record a rise. Known limit: `element` counts lowercase host tags, namespaced tags and member tags whose root is not a `@ten98/ui` import. It never counts a capitalised component, whether it comes from `@ten98/ui` or from the app, so it measures host tags and styling, not whether a component comes from the design system. Raw HTML moved into an app-local component is still counted in that component's own file.
+Apps whose profile has a `presentation` policy keep a committed `presentation-baseline.json`. The architecture check parses each file under the policy's roots and refuses any file whose count rises for a rule. These rules count `.jsx` and `.tsx` files: `element` (host tags), `styling` (`className` and `style`), `inner-html`, `create-element` and `stylesheet`. `node node_modules/@ten98/runtime/check.mjs --update-presentation-baseline .` lowers the baseline as screens move onto `@ten98/ui`, and refuses to record a rise. Known limit: `element` counts lowercase host tags, namespaced tags and member tags whose root is not a `@ten98/ui` import. It never counts a capitalised component, whether it comes from `@ten98/ui` or from the app, so it measures host tags and styling, not whether a component comes from the design system. Raw HTML moved into an app-local component is still counted in that component's own file.
+
+Five more rules have a target of zero. `t98-selector` counts the `.css` and `.pcss` files under the roots; the other four count every script file there (`.js`, `.jsx`, `.ts`, `.tsx` and their `.mjs`, `.cjs`, `.mts` and `.cts` forms, not `.d.ts`). Test and story files under the roots count for these rules like any other file.
+- **`native-dialog`:** calls to `confirm`, `alert` and `prompt`.
+  - It counts them as members of `window`, `globalThis` or `self`, or of a chain of those (`window.window.confirm`).
+  - Optional calls count (`window.confirm?.(…)`, `window?.confirm(…)`), and so do literal bracket keys (`window['confirm']`), TypeScript casts (`(window as any)`, `<any>window`, `satisfies`), `.call`, `.apply` and `.bind`, and tagged templates.
+  - A bare call counts too, unless the file declares a binding of that name anywhere: a variable, a function, a parameter, a catch parameter or an import.
+  - Use `useConfirmDialog` from `@ten98/ui` instead.
+- **`router-blocker`:** the router exports that block navigation, imported from `@tanstack/react-router`, `react-router` or `react-router-dom`, aliased or not.
+  - Those exports are `useBlocker`, `unstable_useBlocker`, `usePrompt`, `unstable_usePrompt` and TanStack's `<Block>`.
+  - Every `require(…)` and dynamic `import(…)` of those packages counts as well, whatever is taken from it.
+  - It counts imports, not calls, so a file at its baseline can add blocker calls through an import it already has.
+  - A type-only import doesn't count, and neither does the register's `leaveGuardAdapter`, when it names one.
+  - Use `useLeaveGuard`, passing the adapter as its `useBlocker`.
+- **`t98-selector`:** selectors in the app's stylesheets that name a library class.
+  - That is a class selector (`.t98-…`), or an attribute selector on `class` whose value holds `t98`, with or without the hyphen (`[class*="t98"]`, `[class^=t98]`, `[class|=t98]`, `[class~="t98-card"]`).
+  - Each selector in a list counts once.
+  - The scanner skips comments and keeps strings whole. It reads the selectors inside `@media`, `@supports`, `@layer` and nested rules, and the prelude of `@scope (.t98-card)`.
+  - It never counts the public custom properties, read (`var(--t98-space-4)`) or declared (`--t98-accent: …`), or any other attribute selector (`[data-theme]`, `[data-density]`, `[data-t98-…]`).
+- **`t98-class`:** each string in a `className` or `class` attribute that names a `t98-` class. A string is a literal, a template's literal parts, or a `+` concatenation of literals (`'t98' + '-button'`).
+- **`t98-dom`:** DOM calls whose arguments name a library class or a `data-t98` attribute. Any argument counts, not only the first.
+  - The calls are `querySelector`, `querySelectorAll`, `closest`, `matches`, `getElementsByClassName`, `getAttribute`, `setAttribute`, `hasAttribute`, `removeAttribute` and `toggleAttribute`.
+  - The first four take a selector, so they also count an attribute selector on `class` that names the library, as `t98-selector` does (`querySelector('[class*="t98"]')`, `closest('[class^=t98]')`).
+  - So are `classList.add`, `.remove`, `.toggle`, `.contains` and `.replace`.
+  - An assignment to `className` (`el.className = 't98-a'`) counts too.
+
+**Private and public.** Every `t98-` class and every `data-t98-*` attribute is private to `@ten98/ui`, including `.t98-theme`, `data-t98-shortcut-scope` and `data-t98-shortcut-modal`. An app reaches the library only through its components, hooks and public API. Two things are public, and no rule counts them:
+- the `--t98-*` custom properties (the design tokens), both read with `var(--t98-…)` and declared (`--t98-accent: …`) to set a theme;
+- the `data-theme` and `data-density` attributes.
+
+Every run prints the remaining total of each of these five rules across all files, pass or fail. The totals are printed even when an earlier check, such as the manifest check, fails first, provided the parser and the roots resolve. When they don't, or a file can't be parsed, the run prints that the totals are unavailable and why.
+
+The baseline records the rules it was recorded for under `"$rules"`.
+- A baseline from before these rules has no `"$rules"`, and may hold only the five older rules. `--update-presentation-baseline` records the new rules once from current counts, alongside lowering the older ones. From then on it only lowers them.
+- `"$rules"` must list known rules, including the five older ones and every rule the baseline's entries use. The check and the update refuse a baseline that breaks this, or that repeats a key in one object.
+- A rule with an entry anywhere in the baseline is never re-recorded, whatever `"$rules"` says.
+- The update also refuses while the shared-flow register has errors. Name the adapter, if the app has one, before recording, or the adapter's own `useBlocker` import is recorded under `router-blocker`.
+- **Reviewer check.** The check can't tell a recording from a re-recording, so two edits let the update record afresh at a higher count: deleting one of the five newer rules from `"$rules"` together with every entry that uses it, and deleting the baseline file. Each shows in the diff of `presentation-baseline.json`. Look in every pull request for a rule removed from `"$rules"`, a deleted file or a count that rose, and ask why.
+
+The rules read a real syntax tree, so a comment or a string that mentions `window.confirm` doesn't count. They are signals, not proof; the cross-app acceptance form is still how layout and wording differences are caught in the running apps. They don't see:
+- **Dialogs:**
+  - one taken into a variable (`const ask = window.confirm`) or reached through a computed key (`window[name]`);
+  - one passed as a value, for example as a callback (`run(window.confirm)`) or through a comma (`(0, window.alert)(…)`);
+  - one reached through `top`, `parent`, `frames` or `document.defaultView`, or called inside a dependency;
+  - a stub or spy on them (`window.confirm = …`, `vi.spyOn(window, 'confirm')`).
+- **Navigation blocking:**
+  - a router imported under a namespace (`import * as Router`), or re-exported by an app module;
+  - `router.history.block(…)` and `beforeunload` handlers.
+- **Stylesheets:**
+  - CSS-in-JS, styles built at run time, and stylesheets outside the roots;
+  - preprocessor files (`.scss`, `.less`), and an `@import` of an outside sheet;
+  - CSS escapes in a selector (`.\74 98-card`).
+- **Class names:**
+  - an object-literal spread (`{...{ className: 't98-a' }}`), and other props that carry classes (`classNames`, `contentClassName`);
+  - `t98-` names passed through a variable or a helper defined in another file.
+- **DOM access:**
+  - walking a flow's markup through refs (`ref.current.firstElementChild`);
+  - queries by tag or role into a flow's container (`querySelector('button')`), and selectors built at run time;
+  - `dataset.t98…`, and mutation observers.
+
+## Shared-flow register
+
+Common features use the design system's shared flows rather than each app building its own. `@ten98/ui` ships the list of those flows as `shared-flows.json` at its package root, exported as `@ten98/ui/shared-flows.json`, from 0.40.0:
+
+```json
+{ "schemaVersion": 1, "features": { "team": { "exports": [{ "name": "TeamFlow", "entry": "@ten98/ui", "since": "0.5.0" }] } } }
+```
+
+The check reads that list from the app's own installed `@ten98/ui`, the way it finds rolldown, so each app is held to the list of the release it pins. Nothing is copied into this repository: `architecture.json` names only the register file and the first `@ten98/ui` release that ships the list (`firstUiVersion`). That version appears only in the message for a missing list. The check fails closed when the installed `@ten98/ui` has no list. It also refuses:
+- a list it can't parse;
+- one whose `schemaVersion` isn't 1;
+- one with no features;
+- an entry without exports.
+
+`since` is shown in messages only. Each installed list already belongs to its own release, so the check doesn't compare `since` with anything.
+
+Each app commits its own `shared-flows.json` at its root, with one entry for each feature in the list:
+
+```json
+{
+  "leaveGuardAdapter": "src/lib/leave-guard.ts",
+  "features": {
+    "team": { "status": "uses" },
+    "date-range": { "status": "absent", "reason": "The app has no date filters; every report covers a single day." },
+    "provider-credentials": { "status": "exception", "reason": "Streams deployment-sourced secrets the flow can't show yet (design system F3).", "review": { "ui": "0.42.0" } }
+  }
+}
+```
+
+The check refuses:
+- **Missing or unknown features:** a feature in the list that is missing from the file, and a feature in the file that isn't in the list.
+- **The wrong file shape:** a file with no features, and a key repeated within one object.
+- **`uses` without a real use:** some non-test file under the roots must render every one of the feature's exports as a JSX element (`<TeamFlow`, `<TeamFlow.Section`, `<Ui.TeamFlow`), or call it, for hooks and functions (`useConfirmDialog()`, `saveFile.call(…)`).
+  - `memo(TeamFlow)`, `React.memo(TeamFlow)` and `createElement(TeamFlow)` render it as a tag does, and so does `component: TeamFlow` (or `Component: TeamFlow`) in an object literal, as route configs write it.
+  - The export must come from its `entry`. A named import counts, aliased or not, and so do a namespace import (`Ui.TeamFlow`, or `const { TeamFlow } = Ui`) and an import through the app's own modules (`export * from '@ten98/ui'`, `export { TeamFlow } from '@ten98/ui'`, or an import exported again, reached through relative paths, with or without an extension or a trailing slash).
+  - A module's own export of a name wins over its `export *`, as in ES modules. A barrel that declares or re-exports its own `TeamFlow` beside `export * from '@ten98/ui'` hands the app's component on, so an import of `TeamFlow` through it is not an import of the shared flow.
+  - These don't count:
+    - an import that is never rendered or called;
+    - a value or member use (`{ team: TeamFlow }`, `TeamFlow.displayName`, `void TeamFlow`), and a re-export on its own;
+    - a type-only import or use;
+    - an import from another entry (`@ten98/ui/app`);
+    - a local of the same name that isn't the import, such as a parameter or a nearer declaration;
+    - any use in a test, mock or story file (`*.test.*`, `*.spec.*`, `*.stories.*`, `*.story.*`, `test-utils.*`, or under `__tests__/`, `__mocks__/` or `tests/`).
+- **`absent` problems:** an entry without a reason, or with the export imported anywhere under the roots. That includes a named import, a namespace member or destructuring, a named re-export (`export { TeamFlow } from '@ten98/ui'`), an app module that re-exports `@ten98/ui` whole (`export * from`, `export * as`), and an import in a test file. A namespace import that is passed on whole (`render(Ui)`, `export { Ui }`, `{ ...Ui }`) or read with a computed key (`Ui[name]`) counts as importing every export of the package. A type-only import or re-export doesn't count.
+- **`exception` problems:** an entry without a reason or without a review trigger. The trigger is one of:
+  - `{ "ui": "<x.y.z>" }`, preferred. It must be a later `@ten98/ui` release than the installed one, in the same major, and at most two minor releases ahead (from 0.40.x, up to 0.42.z). A further trigger is refused; choose a nearer review point.
+  - `{ "issue": "https://github.com/Ten98-IO-Company/<repo>/issues/<n>" }`.
+- **A due trigger:** a `ui` trigger once the installed `@ten98/ui` has reached it.
+  - Versions compare by SemVer precedence: a prerelease (`0.41.0-rc.1`) is below its release, and build metadata is ignored.
+  - An installed version that isn't SemVer makes every `ui` trigger due.
+  - Review a due entry, and either move it to `uses` or write a new reason and trigger.
+- **Bad values:** a reason that is empty or longer than 500 characters, and a status other than `uses`, `absent` or `exception`.
+- **A bad adapter:** a `leaveGuardAdapter` that is given but doesn't name a script file under the presentation roots.
+- **A register outside the app:** one whose real path isn't inside the app's folder because a link takes it out (a symlink, or a junction on Windows), or whose folder is missing. The check never reads or writes through such a link.
+
+`leaveGuardAdapter` is optional. The adapter is the function the app passes to `useLeaveGuard` as its `useBlocker` (`@ten98/ui`'s `LeaveGuardBlocker` type). The file it names is the one file whose router-blocker imports the `router-blocker` rule doesn't count. When it is left out, no file is exempt, and every such import counts. The check doesn't look inside the adapter, so it can be any script under the roots; the reviewer checks that it is only the adapter.
+
+`node node_modules/@ten98/runtime/check.mjs --record-shared-flows .` writes the first register.
+- It marks `uses` wherever every export is already rendered or called.
+- It writes every other feature as an `exception` with an empty reason and no trigger, and leaves `leaveGuardAdapter` out.
+- Those exceptions fail until someone writes them, as the first raw-statement allowlist does.
+- It refuses to replace an existing register.
+
+The register is a written record that the check holds to a few facts. It can't see:
+- whether an `issue` trigger has been resolved. The check can't read issues, so the reviewer checks it;
+- whether an `absent` feature really is absent. That is a written claim, and the reviewer checks it against the shared-flow table in the stack-standard brief;
+- a mode of a flow. Workspace and project rename are modes of `WorkspaceCreateFlow` and `ProjectCreateFlow`; the check sees the export, not the prop that selects the mode;
+- a flow that is rendered but wrapped, restyled, hidden or emptied by its props;
+- a flow rendered only inside a function that nothing calls;
+- a flow rendered for one route while a hand-built version of the same feature serves another;
+- an import through a dynamic `import()` (`lazy(() => import(…))` included), `require(…)`, a deep path (`@ten98/ui/dist/…`) or a path alias (`@/ui`). None of these counts as an import for `absent`, or as a use for `uses`;
+- a flow taken under another name before it is rendered (`const Flow = TeamFlow; <Flow />`), and a barrel that rebinds it (`export const Flow = TeamFlow`) or exports it as `default`. A truthful `uses` through one of these is refused until the flow is rendered by its own name;
+- a flow reached through a ring of barrels that rename it on the way round: the search follows each module once;
+- a use through a namespace re-export (`export * as Ui from '@ten98/ui'`) in another module. The re-export itself counts as an import for `absent`, but not as a use.
 
 ## Browser test library
 
