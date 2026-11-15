@@ -301,17 +301,18 @@ test('architecture detects actual drift without consulting the contract for expe
   }
 });
 
-test('CLI checks the compiler-backed runtime and returns failure for any drift', () => {
+// The check it spawns compiles the package twice; on a loaded machine one pass took 80 s, so each gets 180 s.
+test('CLI checks the compiler-backed runtime and returns failure for any drift', { timeout: 400_000 }, () => {
   const temporary = mkdtempSync(join(tmpdir(), 'ten98-architecture-'));
   try {
     const manifest: PackageManifest & { dependencies: StringMap } = { name: '@ten98/runtime', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' }, dependencies: {}, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test' } }, file = join(temporary, 'package.json');
     writeFileSync(file, JSON.stringify(manifest));
     const script = fileURLToPath(new URL('../check.mjs', import.meta.url));
     const actual = fileURLToPath(new URL('..', import.meta.url));
-    let result = spawnSync(process.execPath, [script, actual, actual], { encoding: 'utf8', timeout: 60_000 });
+    let result = spawnSync(process.execPath, [script, actual, actual], { encoding: 'utf8', timeout: 180_000 });
     assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout.split('architecture declarations match').length - 1, 2);
     manifest.dependencies.express = '5.0.0'; writeFileSync(file, JSON.stringify(manifest));
-    result = spawnSync(process.execPath, [script, temporary], { encoding: 'utf8', timeout: 60_000 });
+    result = spawnSync(process.execPath, [script, temporary], { encoding: 'utf8', timeout: 180_000 });
     assert.equal(result.status, 1); assert.match(result.stderr, /Unapproved runtime dependency express/);
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 });

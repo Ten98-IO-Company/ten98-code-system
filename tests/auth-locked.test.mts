@@ -517,7 +517,7 @@ test('signInWithPassword costs the same for unknown, current, legacy and passwor
   const medians = samples.map(({ times, work }) => [middle(times), middle(work)] as const);
   const spread = (values: number[]) => Math.max(...values) / Math.min(...values);
   const shown = medians.map(([time, cpu]) => `${time.toFixed(0)} ms, ${cpu.toFixed(0)} ms CPU`).join(' / ');
-  assert.ok(spread(medians.map(([time]) => time)) < 1.6, shown);
+  // Wall time is shown, not asserted: other processes on the machine move it. The work done is this process's own.
   // A skipped dummy derivation drops the work by about 40% (a spread near 1.7); load alone stays well under 1.45.
   assert.ok(spread(medians.map(([, cpu]) => cpu)) < 1.45, shown);
 });
@@ -552,24 +552,34 @@ test('signInWithPassword replaces a legacy hash once, under the lock, however ma
 test('60 parallel wrong passwords at one account on a pool of 10: 50 × 401, 10 × 429, no connect timeout, the pool stays usable', { skip }, async () => {
   const email = address('flood');
   await account_(email);
-  const flood = new pg.Pool({ connectionString: url, max: 10, connectionTimeoutMillis: 5000 });
+  // A generous connect timeout: under a loaded machine a slow connect is not the defect; a stall shows below as held
+  // connections, whatever the machine's speed.
+  const flood = new pg.Pool({ connectionString: url, max: 10, connectionTimeoutMillis: 30_000 });
   try {
     const floodDb = drizzle(flood, { schema });
-    const floodAuth = authOver(floodDb);
+    // Fifty verifications two at a time take about 25 rounds; on a loaded machine that passes the default 15 s queue wait,
+    // which is not what this checks, so the wait here is two minutes.
+    const floodAuth = authOver(floodDb, { passwordVerification: { waitMs: 120_000 } });
     // Campaign's limiter shape: one conditional upsert per attempt, 50 per account.
-    const limit = async ({ email: account }: { email: string }) => (await flood.query(
-      'INSERT INTO login_limits VALUES ($1, 1) ON CONFLICT (key) DO UPDATE SET count = login_limits.count + 1 WHERE login_limits.count < 50', [`email:${account}`])).rowCount === 1;
+    let limited = 0, allLimited: () => void = () => {};
+    const counted = new Promise<void>(resolve => { allLimited = resolve; });
+    const limit = async ({ email: account }: { email: string }) => {
+      const allowed = (await flood.query('INSERT INTO login_limits VALUES ($1, 1) ON CONFLICT (key) DO UPDATE SET count = login_limits.count + 1 WHERE login_limits.count < 50', [`email:${account}`])).rowCount === 1;
+      if (++limited === 60) allLimited();
+      return allowed;
+    };
     const attempts = Array.from({ length: 60 }, () => floodAuth.signInWithPassword(floodDb, { source: SOURCE, email, password: 'wrong password guess' }, accountStep(limit))
       .then(response => String(response.status), (error: Error) => `error: ${error.message}`));
-    await delay(300);
-    const started = performance.now();
+    // Once every limiter call has answered, the attempts left are verifying their passwords, two at a time. A stalled
+    // design held a pool connection through each verification; this one holds at most the two short credential reads.
+    await counted;
+    let held = 0;
+    for (let sample = 0; sample < 100; sample++) { held = Math.max(held, flood.totalCount - flood.idleCount); await delay(5); }
     await flood.query('SELECT 1');
-    const probe = performance.now() - started;
     const outcomes = await Promise.all(attempts);
     const tally = (value: string) => outcomes.filter(outcome => outcome === value).length;
     assert.deepEqual([tally('401'), tally('429'), outcomes.filter(outcome => outcome.startsWith('error')).length], [50, 10, 0], [...new Set(outcomes)].join(', '));
-    // A stalled pool kept other requests waiting about 10 s; under a loaded test run a free one answers within 2.5 s.
-    assert.ok(probe < 2500, `another request waited ${probe.toFixed(0)} ms for a connection`);
+    assert.ok(held <= 2, `${held} connections were held while passwords were verified`);
   } finally { await flood.end(); }
 });
 
@@ -1415,9 +1425,9 @@ test('a right password on an unusable account answers at a wrong password\'s cos
     const medians = samples.map(({ times, work }) => [middle(times), middle(work)] as const);
     const spread = (values: number[]) => Math.max(...values) / Math.min(...values);
     const shown = medians.map(([time, cpu]) => `${time.toFixed(0)} ms, ${cpu.toFixed(0)} ms CPU`).join(' / ');
-    // A further derivation for the unusable account would add a third to a half of the work.
+    // A further derivation for the unusable account would add a third to a half of the work. Wall time is shown, not
+    // asserted: other processes on the machine move it.
     assert.ok(spread(medians.map(([, cpu]) => cpu)) < 1.3, shown);
-    assert.ok(spread(medians.map(([time]) => time)) < 1.4, shown);
   }
 });
 
@@ -1486,12 +1496,23 @@ test('the email index may be lower(email), lower(email::text) on varchar or a un
 
 // One shared verification slot and one lane slot, nothing waiting: a flood fills the shared slot at once.
 const narrow = { passwordVerification: { concurrency: 1, queue: 0, knownDevices: { concurrency: 1, queue: 0 } } };
-// Holds the shared slot for one verification (about a quarter of a second) and lets it be taken first.
-async function holdShared(target: Ten98Auth) {
-  const held = target.signInWithPassword(db, { source: 'ip:holder', email: address('holder'), password: 'wrong password guess' }, allow);
-  await delay(40);
-  return held;
+// Holds a verification slot until released: the shared one, or with a known-device cookie the lane. The holder's sign-in
+// runs on a pool of one connection; the test takes that connection the moment the holder's limiter answers (after its
+// device claim), so the holder takes its slot and then waits for the connection to read its credential. The slot is held
+// for exactly as long as the test needs, however loaded the machine.
+async function holdSlot(target: Ten98Auth, email = address('holder'), cookie = '') {
+  const parked = new pg.Pool({ connectionString: url, max: 1 });
+  const parkedDb = drizzle(parked, { schema });
+  await target.assertSchema(parkedDb);
+  let taken: Promise<pg.PoolClient> | undefined;
+  const held = target.signInWithPassword(parkedDb, { source: `ip:${randomUUID()}`, email, password: 'wrong password guess', headers: cookie ? { cookie } : {} },
+    { source: () => true, account: () => { taken = parked.connect(); return true; } });
+  while (!taken) await delay(5);
+  const blocker = await taken;
+  while (parked.waitingCount === 0) await delay(5);
+  return { held, release: async () => { blocker.release(); const response = await held; await parked.end(); return response; } };
 }
+const holdShared = (target: Ten98Auth) => holdSlot(target);
 const attempt = (target: Ten98Auth, email: string, password: string, cookie = '', limit: (attempt: PasswordAttempt) => boolean = () => true) =>
   target.signInWithPassword(db, { source: `ip:${randomUUID()}`, email, password, headers: cookie ? { cookie } : {} }, accountStep(limit));
 
@@ -1500,14 +1521,12 @@ test('a distributed flood fills the shared queue; a known device still signs in 
   const email = address('lane');
   await account_(email);
   const browser = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
-  const flood = Array.from({ length: 20 }, () => attempt(flooded, address('flood'), 'wrong password guess').then(response => response.status));
-  await delay(20);
-  const started = performance.now();
+  const held = await holdShared(flooded);
+  const statuses = await Promise.all(Array.from({ length: 20 }, () => attempt(flooded, address('flood'), 'wrong password guess').then(response => response.status)));
   const signedIn = await attempt(flooded, email, PASSWORD, browser.header());
+  await held.release();
+  assert.deepEqual(statuses, Array(20).fill(503));
   assert.equal(signedIn.status, 200);
-  assert.ok(performance.now() - started < 3000);
-  const statuses = await Promise.all(flood);
-  assert.ok(statuses.filter(status => status === 503).length >= 15, statuses.join(','));
 });
 
 test('without a verified claim, a real account, an unknown email and a foreign cookie answer alike during a flood', { skip }, async () => {
@@ -1516,8 +1535,7 @@ test('without a verified claim, a real account, an unknown email and a foreign c
   await account_(a);
   await account_(b);
   const aCookie = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email: a, password: PASSWORD }, allow)).header();
-  const held = holdShared(flooded);
-  await delay(0);
+  const held = await holdShared(flooded);
   const outcomes = [];
   for (let round = 0; round < 2; round++) {
     outcomes.push(await answer(await attempt(flooded, b, PASSWORD)));                      // a real account, no cookie
@@ -1525,7 +1543,7 @@ test('without a verified claim, a real account, an unknown email and a foreign c
     outcomes.push(await answer(await attempt(flooded, address('nobody'), PASSWORD, aCookie))); // A's valid cookie, unknown email
     outcomes.push(await answer(await attempt(flooded, b, PASSWORD, aCookie)));             // A's valid cookie, B's email
   }
-  await held;
+  await held.release();
   assert.equal(outcomes[0]!.status, 503);
   for (const outcome of outcomes) assert.deepEqual(outcome, outcomes[0]);
 });
@@ -1539,10 +1557,10 @@ test('a forged or revoked device cookie gets no lane: it is an attempt like any 
   const seen: boolean[] = [];
   const recording = (entry: PasswordAttempt) => { seen.push(entry.knownDevice); return true; };
   await flooded.withLockedAuth(db, id, bound => bound.revokeAllSessions());
-  const held = holdShared(flooded);
+  const held = await holdShared(flooded);
   const forgedOutcome = await attempt(flooded, email, PASSWORD, forged.header(), recording);
   const revokedOutcome = await attempt(flooded, email, PASSWORD, valid.header(), recording);
-  await held;
+  await held.release();
   assert.deepEqual([forgedOutcome.status, revokedOutcome.status, seen], [503, 503, [false, false]]);
 });
 
@@ -1554,12 +1572,11 @@ test('the lane has its own bound: valid cookies beyond it get 503 and take no sh
   const firstCookie = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email: first, password: PASSWORD }, allow)).header();
   const secondCookie = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email: second, password: PASSWORD }, allow)).header();
   // One known device holds the lane; the next is refused instead of spilling into the free shared slot.
-  const laneHolder = attempt(flooded, first, 'wrong password guess', firstCookie);
-  await delay(40);
+  const laneHolder = await holdSlot(flooded, first, firstCookie);
   const beyond = await attempt(flooded, second, 'wrong password guess', secondCookie);
   // The shared slot stayed free throughout: an attempt without a claim still gets it while the lane is full.
   const shared = await attempt(flooded, address('nobody'), 'wrong password guess');
-  assert.deepEqual([beyond.status, shared.status, (await laneHolder).status], [503, 401, 401]);
+  assert.deepEqual([beyond.status, shared.status, (await laneHolder.release()).status], [503, 401, 401]);
   assert.throws(() => authOver(db, { passwordVerification: { knownDevices: { concurrency: 0 } } }), /passwordVerification.knownDevices.concurrency must be/);
 });
 
@@ -1570,13 +1587,12 @@ test('the limiter runs before the lane too: a refused known device gets 429 whil
   await account_(other);
   const mine = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).header();
   const theirs = jar().take(await flooded.signInWithPassword(db, { source: SOURCE, email: other, password: PASSWORD }, allow)).header();
-  const laneHolder = attempt(flooded, other, 'wrong password guess', theirs);
-  await delay(40);
+  const laneHolder = await holdSlot(flooded, other, theirs);
   let asked = 0;
   const refused = await attempt(flooded, email, PASSWORD, mine, entry => { asked++; return entry.knownDevice && false; });
   assert.deepEqual([refused.status, asked], [429, 1]);
   assert.equal(await attempts(id), 0);
-  await laneHolder;
+  await laneHolder.release();
 });
 
 // Races around revokeProviderSessions, each forced: pauseInserts stops one side between two of its statements.
@@ -1857,8 +1873,8 @@ test('a flood the source step refuses never touches the pool: no cookie, a forge
       const waited = performance.now() - started;
       await Promise.all(workers);
       clearInterval(sampler);
-      assert.deepEqual([name, [...statuses], waiters, other.status], [name, [429], 0, 200]);
-      assert.ok(waited < 2500, `${name}: another user's sign-in took ${waited.toFixed(0)} ms`);
+      // No pool waiter while it ran, and another user's sign-in on a fresh source succeeded; its time is not asserted.
+      assert.deepEqual([name, [...statuses], waiters, other.status], [name, [429], 0, 200], `${waited.toFixed(0)} ms`);
     }
     assert.equal(accountAsked, 0);
   } finally { await flood.end(); }
@@ -2166,6 +2182,9 @@ test('only a strict true from isAccountUsable or isIssuerUsable counts as usable
 
 test('a revocation pass a deadlock keeps aborting is retried a bounded number of times, then the error is thrown', { skip }, async () => {
   const failing = new pg.Pool({ connectionString: url, max: 2 });
+  // The schema check runs first, once per database object, on the pool's own query path; done before the patch below.
+  const failingDb = drizzle(failing, { schema });
+  await auth.assertSchema(failingDb);
   let aborted = 0;
   const connect = failing.connect.bind(failing) as () => Promise<pg.PoolClient>;
   (failing as unknown as { connect: () => Promise<pg.PoolClient> }).connect = async () => {
@@ -2180,7 +2199,7 @@ test('a revocation pass a deadlock keeps aborting is retried a bounded number of
     return client;
   };
   try {
-    await assert.rejects(revokeProviderSessions(drizzle(failing, { schema }), 'deadlocked'), (error: unknown) => [error, (error as { cause?: unknown }).cause].some(item => (item as { code?: string } | null)?.code === '40P01'));
+    await assert.rejects(revokeProviderSessions(failingDb, 'deadlocked'), (error: unknown) => [error, (error as { cause?: unknown }).cause].some(item => (item as { code?: string } | null)?.code === '40P01'));
     assert.equal(aborted, 5);
   } finally { await failing.end(); }
 });
@@ -2227,4 +2246,121 @@ test('two concurrent invitation acceptances with one identity: the second waits 
     await b.query('ROLLBACK');
   } finally { a.release(); b.release(); }
   assert.deepEqual([await usersAt(first), await usersAt(second)], [1, 0]);
+});
+
+// ---- Usability checks and schema gates ----
+test('before start-up has run, an unmapped closedAt makes completeOidcSession answer the 500 that names the mapping', { skip }, async () => {
+  const bareSchema = { ...schema, user: bareUser };
+  const bare = createTen98Auth({ database: drizzleAdapter(db, { provider: 'pg', schema: bareSchema }), appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test' });
+  const id = await account_(address('bare-provider'));
+  const response = await providerSignIn(id, 'idp', bare);
+  assert.equal(response.status, 500);
+  assert.match(await response.text(), /closed_at as closedAt/);
+  assert.equal(await sessions(id), 0);
+});
+
+test('the provider functions run the schema check: without the account index they refuse', { skip }, async () => {
+  await pool!.query(`CREATE SCHEMA noidx;
+    CREATE TABLE noidx."user" (LIKE public."user" INCLUDING ALL); CREATE TABLE noidx.session (LIKE public.session INCLUDING ALL);
+    CREATE TABLE noidx.verification (LIKE public.verification INCLUDING ALL); CREATE TABLE noidx.account (LIKE public.account INCLUDING DEFAULTS);`);
+  const missing = new pg.Pool({ connectionString: url, max: 2, options: '-c search_path=noidx,public' });
+  try {
+    const missingDb = drizzle(missing, { schema });
+    const refused = (error: unknown) => error instanceof SchemaMismatchError && /providerId/.test(error.message);
+    await assert.rejects(signInOidcUser(missingDb, { iss: ISSUER, sub: subject(), email: address('noidx'), email_verified: true, name: 'No Index' }, { trustVerifiedEmail: true }), refused);
+    await assert.rejects(revokeProviderSessions(missingDb, 'idp'), refused);
+    assert.equal((await missing.query('SELECT count(*)::int AS n FROM noidx."user"')).rows[0]!.n, 0);
+  } finally { await missing.end(); }
+});
+
+test('completing a challenge counts only a strict true from isAccountUsable as usable', { skip }, async () => {
+  let answer: unknown = true;
+  const strict = authOver(db, { isAccountUsable: () => answer as boolean });
+  const email = address('strict-completion');
+  await account_(email);
+  const session = cookieOf(await strict.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
+  const { totpURI } = await (await strict.handler(post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string };
+  assert.equal((await strict.handler(post('/two-factor/verify-totp', session, { code: totp(totpURI) }))).status, 200);
+  const challenge = cookieOf(await strict.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
+  for (const truthy of [1, 'yes', {}]) {
+    answer = truthy;
+    assert.equal((await strict.verifyTwoFactor(db, post('/two-factor/verify-totp', challenge, { code: totp(totpURI, 1) }))).status, 401, JSON.stringify(truthy));
+  }
+  answer = true;
+  assert.equal((await strict.verifyTwoFactor(db, post('/two-factor/verify-totp', challenge, { code: totp(totpURI, 1) }))).status, 200);
+});
+
+test('the password checks before and under the lock each refuse on their own: a truthy answer, or a closure in between', { skip }, async () => {
+  // Before the lock: a truthy non-true answer is refused there, so the sign-in never waits on the email lock.
+  const email = address('two-checks');
+  const id = await account_(email);
+  const truthy = authOver(db, { isAccountUsable: () => 1 as unknown as boolean });
+  const holder = await pool!.connect();
+  try {
+    await holder.query('SELECT pg_advisory_lock(109859, hashtext($1))', [email]);
+    const started = performance.now();
+    assert.equal((await truthy.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).status, 401);
+    assert.ok(performance.now() - started < 3000);
+  } finally { await holder.query('SELECT pg_advisory_unlock_all()'); holder.release(); }
+  // Under the lock: usable at the check before it, refused (or merely truthy) under it, as for an account closed in between.
+  for (const later of [false, 1]) {
+    let asked = 0;
+    const closing = authOver(db, { isAccountUsable: () => (++asked === 1 ? true : later) as boolean });
+    assert.equal((await closing.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow)).status, 401, String(later));
+    assert.equal(asked, 2);
+  }
+  assert.equal(await sessions(id), 0);
+});
+
+test('a flood of forged device cookies leaves a real known device recognised: a forged id never takes a claim slot', { skip }, async () => {
+  const email = address('forged-flood');
+  await account_(email);
+  const browser = jar().take(await signIn(email));
+  const real = browser.header();
+  let refusedKnown = 0;
+  const refuseEveryAccount = { source: () => true, account: (attempt: PasswordAttempt) => { if (attempt.knownDevice) refusedKnown++; return false; } };
+  // Well-formed entries with ids that do not carry the preset's MAC, for the same account.
+  const forged = () => `${deviceCookie}=${randomBytes(24).toString('base64url')}.${randomBytes(32).toString('base64url').slice(0, 43)}`;
+  const until = performance.now() + 2000;
+  const flood = Array.from({ length: 200 }, async () => {
+    while (performance.now() < until) {
+      await auth.signInWithPassword(db, { source: `ip:${randomUUID()}`, email, password: PASSWORD, headers: { cookie: forged() } }, refuseEveryAccount);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  });
+  await delay(200);
+  const recognised: boolean[] = [];
+  for (let round = 0; round < 10; round++) {
+    await auth.signInWithPassword(db, { source: `ip:${randomUUID()}`, email, password: PASSWORD, headers: { cookie: real } }, accountStep(attempt => { recognised.push(attempt.knownDevice); return false; }));
+  }
+  await Promise.all(flood);
+  assert.deepEqual(recognised, Array(10).fill(true));
+  assert.equal(refusedKnown, 0);
+});
+
+test('closedAt mapped to another column, or to one of the wrong type, is refused at start-up', { skip }, async () => {
+  const wrong = (closedAt: unknown) => pgTable('user', {
+    id: text('id').primaryKey(), name: text('name').notNull(), email: text('email').notNull(), emailVerified: boolean('emailVerified').notNull(), image: text('image'),
+    createdAt: stamp('createdAt').notNull(), updatedAt: stamp('updatedAt').notNull(), twoFactorEnabled: boolean('twoFactorEnabled'), closedAt: closedAt as ReturnType<typeof stamp>,
+  });
+  for (const closedAt of [stamp('updatedAt'), boolean('twoFactorEnabled'), timestamp('closed_at')]) {
+    const misplaced = { ...schema, user: wrong(closedAt) };
+    const misplacedAdapter = (client: unknown) => drizzleAdapter(client as Database, { provider: 'pg', schema: misplaced });
+    const target = createTen98Auth({ database: misplacedAdapter(db), transactionDatabase: misplacedAdapter, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test' });
+    await assert.rejects(target.assertSchema(db), (error: unknown) => error instanceof SchemaMismatchError && /closedAt mapped to/.test(error.message));
+  }
+  assert.equal(await authOver(db).assertSchema(db), undefined);
+});
+
+test('a start-up check that fails for another reason reports that failure, not a missing mapping', { skip }, async () => {
+  const outage = new Error('connection terminated unexpectedly');
+  const failing = (client: unknown) => {
+    const factory = adapterOver(client) as unknown as (options: unknown) => Record<string, (query: { model: string; select?: unknown }) => Promise<unknown>>;
+    return ((options: unknown) => {
+      const real = factory(options);
+      return { ...real, findOne: (query: { model: string; select?: unknown }) => query.model === 'user' && query.select ? Promise.reject(outage) : real.findOne!(query) };
+    }) as unknown as ReturnType<typeof adapterOver>;
+  };
+  const target = createTen98Auth({ database: failing(db), transactionDatabase: failing, appUrl: ORIGIN, secret: SECRET, appName: 'Ten98 Test' });
+  await assert.rejects(target.assertSchema(db), (error: unknown) => error === outage);
 });

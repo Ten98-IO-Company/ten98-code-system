@@ -120,6 +120,16 @@ const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts:
 const devicePrefix = 'known-device', deviceRow = (deviceId: string) => `known-device:${deviceId}`, attemptRow = (deviceId: string) => `known-device-attempt:${deviceId}`;
 type DeviceEntry = { readonly deviceId: string; readonly tag: string; readonly text: string };
 const deviceEntryPattern = /^([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/;
+/**
+ * A device id that carries its own MAC: 16 random bytes (22 characters) and the first 10 characters of an HMAC over them,
+ * so a forged id is told apart before any database read or claim slot. The account tag below still binds it to a user.
+ */
+const newDeviceId = (keys: TokenKeys) => {
+  const random = randomBytes(16).toString('base64url');
+  return random + mac(keys.knownDevice, `device-id\u0000${random}`).slice(0, 10);
+};
+const deviceIdSigned = (keys: TokenKeys, deviceId: string) => deviceId.length === 32
+  && timingSafeEqual(Buffer.from(deviceId.slice(22)), Buffer.from(mac(keys.knownDevice, `device-id\u0000${deviceId.slice(0, 22)}`).slice(0, 10)));
 /** The tag binding a device id to one account: HMAC over userId ‖ deviceId (NUL-separated; neither contains NUL). */
 const deviceTag = (keys: TokenKeys, userId: string, deviceId: string) => mac(keys.knownDevice, `${userId}\u0000${deviceId}`);
 /**
@@ -657,7 +667,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
         await adapter.deleteMany({ model: 'verification', where: [{ field: 'identifier', value: identifier }, { field: 'value', value: userId }] });
       }
     }
-    const deviceId = randomBytes(24).toString('base64url');
+    const deviceId = newDeviceId(keys);
     await context.context.internalAdapter.createVerificationValue({ identifier: deviceRow(deviceId), value: userId, expiresAt: new Date(Date.now() + device.lifetimeSeconds * 1000) });
     const live = await adapter.findMany<{ id: string }>({ model: 'verification', where: [{ field: 'value', value: userId }, { field: 'identifier', operator: 'starts_with', value: 'known-device:' }], sortBy: { field: 'createdAt', direction: 'desc' } });
     for (const stale of live.slice(device.devices)) await adapter.delete({ model: 'verification', where: [{ field: 'id', value: stale.id }] });
@@ -715,10 +725,16 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
    * exists. Through the adapter, whose user model must map closed_at as closedAt: without it the select throws, so the
    * check fails loudly instead of being skipped (instanceSchema refuses such an adapter at start-up).
    */
-  const storedAccount = async (adapter: unknown, where: { field: 'id' | 'email'; value: string }) => {
-    const found = await (adapter as { findOne<T>(query: { model: string; where: { field: string; value: string }[]; select: string[] }): Promise<T | null> })
+  const accountRow = (adapter: unknown, where: { field: 'id' | 'email'; value: string }) =>
+    (adapter as { findOne<T>(query: { model: string; where: { field: string; value: string }[]; select: string[] }): Promise<T | null> })
       .findOne<{ id: string; email: string; closedAt?: Date | null }>({ model: 'user', where: [where], select: ['id', 'email', 'closedAt'] });
-    if (found && found.closedAt === undefined) throw new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
+  // Drizzle cannot build a select of an unmapped field and throws a TypeError: the same 500, naming the mapping, as a row
+  // read without the field, whether or not the start-up check has run.
+  const unmappedClosedAt = () => new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
+  const storedAccount = async (adapter: unknown, where: { field: 'id' | 'email'; value: string }) => {
+    let found: Awaited<ReturnType<typeof accountRow>>;
+    try { found = await accountRow(adapter, where); } catch (error) { if (error instanceof TypeError) throw unmappedClosedAt(); throw error; }
+    if (found && found.closedAt === undefined) throw unmappedClosedAt();
     return found;
   };
   const refusedAccount = async (adapter: unknown, where: { field: 'id' | 'email'; value: string }) => {
@@ -940,9 +956,17 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     await schemaOf(db);
     adapterChecked = recheckable(adapterChecked, async () => {
       // Drizzle cannot build a select of an unmapped field and throws a TypeError; any other failure is reported as it is.
-      try { await storedAccount((await storeOf(auth)).adapter, { field: 'id', value: '' }); } catch (error) {
+      const { adapter } = await storeOf(auth);
+      try { await accountRow(adapter, { field: 'id', value: '' }); } catch (error) {
         if (error instanceof TypeError) throw new SchemaMismatchError(['closedAt (closed_at) in the adapter\'s user model']);
         throw error;
+      }
+      // A Drizzle adapter names the column closedAt maps to: it must be closed_at, a timestamp with time zone. Mapped to
+      // another column (updatedAt, a boolean), every account would read as closed or open by accident.
+      const column = (adapter as { options?: { schema?: Record<string, Record<string, { name?: unknown; columnType?: unknown; withTimezone?: unknown } | undefined> | undefined> } })
+        .options?.schema?.user?.closedAt;
+      if (column && (column.name !== 'closed_at' || column.columnType !== 'PgTimestamp' || column.withTimezone !== true)) {
+        throw new SchemaMismatchError([`closedAt mapped to ${String(column.name)} (${String(column.columnType)}); it must map closed_at, a timestamp with time zone`]);
       }
     });
     return adapterChecked.check;
@@ -969,7 +993,8 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
    */
   const claimDevice = async (db: AnyDatabase, address: string, headers: HeadersInit | undefined): Promise<string | undefined> => {
     const store = await storeOf(auth);
-    const entries = deviceEntries(cookieFrom(headers, store.createAuthCookie(device.cookie).name));
+    // Only entries whose device id carries its own MAC: forged cookies never reach the database or a claim slot.
+    const entries = deviceEntries(cookieFrom(headers, store.createAuthCookie(device.cookie).name)).filter(entry => deviceIdSigned(keys, entry.deviceId));
     if (!entries.length) return undefined;
     // At most `device.claims` claims at once in this process (each one pool read, then one short locked transaction)
     // and a few waiting; past that the browser counts as not known, so its cookie never holds more of the pool than that.
@@ -1337,6 +1362,8 @@ const uniqueViolation = (error: unknown) => [error, (error as { cause?: unknown 
  */
 export async function signInOidcUser(db: AnyDatabase, claims: OidcClaims, provider: OidcProviderTrust, { emailLockKey = 109_859 }: { emailLockKey?: number } = {}): Promise<{ userId: string; created: boolean }> {
   refuseLockedAuth(db, 'signInOidcUser');
+  // The schema check every locked call runs, once per database: without the account index one identity could link twice.
+  await schemaOf(db);
   if (!Number.isInteger(emailLockKey) || emailLockKey < -INT32 || emailLockKey >= INT32) throw new TypeError('emailLockKey must be a 32-bit integer.');
   const key = identityKey(claims?.iss, claims?.sub);
   const found = await linkedUser(db, key);
@@ -1435,6 +1462,7 @@ const revocationPasses = 5;
  */
 export async function revokeProviderSessions(db: AnyDatabase, provider: string): Promise<number> {
   refuseLockedAuth(db, 'revokeProviderSessions');
+  await schemaOf(db);
   const key = providerKey(provider);
   if (key === undefined) throw new TypeError('A provider key is at most 256 characters, not blank, with no control characters.');
   const pass = () => transaction(db, async tx => {
