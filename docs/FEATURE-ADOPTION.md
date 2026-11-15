@@ -134,6 +134,7 @@ Five more rules have a target of zero. `t98-selector` counts the `.css` and `.pc
 - **`t98-class`:** each string in a `className` or `class` attribute that names a `t98-` class. A string is a literal, a template's literal parts, or a `+` concatenation of literals (`'t98' + '-button'`).
 - **`t98-dom`:** DOM calls whose arguments name a library class or a `data-t98` attribute. Any argument counts, not only the first.
   - The calls are `querySelector`, `querySelectorAll`, `closest`, `matches`, `getElementsByClassName`, `getAttribute`, `setAttribute`, `hasAttribute`, `removeAttribute` and `toggleAttribute`.
+  - The first four take a selector, so they also count an attribute selector on `class` that names the library, as `t98-selector` does (`querySelector('[class*="t98"]')`, `closest('[class^=t98]')`).
   - So are `classList.add`, `.remove`, `.toggle`, `.contains` and `.replace`.
   - An assignment to `className` (`el.className = 't98-a'`) counts too.
 
@@ -148,6 +149,7 @@ The baseline records the rules it was recorded for under `"$rules"`.
 - `"$rules"` must list known rules, including the five older ones and every rule the baseline's entries use. The check and the update refuse a baseline that breaks this, or that repeats a key in one object.
 - A rule with an entry anywhere in the baseline is never re-recorded, whatever `"$rules"` says.
 - The update also refuses while the shared-flow register has errors. Name the adapter, if the app has one, before recording, or the adapter's own `useBlocker` import is recorded under `router-blocker`.
+- **Reviewer check.** The check can't tell a recording from a re-recording, so two edits let the update record afresh at a higher count: deleting one of the five newer rules from `"$rules"` together with every entry that uses it, and deleting the baseline file. Each shows in the diff of `presentation-baseline.json`. Look in every pull request for a rule removed from `"$rules"`, a deleted file or a count that rose, and ask why.
 
 The rules read a real syntax tree, so a comment or a string that mentions `window.confirm` doesn't count. They are signals, not proof; the cross-app acceptance form is still how layout and wording differences are caught in the running apps. They don't see:
 - **Dialogs:**
@@ -203,15 +205,17 @@ The check refuses:
 - **Missing or unknown features:** a feature in the list that is missing from the file, and a feature in the file that isn't in the list.
 - **The wrong file shape:** a file with no features, and a key repeated within one object.
 - **`uses` without a real use:** some non-test file under the roots must render every one of the feature's exports as a JSX element (`<TeamFlow`, `<TeamFlow.Section`, `<Ui.TeamFlow`), or call it, for hooks and functions (`useConfirmDialog()`, `saveFile.call(…)`).
-  - The export must come from its `entry`. A named import counts, aliased or not, and so do a namespace import (`Ui.TeamFlow`, or `const { TeamFlow } = Ui`) and an import through the app's own modules (`export * from '@ten98/ui'`, `export { TeamFlow } from '@ten98/ui'`, or an import exported again, reached through relative paths).
+  - `memo(TeamFlow)`, `React.memo(TeamFlow)` and `createElement(TeamFlow)` render it as a tag does, and so does `component: TeamFlow` (or `Component: TeamFlow`) in an object literal, as route configs write it.
+  - The export must come from its `entry`. A named import counts, aliased or not, and so do a namespace import (`Ui.TeamFlow`, or `const { TeamFlow } = Ui`) and an import through the app's own modules (`export * from '@ten98/ui'`, `export { TeamFlow } from '@ten98/ui'`, or an import exported again, reached through relative paths, with or without an extension or a trailing slash).
+  - A module's own export of a name wins over its `export *`, as in ES modules. A barrel that declares or re-exports its own `TeamFlow` beside `export * from '@ten98/ui'` hands the app's component on, so an import of `TeamFlow` through it is not an import of the shared flow.
   - These don't count:
     - an import that is never rendered or called;
     - a value or member use (`{ team: TeamFlow }`, `TeamFlow.displayName`, `void TeamFlow`), and a re-export on its own;
     - a type-only import or use;
     - an import from another entry (`@ten98/ui/app`);
     - a local of the same name that isn't the import, such as a parameter or a nearer declaration;
-    - any use in a test or story file (`*.test.*`, `*.spec.*`, `*.stories.*`, or under `__tests__/`).
-- **`absent` problems:** an entry without a reason, or with the export imported anywhere under the roots. That includes a named import, a namespace member or destructuring, a named re-export (`export { TeamFlow } from '@ten98/ui'`), an app module that re-exports `@ten98/ui` whole (`export * from`, `export * as`), and an import in a test file. A type-only import or re-export doesn't count.
+    - any use in a test, mock or story file (`*.test.*`, `*.spec.*`, `*.stories.*`, `*.story.*`, `test-utils.*`, or under `__tests__/`, `__mocks__/` or `tests/`).
+- **`absent` problems:** an entry without a reason, or with the export imported anywhere under the roots. That includes a named import, a namespace member or destructuring, a named re-export (`export { TeamFlow } from '@ten98/ui'`), an app module that re-exports `@ten98/ui` whole (`export * from`, `export * as`), and an import in a test file. A namespace import that is passed on whole (`render(Ui)`, `export { Ui }`, `{ ...Ui }`) or read with a computed key (`Ui[name]`) counts as importing every export of the package. A type-only import or re-export doesn't count.
 - **`exception` problems:** an entry without a reason or without a review trigger. The trigger is one of:
   - `{ "ui": "<x.y.z>" }`, preferred. It must be a later `@ten98/ui` release than the installed one, in the same major, and at most two minor releases ahead (from 0.40.x, up to 0.42.z). A further trigger is refused; choose a nearer review point.
   - `{ "issue": "https://github.com/Ten98-IO-Company/<repo>/issues/<n>" }`.
@@ -221,6 +225,7 @@ The check refuses:
   - Review a due entry, and either move it to `uses` or write a new reason and trigger.
 - **Bad values:** a reason that is empty or longer than 500 characters, and a status other than `uses`, `absent` or `exception`.
 - **A bad adapter:** a `leaveGuardAdapter` that is given but doesn't name a script file under the presentation roots.
+- **A register outside the app:** one whose real path isn't inside the app's folder because a link takes it out (a symlink, or a junction on Windows), or whose folder is missing. The check never reads or writes through such a link.
 
 `leaveGuardAdapter` is optional. The adapter is the function the app passes to `useLeaveGuard` as its `useBlocker` (`@ten98/ui`'s `LeaveGuardBlocker` type). The file it names is the one file whose router-blocker imports the `router-blocker` rule doesn't count. When it is left out, no file is exempt, and every such import counts. The check doesn't look inside the adapter, so it can be any script under the roots; the reviewer checks that it is only the adapter.
 
@@ -235,8 +240,11 @@ The register is a written record that the check holds to a few facts. It can't s
 - whether an `absent` feature really is absent. That is a written claim, and the reviewer checks it against the shared-flow table in the stack-standard brief;
 - a mode of a flow. Workspace and project rename are modes of `WorkspaceCreateFlow` and `ProjectCreateFlow`; the check sees the export, not the prop that selects the mode;
 - a flow that is rendered but wrapped, restyled, hidden or emptied by its props;
+- a flow rendered only inside a function that nothing calls;
 - a flow rendered for one route while a hand-built version of the same feature serves another;
-- an import through a dynamic `import()`, `require(…)`, a deep path (`@ten98/ui/dist/…`) or a path alias (`@/ui`). None of these counts as an import for `absent`, or as a use for `uses`;
+- an import through a dynamic `import()` (`lazy(() => import(…))` included), `require(…)`, a deep path (`@ten98/ui/dist/…`) or a path alias (`@/ui`). None of these counts as an import for `absent`, or as a use for `uses`;
+- a flow taken under another name before it is rendered (`const Flow = TeamFlow; <Flow />`), and a barrel that rebinds it (`export const Flow = TeamFlow`) or exports it as `default`. A truthful `uses` through one of these is refused until the flow is rendered by its own name;
+- a flow reached through a ring of barrels that rename it on the way round: the search follows each module once;
 - a use through a namespace re-export (`export * as Ui from '@ten98/ui'`) in another module. The re-export itself counts as an import for `absent`, but not as a use.
 
 ## Browser test library

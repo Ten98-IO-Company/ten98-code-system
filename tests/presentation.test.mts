@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import test from 'node:test';
+import type { TestContext } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { checkPresentation, inspectWaivers, presentationTotals, recordSharedFlows, updatePresentationBaseline } from '../check.mjs';
 import type { TotalsReport } from '../check.mjs';
@@ -13,7 +14,7 @@ const fixtures = new URL('./fixtures/presentation/', import.meta.url);
 const profile = 'ten98-campaign';
 const baselineName = 'presentation-baseline.json';
 const registerName = 'shared-flows.json';
-// The design system's list, copied unchanged from ten98-design-system PR #226 at 827f269; it ships in @ten98/ui 0.40.0.
+// The design system's list, copied unchanged from ten98-design-system main d77ce68 (PR #226), to ship in @ten98/ui 0.40.0.
 const uiList = readFileSync(new URL('./fixtures/shared-flows/ui-list.json', import.meta.url), 'utf8');
 const listed: Record<string, { exports: { name: string; entry: string }[] }> = JSON.parse(uiList).features;
 const firstUi: string = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8')).appStack.presentation.sharedFlows.firstUiVersion;
@@ -293,6 +294,11 @@ const ruleCases: [string, string, string, number][] = [
   ['t98-dom', 'src/a.ts', "el.classList.contains('t98-a'); el.classList.replace('a', 't98-b'); el.classList.add('x', 't98-a');", 3],
   ['t98-dom', 'src/a.ts', "el.className = 't98-a'; el.setAttribute('class', 't98-a'); el.getAttribute('data-t98-part'); el.querySelector('.t98' + '-x');", 4],
   ['t98-dom', 'src/a.ts', "el.querySelector('button'); el.querySelector(selector); el.classList.add('wide'); set.add('t98-a'); el.closest(`t98${x}-a`);", 0],
+  // A selector call counts an attribute selector on class as a stylesheet does, in any of its operators and in a list.
+  ['t98-dom', 'src/a.ts', "el.querySelector('[class*=\"t98\"]'); el.querySelectorAll('[class^=t98]'); el.closest('[class|=t98]'); el.matches('div[class~=\"t98\"]');", 4],
+  ['t98-dom', 'src/a.ts', "el.querySelector('p, [class$=\"t98\"]'); document.querySelectorAll(`[class*='t98']`);", 2],
+  // Another class, another attribute, a name that only ends in t98, and calls that take a name rather than a selector.
+  ['t98-dom', 'src/a.ts', "el.querySelector('[class*=\"theme\"]'); el.matches('[title*=\"t98\"]'); el.closest('[data-theme], .x-t98-y'); el.getAttribute('[class*=\"t98\"]'); el.getElementsByClassName('t98');", 0],
   // Public: the theme attributes and the --t98-* custom properties. Not seen: the dataset form.
   ['t98-dom', 'src/a.ts', "el.setAttribute('data-theme', 'dark'); el.style.setProperty('--t98-accent', 'red'); el.matches('[data-density]'); el.setAttribute('style', '--t98-accent: red'); el.dataset.t98Part;", 0],
   // Declaration files are not scanned.
@@ -388,6 +394,9 @@ const sourceSets = (...sets: Record<string, string>[]): Record<string, string>[]
 const usesTeam = register(features => { features.team = { status: 'uses' }; });
 const teamRefused = `${registerName}: team is "uses", but no non-test file under src renders or calls TeamFlow imported from @ten98/ui (shared since @ten98/ui 0.5.0).`;
 const teamAbsentRefused = `${registerName}: team is "absent", but TeamFlow is imported from @ten98/ui.`;
+// `export * from '@ten98/ui'` imports every export, so it also refuses the fixture's absent entries, and a member tag
+// counts as a host element; only team's entry matters in the barrel cases.
+const teamOnly = (errors: string[]): string[] => errors.filter(error => !/is "absent", but| element \d+ exceeds/u.test(error));
 
 test('the register refuses a listed feature it leaves out and a feature the list does not have', needsParser, () => consumer({
   register: register(features => { delete features.team; features['setup-checklist'] = { status: 'absent', reason: 'No checklist.' }; }),
@@ -412,6 +421,14 @@ test('"uses" needs the export rendered or called, outside tests', needsParser, (
     // Test and story files never satisfy it.
     { 'src/page.test.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const T = () => <TeamFlow />;", 'src/page.stories.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const S = () => <TeamFlow />;",
       'src/__tests__/team.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const U = () => <TeamFlow />;", 'src/page.spec.ts': "import * as Ui from '@ten98/ui';\nUi.TeamFlow({});" },
+    // Nor do files under tests/ or __mocks__/, a test-utils file, or a story named in the singular.
+    { 'src/tests/team.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const T = () => <TeamFlow />;", 'src/lib/tests/deep/team.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const D = () => <TeamFlow />;" },
+    { 'src/__mocks__/ui.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const M = () => <TeamFlow />;" },
+    { 'src/test-utils.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const R = () => <TeamFlow />;", 'src/lib/test-utils.jsx': "import { TeamFlow } from '@ten98/ui';\nexport const W = () => <TeamFlow />;" },
+    { 'src/Page.story.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const S = () => <TeamFlow />;" },
+    // A flow handed on under another or a computed key, to another call, as a later argument or as a shadowing parameter is not rendered.
+    { 'src/routes.ts': "import { TeamFlow } from '@ten98/ui';\nexport const a = { components: TeamFlow, element: TeamFlow, [component]: TeamFlow };\nexport const b = memoize(TeamFlow);\nexport const c = memo(Other, TeamFlow);\nexport const d = utils.memo(TeamFlow);" },
+    { 'src/routes.ts': "import { TeamFlow } from '@ten98/ui';\nexport function f(TeamFlow: unknown) { return { component: TeamFlow, view: memo(TeamFlow) }; }" },
   )) {
     consumer({ register: usesTeam, sources }, root => assert.deepEqual(check(root), [teamRefused], JSON.stringify(sources)));
   }
@@ -426,11 +443,106 @@ test('"uses" needs the export rendered or called, outside tests', needsParser, (
     { 'src/ui/index.ts': "export * from '@ten98/ui';", 'src/page.tsx': "import { TeamFlow } from './ui';\nexport const Page = () => <TeamFlow />;" },
     { 'src/ui.ts': "export { TeamFlow as Team } from '@ten98/ui';", 'src/pages/team.tsx': "import { Team } from '../ui.js';\nexport const Page = () => <Team />;" },
     { 'src/ui.ts': "import { TeamFlow } from '@ten98/ui';\nexport { TeamFlow };", 'src/kit.ts': "export * from './ui';", 'src/page.tsx': "import * as Kit from './kit';\nexport const Page = () => <Kit.TeamFlow />;" },
+    // A specifier with a trailing slash names the folder's index.
+    { 'src/ui/index.ts': "export * from '@ten98/ui';", 'src/page.tsx': "import { TeamFlow } from './ui/';\nexport const Page = () => <TeamFlow />;" },
+    // A route config's component, memo and createElement render a flow as <TeamFlow /> does.
+    { 'src/routes.ts': "import { TeamFlow } from '@ten98/ui';\nexport const route = createRoute({ path: '/team', component: TeamFlow });" },
+    { 'src/routes.ts': "import { TeamFlow } from '@ten98/ui';\nexport const routes = [{ path: '/team', Component: TeamFlow }];" },
+    { 'src/routes.ts': "import { TeamFlow } from '@ten98/ui';\nexport const route = { 'component': TeamFlow };" },
+    { 'src/routes.ts': "import * as Ui from '@ten98/ui';\nexport const route = { component: Ui.TeamFlow };" },
+    { 'src/page.ts': "import { memo } from 'react';\nimport { TeamFlow } from '@ten98/ui';\nexport const Page = memo(TeamFlow);" },
+    { 'src/page.ts': "import React from 'react';\nimport { TeamFlow } from '@ten98/ui';\nexport const Page = React.memo(TeamFlow as never);" },
+    { 'src/page.ts': "import { createElement } from 'react';\nimport { TeamFlow } from '@ten98/ui';\nexport const Page = () => createElement(TeamFlow, {});" },
+    { 'src/page.ts': "import React from 'react';\nimport { TeamFlow } from '@ten98/ui';\nexport const Page = () => React.createElement(TeamFlow);" },
+    // Names that only look like test files: a folder that merely ends in "tests", a prefixed helper, "story" without a dot before it.
+    { 'src/contests/team.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const T = () => <TeamFlow />;" },
+    { 'src/my-test-utils.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const T = () => <TeamFlow />;" },
+    { 'src/story.tsx': "import { TeamFlow } from '@ten98/ui';\nexport const T = () => <TeamFlow />;" },
   )) {
-    // `export * from '@ten98/ui'` imports every export, so it also refuses the fixture's absent entries, and a member tag
-    // counts as a host element; only team's entry matters here.
-    consumer({ register: usesTeam, sources }, root => assert.deepEqual(check(root).filter(error => !/is "absent", but| element \d+ exceeds/u.test(error)), [], JSON.stringify(sources)));
+    consumer({ register: usesTeam, sources }, root => assert.deepEqual(teamOnly(check(root)), [], JSON.stringify(sources)));
   }
+});
+
+test('a barrel\'s own export of a name shadows its "export *", so only a genuine re-export of the flow is a use', needsParser, () => {
+  const importer = { 'src/page.tsx': "import { TeamFlow } from './ui';\nexport const Page = () => <TeamFlow />;" };
+  for (const barrel of sourceSets(
+    // The two forms from the review: a declaration beside the star, and a re-export of the app's own component.
+    { 'src/ui.tsx': "export * from '@ten98/ui';\nexport const TeamFlow = () => <div />;" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport { TeamFlow } from './mine';", 'src/mine.tsx': 'export const TeamFlow = () => null;' },
+    // Any other way of exporting the name itself.
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport function TeamFlow() { return null; }" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport class TeamFlow {}" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport const { TeamFlow } = { TeamFlow: () => null };" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nconst TeamFlow = () => null;\nexport { TeamFlow };" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nconst Mine = () => null;\nexport { Mine as TeamFlow };" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport { Mine as TeamFlow } from './mine';", 'src/mine.ts': 'export const Mine = () => null;' },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport * as TeamFlow from './mine';", 'src/mine.ts': 'export const x = 1;' },
+    // The star may come before or after, and the shadow may sit at either barrel of a chain.
+    { 'src/ui.ts': "export const TeamFlow = () => null;\nexport * from '@ten98/ui';" },
+    { 'src/ui.ts': "export * from './kit';", 'src/kit.ts': "export * from '@ten98/ui';\nexport const TeamFlow = () => null;" },
+    { 'src/ui.ts': "export * from './kit';\nexport const TeamFlow = () => null;", 'src/kit.ts': "export * from '@ten98/ui';" },
+    // A re-export that leads back to the app's own component, however far.
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport { TeamFlow } from './again';", 'src/again.ts': "export { TeamFlow } from './mine';", 'src/mine.ts': 'export const TeamFlow = () => null;' },
+  )) {
+    consumer({ register: usesTeam, sources: { ...importer, ...barrel } }, root => assert.deepEqual(teamOnly(check(root)), [teamRefused], JSON.stringify(barrel)));
+  }
+  for (const barrel of sourceSets(
+    // The star alone, and beside an export of another name.
+    { 'src/ui.ts': "export * from '@ten98/ui';" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport const Other = () => null;" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport { Other } from './mine';", 'src/mine.ts': 'export const Other = 1;' },
+    // The genuine flow named beside the star, directly or through another module, even beside a star of the app's own.
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport { TeamFlow } from '@ten98/ui';" },
+    { 'src/ui.ts': "export * from '@ten98/ui';\nexport { TeamFlow } from './again';", 'src/again.ts': "export { TeamFlow } from '@ten98/ui';" },
+    { 'src/ui.ts': "import { TeamFlow } from '@ten98/ui';\nexport * from './mine';\nexport { TeamFlow };", 'src/mine.ts': 'export const TeamFlow = () => null;' },
+    { 'src/ui.ts': "export * from './kit';\nexport * from '@ten98/ui';", 'src/kit.ts': 'export const Mine = 1;' },
+  )) {
+    consumer({ register: usesTeam, sources: { ...importer, ...barrel } }, root => assert.deepEqual(teamOnly(check(root)), [], JSON.stringify(barrel)));
+  }
+});
+
+test('a named re-export is followed only under the name it exports', needsParser, () => {
+  const renamed = { 'src/ui.ts': "export { TeamFlow as Team, ApiKeysFlow as Keys } from '@ten98/ui';" };
+  const both = register(features => { features.team = { status: 'uses' }; features['api-keys'] = { status: 'uses' }; });
+  const apiKeysRefused = `${registerName}: api-keys is "uses", but no non-test file under src renders or calls ApiKeysFlow imported from @ten98/ui (shared since @ten98/ui 0.5.0).`;
+  for (const [page, expected] of [
+    ["import { Team, Keys } from './ui';\nexport const Page = () => <><Team /><Keys /></>;", []],
+    ["import { Team as T } from './ui';\nimport { Keys as K } from './ui';\nexport const Page = () => <><T /><K /></>;", []],
+    // Only the exported name is found: not the original one, another name, or the same name in another case.
+    ["import { Keys } from './ui';\nexport const Page = () => <Keys />;", [teamRefused]],
+    ["import { Team } from './ui';\nexport const Page = () => <Team />;", [apiKeysRefused]],
+    ["import { TeamFlow, ApiKeysFlow } from './ui';\nexport const Page = () => <><TeamFlow /><ApiKeysFlow /></>;", [teamRefused, apiKeysRefused]],
+    ["import { Other, team, keys } from './ui';\nexport const Page = () => <><Other /><team /><keys /></>;", [teamRefused, apiKeysRefused]],
+  ] satisfies [string, string[]][]) {
+    consumer({ register: both, sources: { ...renamed, 'src/page.tsx': page } }, root => assert.deepEqual(check(root).filter(error => !/ element \d+ exceeds/u.test(error)), expected, page));
+  }
+});
+
+test('barrels that re-export each other end the search instead of looping', needsParser, () => {
+  const importer = { 'src/page.tsx': "import { TeamFlow } from './a';\nexport const Page = () => <TeamFlow />;" };
+  for (const [barrels, found] of [
+    // Stars in a ring, with the package starred from one of them.
+    [{ 'src/a.ts': "export * from './b';\nexport * from '@ten98/ui';", 'src/b.ts': "export * from './a';" }, true],
+    [{ 'src/a.ts': "export * from './b';", 'src/b.ts': "export * from './c';", 'src/c.ts': "export * from './a';\nexport * from '@ten98/ui';" }, true],
+    [{ 'src/a.ts': "export * from './a';\nexport * from '@ten98/ui';" }, true],
+    // Named re-exports in a ring, and one of a module's own name, lead nowhere.
+    [{ 'src/a.ts': "export { TeamFlow } from './b';", 'src/b.ts': "export { TeamFlow } from './a';" }, false],
+    [{ 'src/a.ts': "export { TeamFlow } from './a';" }, false],
+    [{ 'src/a.ts': "export * from './b';\nexport { TeamFlow } from './b';", 'src/b.ts': "export * from './a';" }, false],
+  ] satisfies [Record<string, string>, boolean][]) {
+    consumer({ register: usesTeam, sources: { ...importer, ...barrels } }, root => assert.deepEqual(teamOnly(check(root)), found ? [] : [teamRefused], JSON.stringify(barrels)));
+  }
+});
+
+test('"export * as" is not followed as a use of the names it holds, though it counts as an import', needsParser, () => {
+  const barrel = { 'src/ui.ts': "export * as Ui from '@ten98/ui';" };
+  for (const page of [
+    "import { TeamFlow } from './ui';\nexport const Page = () => <TeamFlow />;",
+    "import { Ui } from './ui';\nexport const Page = () => <Ui.TeamFlow />;",
+  ]) {
+    consumer({ register: usesTeam, sources: { ...barrel, 'src/page.tsx': page } }, root => assert.deepEqual(teamOnly(check(root)), [teamRefused], page));
+  }
+  consumer({ sources: barrel }, root => assert.ok(check(root).includes(teamAbsentRefused)));
 });
 
 test('"uses" counts hooks and functions that are called', needsParser, () => {
@@ -474,13 +586,58 @@ test('"absent" needs a reason and no import of the export, in any form the check
   });
 });
 
+test('"absent" also refuses a namespace import that is passed on whole or read by a computed key', needsParser, () => {
+  const page = (use: string) => ({ 'src/page.tsx': `import * as Ui from '@ten98/ui';\n${use}\n` });
+  for (const use of [
+    'export const all = Ui;',
+    'export default Ui;',
+    'export { Ui };',
+    'export { Ui as Kit };',
+    'export const names = Object.keys(Ui);',
+    'register(Ui);',
+    'export const list = [Ui], map = { ui: Ui }, copy = { ...Ui };',
+    'export const cast = Ui as never;',
+    'export const view = <Provider ui={Ui} />;',
+    'export const alone = <Ui />;',
+    'export const flow = Ui[name];',
+    "export const flow = Ui['Team' + 'Flow'];",
+    'export const found = lookup[Ui];',
+    'export const { ...rest } = Ui;',
+    'export const { [name]: flow } = Ui;',
+    'let flow;\n({ TeamFlow: flow } = Ui as never);',
+  ]) consumer({ sources: page(use) }, root => assert.ok(check(root).includes(teamAbsentRefused), use));
+  // A literal member or destructuring names the exports it reaches, so the rest of the package stays absent; a name
+  // that is shadowed, a property of the same name, an attribute and a type are not the namespace.
+  for (const use of [
+    'export const name = Ui.ApiKeysFlow.name;',
+    "export const name = Ui['ApiKeysFlow'], other = Ui?.ApiKeysFlow;",
+    'export const { ApiKeysFlow, SessionListFlow: Sessions = null } = Ui;',
+    'export const view = <Ui.ApiKeysFlow />;',
+    'export const f = (Ui: number) => Ui;\nexport function g() { const Ui = 1; return Ui; }',
+    'export const h = other.Ui + { Ui: 1 }.Ui;',
+    'const value = 1;\nexport { value as Ui };',
+    "export { Ui } from './kit';",
+    "export * as Ui from './kit';",
+    'export const view = <a Ui="x" />;',
+    'type T = typeof Ui.ApiKeysFlow;\nexport const t: typeof Ui | null = null;\nexport const u = (x: unknown) => x as typeof Ui;',
+    // Types in every other position: a return type, a type parameter, type arguments, a heritage clause.
+    'export function f(): typeof Ui | null { return null; }',
+    'export function g<T extends typeof Ui>(x: T) { return x; }',
+    'export const m = new Map<string, typeof Ui>();\nexport const r = useRef<typeof Ui>(null);',
+    'class B<T> {}\nexport class A extends B<typeof Ui> {}',
+    'export class C implements Ui.Contract {}',
+    'export enum E { Ui = 1 }',
+  ]) consumer({ sources: page(use) }, root => assert.ok(!check(root).includes(teamAbsentRefused), use));
+});
+
 test('"exception" needs a reason and a bounded review trigger that has not come due', needsParser, () => {
   const exception = (entry: Record<string, unknown>) => register(features => { features.team = { status: 'exception', ...entry }; });
   const [major, minor] = firstUi.split('.').map(Number);
   const next = `${major}.${minor! + 1}.0`, furthest = `${major}.${minor! + 2}.9`, beyond = `${major}.${minor! + 3}.0`;
   const triggerMissing = `${registerName}: team needs a review trigger, { "ui": "<x.y.z>" } or { "issue": "https://github.com/Ten98-IO-Company/<repo>/issues/<n>" }.`;
   const due = (installed: string, trigger: string) => `${registerName}: team is due for review: @ten98/ui ${installed} has reached ${trigger}; move it to "uses" or record a new reason and trigger.`;
-  const unbounded = (trigger: string) => `${registerName}: team's review trigger ${trigger} is more than two minor releases beyond the installed @ten98/ui ${firstUi}; choose a nearer review point.`;
+  // The rule exactly: the installed major release, at most two minor releases ahead, so a later major is out of range too.
+  const unbounded = (trigger: string) => `${registerName}: team's review trigger ${trigger} is out of range for the installed @ten98/ui ${firstUi}: a trigger stays in the same major release and at most two minor releases ahead, up to ${major}.${minor! + 2}.z; choose a nearer review point.`;
   for (const [entry, expected] of [
     [{ reason: 'Waits for F3.', review: { ui: next } }, []],
     [{ reason: 'Waits for F3.', review: { ui: furthest } }, []],
@@ -495,6 +652,14 @@ test('"exception" needs a reason and a bounded review trigger that has not come 
     [{ reason: 'Waits for F3.', review: { issue: 'https://example.com/1' } }, [triggerMissing]],
     [{ reason: 'Waits for F3.', review: { issue: 'https://github.com/someone-else/repo/issues/1' } }, [triggerMissing]],
     [{ reason: 'Waits for F3.', review: { issue: 'https://github.com/Ten98-IO-Company/ten98-design-system/issues/0' } }, [triggerMissing]],
+    // A repository that is no repository: a path segment of dots, or nothing at all.
+    [{ reason: 'Waits for F3.', review: { issue: 'https://github.com/Ten98-IO-Company/../issues/1' } }, [triggerMissing]],
+    [{ reason: 'Waits for F3.', review: { issue: 'https://github.com/Ten98-IO-Company/./issues/1' } }, [triggerMissing]],
+    [{ reason: 'Waits for F3.', review: { issue: 'https://github.com/Ten98-IO-Company/.../issues/1' } }, [triggerMissing]],
+    [{ reason: 'Waits for F3.', review: { issue: 'https://github.com/Ten98-IO-Company//issues/1' } }, [triggerMissing]],
+    // Real repository names with dots in them, one of them starting with a dot.
+    [{ reason: 'Waits for F3.', review: { issue: 'https://github.com/Ten98-IO-Company/.github/issues/7' } }, []],
+    [{ reason: 'Waits for F3.', review: { issue: 'https://github.com/Ten98-IO-Company/a.b-c_d/issues/7' } }, []],
     [{ reason: 'Waits for F3.', review: { ui: next, issue: 'https://github.com/Ten98-IO-Company/ten98-design-system/issues/220' } }, [triggerMissing]],
     [{ reason: 'Waits for F3.', review: { ui: firstUi } }, [due(firstUi, firstUi)]],
     [{ reason: 'Waits for F3.', review: { ui: beyond } }, [unbounded(beyond)]],
@@ -676,12 +841,13 @@ type Presentation = Record<string, any>;
 const pristine = readFileSync(new URL('../architecture.json', import.meta.url), 'utf8');
 const unparseable = '{ "features": ';
 
-async function declaring(change: (presentation: Presentation, folder: string) => void, run: (checker: Checker, folder: string) => void): Promise<void> {
+// The change gets appStack's presentation policy, the case's own folder and the whole contract, for a case that reaches beyond the policy.
+async function declaring(change: (presentation: Presentation, folder: string, contract: Presentation) => void, run: (checker: Checker, folder: string) => void): Promise<void> {
   const folder = mkdtempSync(join(tmpdir(), 'ten98-declaration-'));
   try {
     for (const name of ['check.mjs', 'database-policy.mjs']) copyFileSync(new URL(`../${name}`, import.meta.url), join(folder, name));
     const contract = JSON.parse(pristine);
-    change(contract.appStack.presentation, folder);
+    change(contract.appStack.presentation, folder, contract);
     writeFileSync(join(folder, 'architecture.json'), JSON.stringify(contract));
     run(await import(pathToFileURL(join(folder, 'check.mjs')).href) as Checker, folder);
   } finally { rmSync(folder, { recursive: true, force: true }); }
@@ -694,8 +860,8 @@ const versionError = `${declaredPath}.firstUiVersion needs a plain x.y.z version
 
 // Each bad declaration, the change that makes it, and the one error it is reported as. The two rows that reach into the
 // case's own folder leave an unparseable register there, so a read of it would be reported as unparseable.
-const badDeclarations: [string, (presentation: Presentation, folder: string) => void, string][] = [];
-const refuse = (what: string, expected: string, change: (presentation: Presentation, folder: string) => void): void => { badDeclarations.push([what, change, expected]); };
+const badDeclarations: [string, (presentation: Presentation, folder: string, contract: Presentation) => void, string][] = [];
+const refuse = (what: string, expected: string, change: (presentation: Presentation, folder: string, contract: Presentation) => void): void => { badDeclarations.push([what, change, expected]); };
 const setRegister = (value: unknown) => (presentation: Presentation): void => { presentation.sharedFlows.register = value; };
 const setVersion = (value: unknown) => (presentation: Presentation): void => { presentation.sharedFlows.firstUiVersion = value; };
 
@@ -723,6 +889,18 @@ refuse('register leaving the app by ..', registerError, (presentation, folder) =
 });
 // register is not a path to a .json file.
 for (const value of ['shared-flows', 'shared-flows.yaml', 'shared-flows.json.bak', '', '.json', 'src/.json', 'shared-flows.json/']) refuse(`register ${JSON.stringify(value)}`, registerError, setRegister(value));
+// register is a file another check reads or writes: a baseline, the manifest, the contract or a compiler project, in any
+// spelling of the same path (a "./" or doubled separators, either separator, another case).
+const collisionError = (value: string) => `${declaredPath}.register ${JSON.stringify(value)} is a file the checks read or write (a baseline, package.json, architecture.json or a compiler project); choose another path.`;
+for (const value of [
+  'presentation-baseline.json', 'raw-statements.json', 'package.json', 'architecture.json', 'tsconfig.json', 'tsconfig.backend.json', 'tests/tsconfig.api.json', 'tests/tsconfig.tests.json', 'tsconfig.tooling.json',
+  './presentation-baseline.json', '.\\raw-statements.json', './/package.json', 'tests//tsconfig.api.json', 'tests\\tsconfig.tests.json', 'Presentation-Baseline.json', 'PACKAGE.json',
+]) refuse(`register ${JSON.stringify(value)}`, collisionError(value), setRegister(value));
+// ... also one that only another profile's policy names.
+refuse('register named as another profile\'s baseline', collisionError('other-baseline.json'), (presentation, _folder, contract) => {
+  contract.profiles['other-app'] = { stack: 'app', data: { roots: ['src'], baseline: 'other-baseline.json' } };
+  presentation.sharedFlows.register = 'other-baseline.json';
+});
 // firstUiVersion is not a string, or not a SemVer version. An array of one version reads as that version to a pattern test.
 for (const value of ['banana', '0.40', '0.40.0.1', 'v0.40.0', '00.40.0', '', ' 0.40.0', 40, null, ['0.40.0']]) refuse(`firstUiVersion ${JSON.stringify(value)}`, versionError, setVersion(value));
 // firstUiVersion is a SemVer version with more than x.y.z: a prerelease or a build part.
@@ -737,8 +915,10 @@ test('the real architecture.json declares its sharedFlows in the shape the check
   assert.deepEqual(inspectWaivers(), []);
 });
 
-test('a sharedFlows declaration refuses only a ".." segment, an absolute path and a version that is not x.y.z', async () => {
-  for (const register of ['shared-flows.json', './shared-flows.json', 'config/flows.json', 'a..b/c.json', '..hidden.json', 'dir/..hidden.json', 'spaced name/flows.json']) {
+test('a sharedFlows declaration refuses only a ".." segment, an absolute path, a file another check uses and a version that is not x.y.z', async () => {
+  // A file of the same name in another folder, or a similar name, is another file.
+  for (const register of ['shared-flows.json', './shared-flows.json', 'config/flows.json', 'a..b/c.json', '..hidden.json', 'dir/..hidden.json', 'spaced name/flows.json',
+    'config/package.json', 'src/presentation-baseline.json', 'raw-statements-2.json', 'tsconfig.app.json', 'package-lock.json']) {
     await declaring(setRegister(register), checker => assert.deepEqual(checker.inspectWaivers(), [], register));
   }
   for (const version of ['0.0.0', '10.20.30', '0.40.100']) await declaring(setVersion(version), checker => assert.deepEqual(checker.inspectWaivers(), [], version));
@@ -781,3 +961,88 @@ test('check.mjs reports a bad sharedFlows declaration instead of throwing, and s
     assert.match(result.stdout, /presentation counts remaining: native-dialog 1, router-blocker 1, t98-selector 0, t98-class 0, t98-dom 0\./);
   }));
 });
+
+// A register path that passes the declaration's lexical check can still lead out of the app through a link. A junction
+// is made without special rights on Windows, and is a symlink elsewhere; a directory symlink on Windows needs the right
+// to make one, so a test that cannot make its link is skipped with the reason.
+const linkKinds = process.platform === 'win32' ? ['junction', 'dir'] as const : ['dir'] as const;
+const unplaced = (declared: string) => `${declared} must be a file inside the app: a link leads it outside the app, or its folder is missing.`;
+const unlinked = `src/leave-guard.ts: router-blocker 1 exceeds baseline 0 ${owned}`;
+
+function linked(t: TestContext, target: string, path: string, kind: 'junction' | 'dir'): boolean {
+  try { symlinkSync(target, path, kind); return true; }
+  catch (error) { t.skip(`cannot make a ${kind} link here: ${(error as NodeJS.ErrnoException).code}`); return false; }
+}
+
+// A consumer whose `link` folder is a link to a folder inside or outside its root, under a declaration naming `link/new.json`.
+async function withLink(t: TestContext, kind: 'junction' | 'dir', where: 'inside' | 'outside', run: (checker: Checker, root: string, target: string) => void): Promise<void> {
+  await declaring(presentation => { presentation.sharedFlows.register = 'link/new.json'; }, checker => consumer({ register: null }, root => {
+    const target = where === 'outside' ? mkdtempSync(join(tmpdir(), 'ten98-outside-')) : join(root, 'inner');
+    try {
+      mkdirSync(target, { recursive: true });
+      if (linked(t, target, join(root, 'link'), kind)) run(checker, root, target);
+    } finally { if (where === 'outside') rmSync(target, { recursive: true, force: true }); }
+  }));
+}
+
+for (const kind of linkKinds) {
+  const noun = kind === 'junction' ? 'a junction' : 'a symbolic link';
+  test(`a register reached through ${noun} that leads out of the app is neither read nor written`, needsParser, t => withLink(t, kind, 'outside', (checker, root, outside) => {
+    const options = { parseAst }, message = unplaced('link/new.json');
+    // A register already there is not read through the link, so its adapter is not exempt either.
+    writeFileSync(join(outside, 'new.json'), JSON.stringify(absentRegister()));
+    assert.deepEqual(checker.checkPresentation(root, profile, options), [message, unlinked]);
+    // Recording creates none there, and says why.
+    rmSync(join(outside, 'new.json'));
+    assert.deepEqual(checker.recordSharedFlows(root, profile, options), [message]);
+    assert.deepEqual(readdirSync(outside), []);
+  }));
+
+  test(`a register reached through ${noun} that stays inside the app is written and read as usual`, needsParser, t => withLink(t, kind, 'inside', (checker, root, inside) => {
+    const options = { parseAst };
+    assert.doesNotMatch(checker.recordSharedFlows(root, profile, options).join('\n'), /must be a file inside the app/);
+    assert.ok(existsSync(join(inside, 'new.json')));
+    assert.doesNotMatch(checker.checkPresentation(root, profile, options).join('\n'), /must be a file inside the app|is missing/);
+    assert.deepEqual(checker.recordSharedFlows(root, profile, options), ['link/new.json already exists; edit it instead of recording it again.']);
+  }));
+}
+
+test('a register whose folder is missing is refused, not written', needsParser, () => declaring(presentation => { presentation.sharedFlows.register = 'missing/new.json'; }, checker => consumer({ register: null }, root => {
+  const message = unplaced('missing/new.json');
+  assert.deepEqual(checker.recordSharedFlows(root, profile, { parseAst }), [message]);
+  assert.deepEqual(checker.checkPresentation(root, profile, { parseAst }), [message, unlinked]);
+  assert.equal(existsSync(join(root, 'missing')), false);
+})));
+
+// The register itself is the link. A junction can only point at a folder, so the target is a folder named like a file.
+for (const target of ['a folder outside the app', 'nothing', 'the app\'s own folder']) {
+  test(`a register that is a link to ${target} is refused, not read or written through`, needsParser, t => consumer({ register: null }, root => {
+    const outside = mkdtempSync(join(tmpdir(), 'ten98-outside-'));
+    try {
+      const place = target === 'the app\'s own folder' ? root : join(outside, 'target.json');
+      if (target === 'a folder outside the app') mkdirSync(place);
+      if (!linked(t, place, join(root, registerName), 'junction')) return;
+      assert.deepEqual(checkPresentation(root, profile, { parseAst }), [unplaced(registerName), unlinked]);
+      assert.deepEqual(recordSharedFlows(root, profile, { parseAst }), [unplaced(registerName)]);
+      assert.deepEqual(readdirSync(outside), target === 'a folder outside the app' ? ['target.json'] : []);
+      if (target === 'a folder outside the app') assert.deepEqual(readdirSync(place), []);
+    } finally { rmSync(outside, { recursive: true, force: true }); }
+  }));
+}
+
+for (const kind of linkKinds) {
+  test(`an app folder that is itself reached through ${kind === 'junction' ? 'a junction' : 'a symbolic link'} keeps its register`, needsParser, t => consumer({ register: null }, root => {
+    const alias = `${root}-alias`;
+    if (!linked(t, root, alias, kind)) return;
+    try {
+      assert.doesNotMatch(recordSharedFlows(alias, profile, { parseAst }).join('\n'), /must be a file inside the app/);
+      assert.ok(existsSync(join(root, registerName)));
+      assert.doesNotMatch(checkPresentation(alias, profile, { parseAst }).join('\n'), /must be a file inside the app|is missing/);
+    } finally { rmSync(alias); }
+  }));
+}
+
+test('a register whose name starts with two dots is inside the app', needsParser, () => declaring(presentation => { presentation.sharedFlows.register = '..flows.json'; }, checker => consumer({ register: null }, root => {
+  assert.doesNotMatch(checker.recordSharedFlows(root, profile, { parseAst }).join('\n'), /must be a file inside the app/);
+  assert.ok(existsSync(join(root, '..flows.json')));
+})));

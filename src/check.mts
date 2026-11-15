@@ -1,6 +1,6 @@
 import { inspectDatabasePolicy } from './database-policy.mjs';
 import { readFileSync, writeFileSync, realpathSync, existsSync, readdirSync, lstatSync } from 'node:fs';
-import { resolve, relative, basename, dirname, posix } from 'node:path';
+import { resolve, relative, basename, dirname, isAbsolute, join, posix } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -386,11 +386,17 @@ const CLASS_LIST = new Set(['add', 'remove', 'toggle', 'contains', 'replace']);
 // A library class (`t98-…` on its own, so neither a longer name nor the public `--t98-…` custom properties), and in
 // DOM calls also a private `data-t98…` attribute. `data-theme` and `data-density` are public and never match.
 const LIBRARY_CLASS = /(?<![\w-])t98-/u, LIBRARY_DOM = /(?<![\w-])t98-|data-t98/u;
+// A selector argument also names the library when a stylesheet's selector would, as `[class*="t98"]` does.
+const SELECTOR_QUERIES = new Set(['querySelector', 'querySelectorAll', 'closest', 'matches']);
+const namesLibrary = (method: string, text: string): boolean => LIBRARY_DOM.test(text) || SELECTOR_QUERIES.has(method) && selectorsNamingLibrary(text) > 0;
+// Calls that render their first argument as `<X />` does.
+const RENDER_CALLS = new Set(['memo', ...CREATE_ELEMENT]);
 const SCRIPT = /\.(?:[cm]?[jt]s|[jt]sx)$/u, STYLESHEET = /\.p?css$/u;
-// Test and story files count for the ratchets and as imports, but never satisfy "uses".
-const TEST_FILE = /(?:^|\/)__tests__\/|\.(?:test|spec|stories)\.[cm]?[jt]sx?$/u;
+// Test, mock and story files count for the ratchets and as imports, but never satisfy "uses".
+const TEST_FILE = /(?:^|\/)(?:__tests__|__mocks__|tests)\/|(?:^|\/)test-utils\.[cm]?[jt]sx?$|\.(?:test|spec|stories|story)\.[cm]?[jt]sx?$/u;
 const RESOLVED_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'];
-const ISSUE_URL = /^https:\/\/github\.com\/Ten98-IO-Company\/[A-Za-z0-9._-]+\/issues\/[1-9]\d*$/u;
+// A repository name made only of dots is a path segment ("..", "."), not a repository.
+const ISSUE_URL = /^https:\/\/github\.com\/Ten98-IO-Company\/(?!\.+\/)[A-Za-z0-9._-]+\/issues\/[1-9]\d*$/u;
 // A register path is a .json file name with something before the extension, relative to the app and below it. Both
 // separators count, so a Windows-style `..\x.json`, `\x.json` or `C:\x.json` is refused on every platform.
 const REGISTER_FILE = /[^/\\]\.json$/u, OUTSIDE_APP = /^[/\\]|^[A-Za-z]:|(?:^|[/\\])\.\.(?:[/\\]|$)/u;
@@ -408,7 +414,12 @@ interface SharedFlowRegister { leaveGuardAdapter: unknown; features: Record<stri
 // `imported` and `used` hold exportKeys; `importedAll` the packages an app module re-exports whole.
 interface PresentationScan { counts: PresentationCounts; errors: string[]; incomplete: string[]; files: Set<string>; imported: Set<string>; used: Set<string>; importedAll: Set<string> }
 // What one script file imports (with whether a non-test file renders or calls it) and re-exports, by source specifier.
-interface ModuleFacts { imports: { source: string; name: string; used: boolean }[]; reexports: { source: string; name: string; exported: string }[]; exportAll: { source: string; whole: boolean }[] }
+// `named` holds every name the file exports itself, by a declaration, a list or a named re-export; each shadows an
+// `export *` of the same name. `wholeNamespaces` holds the packages whose namespace import it hands on or reads by a computed key.
+interface ModuleFacts {
+  imports: { source: string; name: string; used: boolean }[]; reexports: { source: string; name: string; exported: string }[];
+  exportAll: { source: string; whole: boolean }[]; named: Set<string>; wholeNamespaces: string[];
+}
 
 const exportKey = (entry: string, name: string): string => `${entry}\n${name}`;
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
@@ -539,11 +550,25 @@ function scopeNames(node: AstNode, namespaces: Map<string, string>): Set<string>
   return names;
 }
 
-// Which imported locals the file renders as a JSX element or calls (`.call` and `.apply` included), and each literal
-// member of a namespace import it reaches (`Ui.TeamFlow`), true when that member is rendered or called. A local
-// shadowed by a parameter or a nearer declaration of the same name is not the import, so it does not count.
-function flowUses(body: AstNode[], locals: Set<string>, namespaces: Map<string, string>): { used: Set<string>; members: Map<string, boolean> } {
-  const used = new Set<string>(), members = new Map<string, boolean>();
+// Whether `key` of `node` holds a name rather than a reference to a binding: a property, a key, an attribute, an enum
+// member, an exported name, the names a re-export takes from another module, or anything inside a type.
+const TYPE_KEYS = new Set(['typeAnnotation', 'typeParameters', 'typeArguments', 'superTypeArguments']);
+function holdsName(node: AstNode, key: string): boolean {
+  if (TYPE_KEYS.has(key)) return true;
+  if (key === 'id') return node.type === 'TSEnumMember';
+  if (key === 'name') return node.type === 'JSXAttribute';
+  if (key === 'exported') return node.type === 'ExportSpecifier' || node.type === 'ExportAllDeclaration';
+  if (key === 'specifiers') return node.type === 'ExportNamedDeclaration' && !!node.source;
+  return !node.computed && (key === 'property' && /MemberExpression$/u.test(node.type) || key === 'key' && /^(?:Property|MethodDefinition|PropertyDefinition|AccessorProperty)$/u.test(node.type));
+}
+
+// Which imported locals the file renders as a JSX element or calls (`.call` and `.apply` included; `memo(X)`,
+// `createElement(X)` and `component: X` in an object literal render X too), each literal member of a namespace import it
+// reaches (`Ui.TeamFlow`), true when that member is rendered or called, and the namespaces it uses as a whole: passed
+// on, spread, exported or read by a computed key. A local shadowed by a parameter or a nearer declaration of the same
+// name is not the import, so it does not count.
+function flowUses(body: AstNode[], locals: Set<string>, namespaces: Map<string, string>): { used: Set<string>; members: Map<string, boolean>; whole: Set<string> } {
+  const used = new Set<string>(), members = new Map<string, boolean>(), whole = new Set<string>(), accounted = new Set<AstNode>();
   const visit = (node: unknown, shadowed: ReadonlySet<string>): void => {
     if (Array.isArray(node)) { for (const item of node) visit(item, shadowed); return; }
     if (!isRecord(node) || typeof node.type !== 'string' || node.type === 'ImportDeclaration' || /^TS(?:TypeAlias|Interface)Declaration$/u.test(node.type)) return;
@@ -561,8 +586,13 @@ function flowUses(body: AstNode[], locals: Set<string>, namespaces: Map<string, 
       const member = memberOf(value);
       if (member) members.set(member, true);
     };
+    // A namespace named with no literal member after it and no literal destructuring around it is used as a whole.
+    if (/^(?:JSX)?Identifier$/u.test(current.type) && namespaces.has(current.name) && !inner.has(current.name) && !accounted.has(current)) whole.add(current.name);
     const member = memberOf(current);
-    if (member && !members.has(member)) members.set(member, false);
+    if (member) {
+      accounted.add(current.object);
+      if (!members.has(member)) members.set(member, false);
+    }
     if (current.type === 'JSXOpeningElement') {
       let root: AstNode = current.name;
       markUse(root);
@@ -572,11 +602,20 @@ function flowUses(body: AstNode[], locals: Set<string>, namespaces: Map<string, 
       const callee = unwrap(current.callee);
       markUse(callee);
       if (['call', 'apply'].includes(memberName(callee) ?? '')) markUse(callee.object);
+      const called = callee.type === 'Identifier' ? callee.name : callee.object?.name === 'React' ? memberName(callee) : undefined;
+      if (RENDER_CALLS.has(called ?? '')) markUse(current.arguments[0]);
+    } else if (current.type === 'ObjectExpression') {
+      // A route config's `component: TeamFlow` renders it.
+      for (const property of current.properties) if (property.type === 'Property' && !property.computed && /^[cC]omponent$/u.test(nameOf(property.key) ?? '')) markUse(property.value);
+    } else if (current.type === 'VariableDeclarator' && current.id?.type === 'ObjectPattern') {
+      // `const { TeamFlow } = Ui` names each export it takes; a rest element or a computed key takes the whole namespace.
+      const source = unwrap(current.init);
+      if (namespaces.has(source?.name) && current.id.properties.every((property: AstNode) => property.type === 'Property' && !property.computed)) accounted.add(source);
     }
-    for (const value of Object.values(current)) if (value && typeof value === 'object') visit(value, inner);
+    for (const [key, value] of Object.entries(current)) if (value && typeof value === 'object' && !holdsName(current, key)) visit(value, inner);
   };
   visit(body, new Set());
-  return { used, members };
+  return { used, members, whole };
 }
 
 // The selectors in one selector list that name a `t98-` class: a class selector (`.t98-…`), or an attribute selector
@@ -675,7 +714,7 @@ function scanPresentation(directory: string, policy: PresentationPolicy, parseAs
     try { program = parseAst(text, { lang: `${/\.[cm]?tsx?$/u.test(name) ? 'ts' : 'js'}${jsx ? 'x' : ''}` }); }
     catch (error) { partial(`${name}: cannot parse for the presentation check: ${messageOf(error)}`); continue; }
     const uiNamespaces = new Set<string>(), namespaces = new Map<string, string>(), locals = new Map<string, { source: string; name: string }>();
-    const module: ModuleFacts = { imports: [], reexports: [], exportAll: [] };
+    const module: ModuleFacts = { imports: [], reexports: [], exportAll: [], named: new Set(), wholeNamespaces: [] };
     for (const node of program.body) {
       if (node.type !== 'ImportDeclaration') continue;
       const source = node.source.value;
@@ -691,11 +730,19 @@ function scanPresentation(directory: string, policy: PresentationPolicy, parseAs
       }
     }
     for (const node of program.body) {
-      if (node.type === 'ExportAllDeclaration' && node.exportKind !== 'type') module.exportAll.push({ source: node.source.value, whole: !node.exported });
+      if (node.type === 'ExportAllDeclaration' && node.exportKind !== 'type') {
+        module.exportAll.push({ source: node.source.value, whole: !node.exported });
+        if (node.exported) module.named.add(nameOf(node.exported)!);
+      }
       if (node.type !== 'ExportNamedDeclaration' || node.exportKind === 'type') continue;
+      // A declaration the file exports is its own export, whatever it is named; a type leaves no export behind.
+      const { declaration } = node;
+      if (declaration?.type === 'VariableDeclaration') for (const declarator of declaration.declarations) bindPattern(declarator.id, module.named);
+      else if (declaration && !/^TS(?:TypeAlias|Interface)Declaration$/u.test(declaration.type)) bindPattern(declaration.id, module.named);
       for (const specifier of node.specifiers) {
         if (specifier.exportKind === 'type') continue;
         const local = nameOf(specifier.local)!, exported = nameOf(specifier.exported)!, origin = node.source ? { source: node.source.value, name: local } : locals.get(local);
+        module.named.add(exported);
         if (origin) module.reexports.push({ ...origin, exported });
       }
     }
@@ -708,7 +755,8 @@ function scanPresentation(directory: string, policy: PresentationPolicy, parseAs
         if (key !== undefined && value?.type === 'Identifier') locals.set(value.name, { source, name: key });
       }
     });
-    const test = TEST_FILE.test(name), { used, members } = flowUses(program.body, new Set(locals.keys()), namespaces);
+    const test = TEST_FILE.test(name), { used, members, whole } = flowUses(program.body, new Set(locals.keys()), namespaces);
+    module.wholeNamespaces = [...whole].map(local => namespaces.get(local)!);
     for (const [local, origin] of locals) module.imports.push({ ...origin, used: !test && used.has(local) });
     for (const [member, rendered] of members) {
       const dot = member.indexOf('.');
@@ -752,7 +800,7 @@ function scanPresentation(directory: string, policy: PresentationPolicy, parseAs
         if (node.type !== 'CallExpression') return;
         if (callee.type === 'Identifier' && callee.name === 'require' && !declared.has('require') && ROUTERS.has(stringText(node.arguments[0]) ?? '') && name !== adapter) add(name, 'router-blocker');
         if (method !== undefined && (DOM_QUERIES.has(method) || CLASS_LIST.has(method) && memberName(object as AstNode) === 'classList')
-          && node.arguments.some((argument: AstNode) => LIBRARY_DOM.test(stringText(argument) ?? ''))) add(name, 't98-dom');
+          && node.arguments.some((argument: AstNode) => namesLibrary(method, stringText(argument) ?? ''))) add(name, 't98-dom');
         const written = node.callee;
         if (jsx && typeof node.arguments[0]?.value === 'string' && node.arguments[0].type === 'Literal'
           && (written.type === 'Identifier' ? CREATE_ELEMENT.has(written.name) : written.type === 'MemberExpression' && written.object.name === 'React' && written.property.name === 'createElement')) add(name, 'create-element');
@@ -762,25 +810,28 @@ function scanPresentation(directory: string, policy: PresentationPolicy, parseAs
   // Follow each import through the app's own modules to the package export it comes from.
   const resolveModule = (from: string, specifier: string): string | undefined => {
     if (!specifier.startsWith('.')) return undefined;
-    const base = posix.join(posix.dirname(from), specifier), stem = base.replace(/\.[cm]?jsx?$/u, '');
+    const base = posix.join(posix.dirname(from), specifier).replace(/\/+$/u, ''), stem = base.replace(/\.[cm]?jsx?$/u, '');
     return [base, ...RESOLVED_EXTENSIONS.map(extension => stem + extension), ...RESOLVED_EXTENSIONS.map(extension => `${base}/index${extension}`)].find(file => facts.has(file));
   };
+  // A module's own export of a name wins over its `export *`, as in ES modules: its own declaration is the app's, and
+  // only a named re-export is followed. `seen` ends a cycle of barrels.
   const origins = (from: string, source: string, name: string, seen: Set<string>): string[] => {
     const target = resolveModule(from, source);
     if (target === undefined) return source.startsWith('.') ? [] : [exportKey(source, name)];
     if (seen.has(target)) return [];
     seen.add(target);
-    const module = facts.get(target)!;
+    const module = facts.get(target)!, stars = module.named.has(name) ? [] : module.exportAll.filter(entry => entry.whole);
     return [...module.reexports.filter(entry => entry.exported === name).flatMap(entry => origins(target, entry.source, entry.name, seen)),
-      ...module.exportAll.filter(entry => entry.whole).flatMap(entry => origins(target, entry.source, name, seen))];
+      ...stars.flatMap(entry => origins(target, entry.source, name, seen))];
   };
   for (const [file, module] of facts) {
     for (const { source, name, used } of module.imports) {
       for (const key of origins(file, source, name, new Set())) { scan.imported.add(key); if (used) scan.used.add(key); }
     }
-    // A re-export imports what it names, and an app module that re-exports a package whole imports every one of its exports.
+    // A re-export imports what it names, and an app module that re-exports a package whole, or hands its namespace on
+    // whole, imports every one of its exports.
     for (const { source, name } of module.reexports) for (const key of origins(file, source, name, new Set())) scan.imported.add(key);
-    for (const { source } of module.exportAll) if (!source.startsWith('.')) scan.importedAll.add(source);
+    for (const source of [...module.exportAll.map(entry => entry.source), ...module.wholeNamespaces]) if (!source.startsWith('.')) scan.importedAll.add(source);
   }
   return scan;
 }
@@ -799,21 +850,50 @@ function resolveParseAst(directory: string): ParseAst | undefined {
   return undefined;
 }
 
+// A path in one spelling, so that two can be compared: forward slashes, no "." segments or doubled separators, and lower
+// case, as an app's folder may be on a case-insensitive file system.
+const spelled = (path: string): string => path.replaceAll('\\', '/').split('/').filter(part => part && part !== '.').join('/').toLowerCase();
+
+// The files the checks read or write in an app besides the register: the manifest, the contract, and the baselines and
+// compiler projects of every profile.
+function checkedFiles(): Set<string> {
+  const listed = (value: unknown): string[] => Array.isArray(value) ? value.filter(item => typeof item === 'string') : [];
+  const profiles: (Partial<Profile> | undefined)[] = [contract.appStack, ...Object.values(contract.profiles)];
+  const names = profiles.flatMap(profile => [profile?.presentation?.baseline, profile?.data?.baseline, ...listed(profile?.sourceLanguage?.compilerProjects)]);
+  return new Set(['package.json', 'architecture.json', ...names.filter((name): name is string => typeof name === 'string')].map(spelled));
+}
+
 // The shared-flow declaration of appStack and of each profile with its own presentation policy is exactly
 // { register, firstUiVersion }. The readers join `register` to an app's folder and print `firstUiVersion`, so both are
-// checked before either is used. A declaration that is present but not an object is an error, not "no register".
+// checked before either is used. A declaration that is present but not an object is an error, not "no register". The
+// register is also not a file another check reads or writes, which it would overwrite or be read as.
 function inspectSharedFlowsPolicy(): string[] {
   const policies: [string, PresentationPolicy | undefined][] = [['appStack', contract.appStack?.presentation],
     ...Object.entries(contract.profiles).map(([name, profile]): [string, PresentationPolicy | undefined] => [`profiles.${name}`, profile.presentation])];
+  const checked = checkedFiles();
   return policies.flatMap(([owner, policy]) => {
     const declared: unknown = policy?.sharedFlows, label = `${owner}.presentation.sharedFlows`;
     if (declared === undefined) return [];
     if (!isRecord(declared) || Object.keys(declared).length !== 2) return [`${label} needs an object with exactly the keys register and firstUiVersion.`];
     const { register, firstUiVersion } = declared, errors: string[] = [];
     if (typeof register !== 'string' || !REGISTER_FILE.test(register) || OUTSIDE_APP.test(register)) errors.push(`${label}.register needs a relative path to a .json file, without ".." or an absolute path.`);
+    else if (checked.has(spelled(register))) errors.push(`${label}.register ${JSON.stringify(register)} is a file the checks read or write (a baseline, package.json, architecture.json or a compiler project); choose another path.`);
     if (typeof firstUiVersion !== 'string' || !PLAIN_VERSION.test(firstUiVersion)) errors.push(`${label}.firstUiVersion needs a plain x.y.z version, without a prerelease or build suffix.`);
     return errors;
   });
+}
+
+// Where the register is in the app, with links resolved. The declared path is checked lexically, so a link on the way (a
+// symlink, or a junction on Windows) could still lead out of the app: the real path of the file, or of its folder while the
+// file is not there yet, must lie inside the app's real path. A dangling link or a missing folder is refused as well.
+function registerPath(directory: string, register: string): { file: string; error?: string } {
+  const file = resolve(directory, register);
+  try {
+    const real = lstatSync(file, { throwIfNoEntry: false }) ? realpathSync.native(file) : join(realpathSync.native(dirname(file)), basename(file));
+    const inside = relative(realpathSync.native(directory), real);
+    if (inside && !/^\.\.(?:[\\/]|$)/u.test(inside) && !isAbsolute(inside)) return { file: real };
+  } catch { /* refused below */ }
+  return { file, error: `${register} must be a file inside the app: a link leads it outside the app, or its folder is missing.` };
 }
 
 // The shared-flow list ships in the owner package, so it is read from the consumer's install, the way rolldown is:
@@ -846,7 +926,8 @@ function readSharedFlowList(directory: string, owner: string, policy: SharedFlow
 }
 
 function readSharedFlowRegister(directory: string, policy: SharedFlowsPolicy): { register?: SharedFlowRegister; errors: string[] } {
-  const file = resolve(directory, policy.register);
+  const { file, error } = registerPath(directory, policy.register);
+  if (error) return { errors: [error] };
   if (!existsSync(file)) return { errors: [`${policy.register} is missing; record it once with check.mjs --record-shared-flows, then write each reason.`] };
   const text = readFileSync(file, 'utf8');
   let parsed: unknown;
@@ -861,7 +942,7 @@ function readSharedFlowRegister(directory: string, policy: SharedFlowsPolicy): {
 
 // Each listed feature is declared once: "uses" needs every export rendered or called in a non-test file, "absent" a
 // reason and no import of the export, "exception" a reason and a review trigger: a `ui` version beyond the installed
-// release and at most two minor releases ahead of it, or a Ten98 GitHub issue.
+// release, in its major release and at most two minor releases ahead of it, or a Ten98 GitHub issue.
 function inspectSharedFlowRegister(policy: PresentationPolicy & { sharedFlows: SharedFlowsPolicy }, list: SharedFlowList, version: string, register: SharedFlowRegister, scan: PresentationScan, adapter: string | undefined): string[] {
   const file = policy.sharedFlows.register, roots = policy.roots.join(', '), errors: string[] = [], installed = semver(version), owner = policy.owner;
   const describe = (id: string): string => list[id]!.map(({ name, entry, since }) => `${name} from ${entry}${since ? `, shared since ${owner} ${since}` : ''}`).join('; ');
@@ -895,7 +976,7 @@ function inspectSharedFlowRegister(policy: PresentationPolicy & { sharedFlows: S
       else if (due && installed && compareVersions(installed, due) >= 0) {
         errors.push(`${file}: ${id} is due for review: ${owner} ${version} has reached ${String(isRecord(review) && review.ui)}; move it to "uses" or record a new reason and trigger.`);
       } else if (due && installed && (due.core[0] !== installed.core[0] || due.core[1]! > installed.core[1]! + 2)) {
-        errors.push(`${file}: ${id}'s review trigger ${String(isRecord(review) && review.ui)} is more than two minor releases beyond the installed ${owner} ${version}; choose a nearer review point.`);
+        errors.push(`${file}: ${id}'s review trigger ${String(isRecord(review) && review.ui)} is out of range for the installed ${owner} ${version}: a trigger stays in the same major release and at most two minor releases ahead, up to ${installed.core[0]}.${installed.core[1]! + 2}.z; choose a nearer review point.`);
       }
     } else errors.push(`${file}: ${id} has unknown status ${JSON.stringify(status) ?? '(none)'}; use "uses", "absent" or "exception".`);
   }
@@ -1020,7 +1101,8 @@ export function recordSharedFlows(directory: string, name: string, options: Pres
   const parseAst = options.parseAst ?? resolveParseAst(directory);
   if (typeof parseAst !== 'function') return [PARSER_MISSING];
   directory = resolve(directory);
-  const file = resolve(directory, sharedFlows.register);
+  const { file, error } = registerPath(directory, sharedFlows.register);
+  if (error) return [error];
   if (existsSync(file)) return [`${sharedFlows.register} already exists; edit it instead of recording it again.`];
   const { list, errors } = readSharedFlowList(directory, policy.owner, sharedFlows);
   if (!list) return errors;
