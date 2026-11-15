@@ -36,6 +36,8 @@ export function inspectWaivers() {
         if (restated.length)
             errors.push(`profiles.${name} restates the shared app stack (${restated.join(', ')}); change appStack or record a transition.`);
     }
+    // A bad shared-flow declaration fails every manifest check, not only the readers of the register.
+    errors.push(...inspectSharedFlowsPolicy());
     return errors;
 }
 // Whether a transition for this profile and rule allows `value`; `unset` stands for an absent field.
@@ -331,6 +333,11 @@ const SCRIPT = /\.(?:[cm]?[jt]s|[jt]sx)$/u, STYLESHEET = /\.p?css$/u;
 const TEST_FILE = /(?:^|\/)__tests__\/|\.(?:test|spec|stories)\.[cm]?[jt]sx?$/u;
 const RESOLVED_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'];
 const ISSUE_URL = /^https:\/\/github\.com\/Ten98-IO-Company\/[A-Za-z0-9._-]+\/issues\/[1-9]\d*$/u;
+// A register path is a .json file name with something before the extension, relative to the app and below it. Both
+// separators count, so a Windows-style `..\x.json`, `\x.json` or `C:\x.json` is refused on every platform.
+const REGISTER_FILE = /[^/\\]\.json$/u, OUTSIDE_APP = /^[/\\]|^[A-Za-z]:|(?:^|[/\\])\.\.(?:[/\\]|$)/u;
+// A plain x.y.z version: no prerelease, no build part, no leading zeros.
+const PLAIN_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
 const PARSER_MISSING = 'Cannot resolve rolldown/parseAst from the consumer; install the pinned build tooling to check presentation ownership.';
 const exportKey = (entry, name) => `${entry}\n${name}`;
 const isRecord = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
@@ -870,6 +877,26 @@ function resolveParseAst(directory) {
     }
     return undefined;
 }
+// The shared-flow declaration of appStack and of each profile with its own presentation policy is exactly
+// { register, firstUiVersion }. The readers join `register` to an app's folder and print `firstUiVersion`, so both are
+// checked before either is used. A declaration that is present but not an object is an error, not "no register".
+function inspectSharedFlowsPolicy() {
+    const policies = [['appStack', contract.appStack?.presentation],
+        ...Object.entries(contract.profiles).map(([name, profile]) => [`profiles.${name}`, profile.presentation])];
+    return policies.flatMap(([owner, policy]) => {
+        const declared = policy?.sharedFlows, label = `${owner}.presentation.sharedFlows`;
+        if (declared === undefined)
+            return [];
+        if (!isRecord(declared) || Object.keys(declared).length !== 2)
+            return [`${label} needs an object with exactly the keys register and firstUiVersion.`];
+        const { register, firstUiVersion } = declared, errors = [];
+        if (typeof register !== 'string' || !REGISTER_FILE.test(register) || OUTSIDE_APP.test(register))
+            errors.push(`${label}.register needs a relative path to a .json file, without ".." or an absolute path.`);
+        if (typeof firstUiVersion !== 'string' || !PLAIN_VERSION.test(firstUiVersion))
+            errors.push(`${label}.firstUiVersion needs a plain x.y.z version, without a prerelease or build suffix.`);
+        return errors;
+    });
+}
 // The shared-flow list ships in the owner package, so it is read from the consumer's install, the way rolldown is:
 // each app is held to the list of the release it pins. Anything but a well-formed schemaVersion 1 list fails closed.
 // `since` is shown in messages only: the installed list is already the list of that release.
@@ -973,7 +1000,7 @@ function inspectSharedFlowRegister(policy, list, version, register, scan, adapte
         else if (status === 'exception') {
             needsReason();
             const single = isRecord(review) && Object.keys(review).length === 1;
-            const due = single && typeof review.ui === 'string' && /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u.test(review.ui) ? semver(review.ui) : undefined;
+            const due = single && typeof review.ui === 'string' && PLAIN_VERSION.test(review.ui) ? semver(review.ui) : undefined;
             const issue = single && typeof review.issue === 'string' && ISSUE_URL.test(review.issue);
             if (!due && !issue)
                 errors.push(`${file}: ${id} needs a review trigger, { "ui": "<x.y.z>" } or { "issue": "https://github.com/Ten98-IO-Company/<repo>/issues/<n>" }.`);
@@ -993,9 +1020,13 @@ function inspectSharedFlowRegister(policy, list, version, register, scan, adapte
 }
 // The scan, with the register's adapter exempt from router-blocker and the register checked against the list.
 function presentationFindings(directory, policy, parseAst) {
-    const { sharedFlows } = policy;
-    if (!sharedFlows)
-        return scanPresentation(directory, policy, parseAst);
+    const { sharedFlows } = policy, declared = inspectSharedFlowsPolicy();
+    // A declaration that is not well formed is reported, and its register is not read: no file is exempt, as when it is missing.
+    if (!sharedFlows || declared.length) {
+        const scan = scanPresentation(directory, policy, parseAst);
+        scan.errors.push(...declared);
+        return scan;
+    }
     const { register, errors } = readSharedFlowRegister(directory, sharedFlows);
     const value = register?.leaveGuardAdapter;
     const adapter = typeof value === 'string' && value.trim() ? relative(directory, resolve(directory, value)).replaceAll('\\', '/') : undefined;
@@ -1113,6 +1144,10 @@ export function updatePresentationBaseline(directory, name, options = {}) {
 // or changes it to "absent". leaveGuardAdapter is left out until someone names the adapter. An existing register is
 // never replaced.
 export function recordSharedFlows(directory, name, options = {}) {
+    // The register is written where the declaration says, so a declaration that is not well formed is reported first.
+    const declared = inspectSharedFlowsPolicy();
+    if (declared.length)
+        return declared;
     const policy = resolveProfile(name)?.profile.presentation, sharedFlows = policy?.sharedFlows;
     if (!policy || !sharedFlows)
         return [`${name} declares no shared-flow register.`];

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import test from 'node:test';
-import { checkPresentation, presentationTotals, recordSharedFlows, updatePresentationBaseline } from '../check.mjs';
+import { pathToFileURL } from 'node:url';
+import { checkPresentation, inspectWaivers, presentationTotals, recordSharedFlows, updatePresentationBaseline } from '../check.mjs';
 import type { TotalsReport } from '../check.mjs';
 
 const fixtures = new URL('./fixtures/presentation/', import.meta.url);
@@ -666,4 +667,117 @@ test('check.mjs prints the remaining ratchet counts on every run, even when an e
       assert.match(cli().stdout, /presentation counts unavailable: Cannot resolve rolldown\/parseAst/);
     });
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+// The sharedFlows declaration in architecture.json. The checker reads the declaration beside itself, so each case
+// imports its own copy of the checker next to a changed declaration.
+type Checker = typeof import('../check.mjs');
+type Presentation = Record<string, any>;
+const pristine = readFileSync(new URL('../architecture.json', import.meta.url), 'utf8');
+const unparseable = '{ "features": ';
+
+async function declaring(change: (presentation: Presentation, folder: string) => void, run: (checker: Checker, folder: string) => void): Promise<void> {
+  const folder = mkdtempSync(join(tmpdir(), 'ten98-declaration-'));
+  try {
+    for (const name of ['check.mjs', 'database-policy.mjs']) copyFileSync(new URL(`../${name}`, import.meta.url), join(folder, name));
+    const contract = JSON.parse(pristine);
+    change(contract.appStack.presentation, folder);
+    writeFileSync(join(folder, 'architecture.json'), JSON.stringify(contract));
+    run(await import(pathToFileURL(join(folder, 'check.mjs')).href) as Checker, folder);
+  } finally { rmSync(folder, { recursive: true, force: true }); }
+}
+
+const declaredPath = 'appStack.presentation.sharedFlows';
+const shapeError = `${declaredPath} needs an object with exactly the keys register and firstUiVersion.`;
+const registerError = `${declaredPath}.register needs a relative path to a .json file, without ".." or an absolute path.`;
+const versionError = `${declaredPath}.firstUiVersion needs a plain x.y.z version, without a prerelease or build suffix.`;
+
+// Each bad declaration, the change that makes it, and the one error it is reported as. The two rows that reach into the
+// case's own folder leave an unparseable register there, so a read of it would be reported as unparseable.
+const badDeclarations: [string, (presentation: Presentation, folder: string) => void, string][] = [];
+const refuse = (what: string, expected: string, change: (presentation: Presentation, folder: string) => void): void => { badDeclarations.push([what, change, expected]); };
+const setRegister = (value: unknown) => (presentation: Presentation): void => { presentation.sharedFlows.register = value; };
+const setVersion = (value: unknown) => (presentation: Presentation): void => { presentation.sharedFlows.firstUiVersion = value; };
+
+// Not an object. The falsy values were once read as "no register declared".
+for (const value of ['shared-flows.json', null, 5, true, false, 0, '', [], [firstUi, 'shared-flows.json']]) refuse(`sharedFlows ${JSON.stringify(value)}`, shapeError, presentation => { presentation.sharedFlows = value; });
+// Not exactly the two keys.
+refuse('register missing', shapeError, presentation => { delete presentation.sharedFlows.register; });
+refuse('firstUiVersion missing', shapeError, presentation => { delete presentation.sharedFlows.firstUiVersion; });
+refuse('an unknown extra key', shapeError, presentation => { presentation.sharedFlows.extra = 'x'; });
+refuse('register under another key', registerError, presentation => { presentation.sharedFlows = { regster: 'shared-flows.json', firstUiVersion: firstUi }; });
+refuse('firstUiVersion under another key', versionError, presentation => { presentation.sharedFlows = { register: 'shared-flows.json', firstVersion: firstUi }; });
+// register is not a string. An array of one path reads as that path to a pattern test, so it has its own case.
+for (const value of [5, null, true, ['shared-flows.json'], { path: 'shared-flows.json' }]) refuse(`register ${JSON.stringify(value)}`, registerError, setRegister(value));
+// register is absolute, in the POSIX, Windows and UNC forms, and as this machine writes it.
+for (const value of ['/shared-flows.json', '\\shared-flows.json', '\\\\server\\share\\shared-flows.json', 'C:\\apps\\shared-flows.json', 'C:/shared-flows.json', 'c:shared-flows.json']) refuse(`register ${value}`, registerError, setRegister(value));
+refuse('register as an absolute path on this machine', registerError, (presentation, folder) => {
+  writeFileSync(join(folder, 'register.json'), unparseable);
+  presentation.sharedFlows.register = join(folder, 'register.json');
+});
+// register has a ".." segment, however it is separated, and leaves the app.
+for (const value of ['src/../shared-flows.json', '..\\shared-flows.json', 'src\\..\\shared-flows.json', 'a/b/../../shared-flows.json']) refuse(`register ${value}`, registerError, setRegister(value));
+refuse('register leaving the app by ..', registerError, (presentation, folder) => {
+  writeFileSync(join(folder, 'register.json'), unparseable);
+  presentation.sharedFlows.register = `../${basename(folder)}/register.json`;
+});
+// register is not a path to a .json file.
+for (const value of ['shared-flows', 'shared-flows.yaml', 'shared-flows.json.bak', '', '.json', 'src/.json', 'shared-flows.json/']) refuse(`register ${JSON.stringify(value)}`, registerError, setRegister(value));
+// firstUiVersion is not a string, or not a SemVer version. An array of one version reads as that version to a pattern test.
+for (const value of ['banana', '0.40', '0.40.0.1', 'v0.40.0', '00.40.0', '', ' 0.40.0', 40, null, ['0.40.0']]) refuse(`firstUiVersion ${JSON.stringify(value)}`, versionError, setVersion(value));
+// firstUiVersion is a SemVer version with more than x.y.z: a prerelease or a build part.
+for (const value of ['0.40.0-rc.1', '0.40.0-0', '0.40.0+build.5']) refuse(`firstUiVersion ${value}`, versionError, setVersion(value));
+
+test('the sharedFlows declaration must be exactly a relative .json register and a plain x.y.z version', async () => {
+  for (const [what, change, expected] of badDeclarations) await declaring(change, checker => assert.deepEqual(checker.inspectWaivers(), [expected], what));
+});
+
+test('the real architecture.json declares its sharedFlows in the shape the checker accepts', () => {
+  assert.deepEqual(Object.keys(JSON.parse(pristine).appStack.presentation.sharedFlows).sort(), ['firstUiVersion', 'register']);
+  assert.deepEqual(inspectWaivers(), []);
+});
+
+test('a sharedFlows declaration refuses only a ".." segment, an absolute path and a version that is not x.y.z', async () => {
+  for (const register of ['shared-flows.json', './shared-flows.json', 'config/flows.json', 'a..b/c.json', '..hidden.json', 'dir/..hidden.json', 'spaced name/flows.json']) {
+    await declaring(setRegister(register), checker => assert.deepEqual(checker.inspectWaivers(), [], register));
+  }
+  for (const version of ['0.0.0', '10.20.30', '0.40.100']) await declaring(setVersion(version), checker => assert.deepEqual(checker.inspectWaivers(), [], version));
+});
+
+const listing = (...folders: string[]): string[] => folders.flatMap(folder => readdirSync(folder, { recursive: true, encoding: 'utf8' }).map(name => join(folder, name))).sort();
+
+test('a bad sharedFlows declaration is reported, not thrown, and no register is read or written', needsParser, async () => {
+  for (const [what, change, expected] of badDeclarations) {
+    await declaring(change, (checker, folder) => consumer({ register: unparseable }, root => {
+      const options = { parseAst };
+      // Without a declared register no file is exempt from router-blocker, as when the register is missing.
+      assert.deepEqual(checker.checkPresentation(root, profile, options), [expected, `src/leave-guard.ts: router-blocker 1 exceeds baseline 0 ${owned}`], what);
+      assert.deepEqual(checker.updatePresentationBaseline(root, profile, options), [expected], what);
+      assert.equal(existsSync(join(root, baselineName)), false, what);
+      const report = checker.presentationTotals(root, profile, options);
+      assert.ok(report && 'totals' in report && report.totals['router-blocker'] === 1, what);
+      // The register is gone, so a recording that ignored the declaration would write one.
+      rmSync(join(root, registerName));
+      const before = listing(root, folder);
+      assert.deepEqual(checker.recordSharedFlows(root, profile, options), [expected], what);
+      assert.deepEqual(listing(root, folder), before, what);
+    }));
+  }
+});
+
+test('check.mjs reports a bad sharedFlows declaration instead of throwing, and still prints the remaining counts', needsParser, async () => {
+  await declaring(presentation => { delete presentation.sharedFlows.register; }, (_checker, folder) => consumer({ sources: { 'src/a.tsx': "window.confirm('a');\n" } }, root => {
+    // The manifest only names the profile: its other errors are printed too and stop the run before presentation, and
+    // the totals are then counted on their own, which is where an unchecked declaration used to throw.
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: profile }));
+    const rolldown = join(root, 'node_modules', 'rolldown');
+    mkdirSync(rolldown);
+    writeFileSync(join(rolldown, 'package.json'), '{"name":"rolldown","exports":{"./parseAst":"./parse-ast.cjs"}}');
+    writeFileSync(join(rolldown, 'parse-ast.cjs'), `module.exports = require(${JSON.stringify(parserPath)});`);
+    const result = spawnSync(process.execPath, [join(folder, 'check.mjs'), root], { encoding: 'utf8', timeout: 20_000, windowsHide: true });
+    assert.equal(result.status, 1);
+    assert.ok(result.stderr.includes(`${root}: ${shapeError}`), result.stderr);
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /ERR_INVALID_ARG|must be of type string|unavailable/);
+    assert.match(result.stdout, /presentation counts remaining: native-dialog 1, router-blocker 1, t98-selector 0, t98-class 0, t98-dom 0\./);
+  }));
 });
