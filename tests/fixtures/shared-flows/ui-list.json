@@ -1,0 +1,248 @@
+{
+  "schemaVersion": 1,
+  "features": {
+    "sign-in": {
+      "exports": [
+        {
+          "name": "SignInFlow",
+          "entry": "@ten98/ui",
+          "since": "0.4.0"
+        }
+      ]
+    },
+    "first-run-setup": {
+      "exports": [
+        {
+          "name": "FirstUserSetupFlow",
+          "entry": "@ten98/ui",
+          "since": "0.4.0"
+        }
+      ]
+    },
+    "invitation-accept": {
+      "exports": [
+        {
+          "name": "InvitationAcceptFlow",
+          "entry": "@ten98/ui",
+          "since": "0.4.0"
+        }
+      ]
+    },
+    "password-reset": {
+      "exports": [
+        {
+          "name": "PasswordRecoveryFlow",
+          "entry": "@ten98/ui",
+          "since": "0.4.0"
+        }
+      ]
+    },
+    "two-factor-challenge": {
+      "exports": [
+        {
+          "name": "TwoFactorChallengeFlow",
+          "entry": "@ten98/ui",
+          "since": "0.4.0"
+        }
+      ]
+    },
+    "two-factor-setup": {
+      "exports": [
+        {
+          "name": "TwoFactorSetupFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "profile": {
+      "exports": [
+        {
+          "name": "AccountProfileFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "password-change": {
+      "exports": [
+        {
+          "name": "PasswordChangeFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "sessions": {
+      "exports": [
+        {
+          "name": "SessionListFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "linked-identities": {
+      "exports": [
+        {
+          "name": "LinkedIdentitiesFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "sign-in-providers": {
+      "exports": [
+        {
+          "name": "OidcProvidersFlow",
+          "entry": "@ten98/ui",
+          "since": "0.25.0"
+        }
+      ]
+    },
+    "team": {
+      "exports": [
+        {
+          "name": "TeamFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "workspace-create": {
+      "exports": [
+        {
+          "name": "WorkspaceCreateFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "project-create": {
+      "exports": [
+        {
+          "name": "ProjectCreateFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "switcher": {
+      "exports": [
+        {
+          "name": "WorkspaceProjectSwitcher",
+          "entry": "@ten98/ui",
+          "since": "0.4.0"
+        }
+      ]
+    },
+    "api-keys": {
+      "exports": [
+        {
+          "name": "ApiKeysFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "provider-credentials": {
+      "exports": [
+        {
+          "name": "ProviderCredentialsFlow",
+          "entry": "@ten98/ui",
+          "since": "0.25.0"
+        }
+      ]
+    },
+    "settings-layout": {
+      "exports": [
+        {
+          "name": "SettingsLayout",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "app-shell": {
+      "exports": [
+        {
+          "name": "AppShell",
+          "entry": "@ten98/ui",
+          "since": "0.3.0"
+        }
+      ]
+    },
+    "account-menu": {
+      "exports": [
+        {
+          "name": "AccountMenu",
+          "entry": "@ten98/ui",
+          "since": "0.3.19"
+        }
+      ]
+    },
+    "app-state": {
+      "exports": [
+        {
+          "name": "AppStateScreen",
+          "entry": "@ten98/ui",
+          "since": "0.4.0"
+        }
+      ]
+    },
+    "empty-state": {
+      "exports": [
+        {
+          "name": "EmptyState",
+          "entry": "@ten98/ui",
+          "since": "0.3.0"
+        }
+      ]
+    },
+    "confirm": {
+      "exports": [
+        {
+          "name": "useConfirmDialog",
+          "entry": "@ten98/ui",
+          "since": "0.18.0"
+        }
+      ]
+    },
+    "leave-guard": {
+      "exports": [
+        {
+          "name": "useLeaveGuard",
+          "entry": "@ten98/ui",
+          "since": "0.39.0"
+        }
+      ]
+    },
+    "date-range": {
+      "exports": [
+        {
+          "name": "DateRangeField",
+          "entry": "@ten98/ui",
+          "since": "0.3.0"
+        }
+      ]
+    },
+    "danger-zone": {
+      "exports": [
+        {
+          "name": "DangerZoneFlow",
+          "entry": "@ten98/ui",
+          "since": "0.5.0"
+        }
+      ]
+    },
+    "export": {
+      "exports": [
+        {
+          "name": "saveFile",
+          "entry": "@ten98/ui",
+          "since": "0.30.0"
+        }
+      ]
+    }
+  }
+}

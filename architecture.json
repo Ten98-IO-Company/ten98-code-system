@@ -55,7 +55,11 @@
       "roots": [
         "src"
       ],
-      "baseline": "presentation-baseline.json"
+      "baseline": "presentation-baseline.json",
+      "sharedFlows": {
+        "register": "shared-flows.json",
+        "firstUiVersion": "0.40.0"
+      }
     },
     "data": {
       "roots": [

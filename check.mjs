@@ -1,6 +1,6 @@
 import { inspectDatabasePolicy } from './database-policy.mjs';
 import { readFileSync, writeFileSync, realpathSync, existsSync, readdirSync, lstatSync } from 'node:fs';
-import { resolve, relative, basename } from 'node:path';
+import { resolve, relative, basename, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -312,54 +312,283 @@ export function checkSourceLanguage(directory, name) {
 }
 const CREATE_ELEMENT = new Set(['createElement', 'jsx', 'jsxs', '_jsx']);
 const UI_SOURCE = /^@ten98\/ui(?:\/app)?$/u;
-// Counts presentation violations per file and rule. Dynamic JSX spreads are a known limit: only
-// object-literal spreads are inspected, so a spread variable can still carry className/style.
-function presentationCounts(directory, policy, parseAst) {
-    const counts = {}, errors = [], files = [];
-    const add = (name, rule) => { counts[name] ??= {}; counts[name][rule] = (counts[name][rule] ?? 0) + 1; };
+// The first five rules count JSX files only, as before; the ratchet rules count every script file, and t98-selector
+// counts the stylesheets. A baseline names the rules it was recorded for, so a rule added later is recorded once.
+const JSX_RULES = ['element', 'styling', 'inner-html', 'create-element', 'stylesheet'];
+const RATCHET_RULES = ['native-dialog', 'router-blocker', 't98-selector', 't98-class', 't98-dom'];
+const DIALOGS = new Set(['confirm', 'alert', 'prompt']), DIALOG_GLOBALS = new Set(['window', 'globalThis', 'self']);
+const ROUTERS = new Set(['@tanstack/react-router', 'react-router', 'react-router-dom']);
+const DOM_QUERIES = new Set(['querySelector', 'querySelectorAll', 'closest', 'matches', 'getElementsByClassName']), CLASS_LIST = new Set(['add', 'remove', 'toggle']);
+const SCRIPT = /\.(?:[cm]?[jt]s|[jt]sx)$/u;
+const PARSER_MISSING = 'Cannot resolve rolldown/parseAst from the consumer; install the pinned build tooling to check presentation ownership.';
+const exportKey = (entry, name) => `${entry}\n${name}`;
+const isRecord = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
+function versionParts(version) {
+    const match = typeof version === 'string' ? /^(\d+)\.(\d+)\.(\d+)$/u.exec(version) : null;
+    return match ? match.slice(1).map(Number) : undefined;
+}
+// Every AST node under `node`, parents first.
+function visitNodes(node, enter) {
+    if (Array.isArray(node)) {
+        for (const item of node)
+            visitNodes(item, enter);
+        return;
+    }
+    if (!isRecord(node) || typeof node.type !== 'string')
+        return;
+    enter(node);
+    for (const value of Object.values(node))
+        if (value && typeof value === 'object')
+            visitNodes(value, enter);
+}
+// The called value without wrappers that leave it unchanged: `x!`, `(x)` and an optional chain.
+function unwrap(node) {
+    while (['TSNonNullExpression', 'ParenthesizedExpression', 'ChainExpression'].includes(node?.type))
+        node = node.expression;
+    return node;
+}
+// A member's property name when it is written literally: `a.b`, `a['b']` or a template without substitutions.
+function memberName(node) {
+    if (node?.type !== 'MemberExpression' && node?.type !== 'JSXMemberExpression')
+        return undefined;
+    const property = node.property;
+    if (!node.computed)
+        return property.name;
+    if (property.type === 'Literal' && typeof property.value === 'string')
+        return property.value;
+    return property.type === 'TemplateLiteral' && !property.expressions.length ? property.quasis[0].value.cooked : undefined;
+}
+// A string literal's text, or a template's literal parts kept apart so that no `t98-` is formed across a substitution.
+function literalText(node) {
+    if (node?.type === 'Literal' && typeof node.value === 'string')
+        return node.value;
+    return node?.type === 'TemplateLiteral' ? node.quasis.map((part) => part.value.cooked ?? part.value.raw).join('\0') : undefined;
+}
+// Every name the file binds, in any scope: a bare confirm() in such a file may be the app's own function.
+const FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression', 'TSDeclareFunction']);
+const NAMED_DECLARATIONS = new Set(['ClassDeclaration', 'ClassExpression', 'TSEnumDeclaration', 'TSImportEqualsDeclaration']);
+function declaredNames(body) {
+    const names = new Set();
+    const bind = (pattern) => {
+        if (pattern?.type === 'Identifier')
+            names.add(pattern.name);
+        else if (pattern?.type === 'ObjectPattern')
+            for (const property of pattern.properties)
+                bind(property.type === 'RestElement' ? property.argument : property.value);
+        else if (pattern?.type === 'ArrayPattern')
+            pattern.elements.forEach(bind);
+        else if (pattern?.type === 'AssignmentPattern')
+            bind(pattern.left);
+        else if (pattern?.type === 'RestElement')
+            bind(pattern.argument);
+        else if (pattern?.type === 'TSParameterProperty')
+            bind(pattern.parameter);
+    };
+    visitNodes(body, node => {
+        if (node.type === 'VariableDeclarator')
+            bind(node.id);
+        else if (FUNCTIONS.has(node.type)) {
+            bind(node.id);
+            node.params.forEach(bind);
+        }
+        else if (NAMED_DECLARATIONS.has(node.type))
+            bind(node.id);
+        else if (node.type === 'CatchClause')
+            bind(node.param);
+        else if (/^Import(?:Default|Namespace)?Specifier$/u.test(node.type))
+            bind(node.local);
+    });
+    return names;
+}
+// Names a file refers to as values: identifiers outside imports and type positions, skipping non-computed property
+// keys and member properties, JSX attribute names, labels and exported aliases. `members` holds each literal
+// `object.property` access, so a use through a namespace import can be matched to its source.
+const NOT_REFERENCES = new Set(['ImportDeclaration', 'TSTypeAliasDeclaration', 'TSInterfaceDeclaration', 'JSXNamespacedName', 'MetaProperty']);
+const NOT_REFERENCE_KEYS = new Set(['typeAnnotation', 'typeArguments', 'typeParameters', 'returnType', 'superTypeArguments', 'implements', 'label', 'exported']);
+function references(body) {
+    const names = new Set(), members = new Set();
+    const visit = (node) => {
+        if (Array.isArray(node)) {
+            for (const item of node)
+                visit(item);
+            return;
+        }
+        if (!isRecord(node) || typeof node.type !== 'string' || NOT_REFERENCES.has(node.type))
+            return;
+        const current = node;
+        if (current.type === 'Identifier' || current.type === 'JSXIdentifier') {
+            names.add(current.name);
+            return;
+        }
+        const member = memberName(current), object = current.object;
+        if (member !== undefined && (object?.type === 'Identifier' || object?.type === 'JSXIdentifier'))
+            members.add(`${object.name}.${member}`);
+        for (const [key, value] of Object.entries(current)) {
+            if (NOT_REFERENCE_KEYS.has(key) || key === 'key' && !current.computed || key === 'name' && current.type === 'JSXAttribute'
+                || key === 'property' && (!current.computed || current.type === 'JSXMemberExpression'))
+                continue;
+            if (value && typeof value === 'object')
+                visit(value);
+        }
+    };
+    visit(body);
+    return { names, members };
+}
+// The selectors in one selector list that name a `t98-` class, or hold `t98-` inside an attribute selector. Lists are
+// split at top-level commas; commas inside :is(…), brackets or quotes stay in their selector.
+function selectorsNamingLibrary(list) {
+    let count = 0, named = false, depth = 0, attribute = 0, quote = '';
+    for (let at = 0; at <= list.length; at++) {
+        const char = list[at];
+        if (char === undefined || char === ',' && !quote && !depth && !attribute) {
+            count += Number(named);
+            named = false;
+        }
+        else if (quote) {
+            if (char === '\\')
+                at++;
+            else if (char === quote)
+                quote = '';
+            else if (attribute && list.startsWith('t98-', at))
+                named = true;
+        }
+        else if (char === '"' || char === "'")
+            quote = char;
+        else if (char === '\\')
+            at++;
+        else if (char === '(')
+            depth++;
+        else if (char === ')')
+            depth = Math.max(0, depth - 1);
+        else if (char === '[')
+            attribute++;
+        else if (char === ']')
+            attribute = Math.max(0, attribute - 1);
+        else if (list.startsWith(attribute ? 't98-' : '.t98-', at))
+            named = true;
+    }
+    return count;
+}
+// One linear pass over a stylesheet. Comments are skipped and strings kept whole, so neither a brace nor a semicolon
+// inside them ends the text before a `{`. That text is a selector list unless it is an at-rule (`@media`, `@supports`,
+// `@layer` and the rest), whose block is read for nested rules the same way. Declarations end at `;` or `}`.
+function countLibrarySelectors(text) {
+    let count = 0, prelude = '';
+    for (let at = 0; at < text.length; at++) {
+        const char = text[at];
+        if (char === '/' && text[at + 1] === '*') {
+            const end = text.indexOf('*/', at + 2);
+            at = end < 0 ? text.length : end + 1;
+        }
+        else if (char === '"' || char === "'") {
+            let end = at + 1;
+            while (end < text.length && text[end] !== char && text[end] !== '\n')
+                end += text[end] === '\\' ? 2 : 1;
+            prelude += text.slice(at, end + 1);
+            at = end;
+        }
+        else if (char === '{') {
+            if (!prelude.trimStart().startsWith('@'))
+                count += selectorsNamingLibrary(prelude);
+            prelude = '';
+        }
+        else if (char === '}' || char === ';')
+            prelude = '';
+        else
+            prelude += char;
+    }
+    return count;
+}
+// Counts presentation violations per file and rule, and records which exports the files import and use. Dynamic JSX
+// spreads are a known limit: only object-literal spreads are inspected, so a spread variable can still carry className/style.
+function scanPresentation(directory, policy, parseAst, adapter) {
+    const scan = { counts: {}, errors: [], files: new Set(), imported: new Set(), used: new Set() }, files = [];
+    const add = (name, rule, by = 1) => {
+        if (!by)
+            return;
+        scan.counts[name] ??= {};
+        scan.counts[name][rule] = (scan.counts[name][rule] ?? 0) + by;
+    };
     const rootOf = (node) => node.type === 'JSXMemberExpression' ? rootOf(node.object) : node.name;
-    const walk = (folder) => {
+    const collect = (folder) => {
         if (!existsSync(folder)) {
-            errors.push(`Required presentation root missing: ${relative(directory, folder)}`);
+            scan.errors.push(`Required presentation root missing: ${relative(directory, folder)}`);
             return;
         }
         for (const entry of readdirSync(folder, { withFileTypes: true })) {
             const file = resolve(folder, entry.name);
             if (entry.isDirectory())
-                walk(file);
-            else if (entry.isFile() && /\.[jt]sx$/u.test(entry.name))
+                collect(file);
+            else if (entry.isFile() && (SCRIPT.test(entry.name) && !/\.d\.[cm]?ts$/u.test(entry.name) || entry.name.endsWith('.css')))
                 files.push(file);
         }
     };
     for (const root of policy.roots)
-        walk(resolve(directory, root));
+        collect(resolve(directory, root));
     for (const file of files) {
-        const name = relative(directory, file).replaceAll('\\', '/');
-        let program;
-        try {
-            program = parseAst(readFileSync(file, 'utf8'), { lang: name.endsWith('tsx') ? 'tsx' : 'jsx' });
-        }
-        catch (error) {
-            errors.push(`${name}: cannot parse for the presentation check: ${messageOf(error)}`);
+        const name = relative(directory, file).replaceAll('\\', '/'), text = readFileSync(file, 'utf8');
+        if (name.endsWith('.css')) {
+            add(name, 't98-selector', countLibrarySelectors(text));
             continue;
         }
-        const uiNamespaces = new Set();
+        scan.files.add(name);
+        const jsx = /\.[jt]sx$/u.test(name);
+        let program;
+        try {
+            program = parseAst(text, { lang: `${/\.[cm]?tsx?$/u.test(name) ? 'ts' : 'js'}${jsx ? 'x' : ''}` });
+        }
+        catch (error) {
+            scan.errors.push(`${name}: cannot parse for the presentation check: ${messageOf(error)}`);
+            continue;
+        }
+        const uiNamespaces = new Set(), namespaces = new Map(), named = [];
         for (const node of program.body) {
+            if (node.type === 'ExportNamedDeclaration' && node.source && node.exportKind !== 'type') {
+                // A re-export straight from a package counts as importing and using it; the guide lists this limit.
+                for (const specifier of node.specifiers) {
+                    if (specifier.exportKind === 'type')
+                        continue;
+                    const key = exportKey(node.source.value, specifier.local.name ?? specifier.local.value);
+                    scan.imported.add(key);
+                    scan.used.add(key);
+                }
+            }
             if (node.type !== 'ImportDeclaration')
                 continue;
             const source = node.source.value;
-            if (/\.(?:css|scss|sass|less)$/u.test(source) && !source.startsWith('@ten98/ui'))
+            if (jsx && /\.(?:css|scss|sass|less)$/u.test(source) && !source.startsWith('@ten98/ui'))
                 add(name, 'stylesheet');
             if (UI_SOURCE.test(source))
                 for (const specifier of node.specifiers)
                     if (specifier.type !== 'ImportSpecifier')
                         uiNamespaces.add(specifier.local.name);
+            if (node.importKind === 'type')
+                continue;
+            for (const specifier of node.specifiers) {
+                if (specifier.type === 'ImportNamespaceSpecifier')
+                    namespaces.set(specifier.local.name, source);
+                if (specifier.type !== 'ImportSpecifier' || specifier.importKind === 'type')
+                    continue;
+                const imported = specifier.imported.name ?? specifier.imported.value;
+                scan.imported.add(exportKey(source, imported));
+                named.push([exportKey(source, imported), specifier.local.name]);
+                if (imported === 'useBlocker' && ROUTERS.has(source) && name !== adapter)
+                    add(name, 'router-blocker');
+            }
         }
-        const visit = (node) => {
-            if (Array.isArray(node))
-                return node.forEach(visit);
-            if (!node || typeof node.type !== 'string')
-                return;
+        const { names, members } = references(program.body);
+        for (const [key, local] of named)
+            if (names.has(local))
+                scan.used.add(key);
+        for (const member of members) {
+            const dot = member.indexOf('.'), source = namespaces.get(member.slice(0, dot));
+            if (source === undefined)
+                continue;
+            scan.imported.add(exportKey(source, member.slice(dot + 1)));
+            scan.used.add(exportKey(source, member.slice(dot + 1)));
+        }
+        const declared = declaredNames(program.body);
+        visitNodes(program.body, node => {
             if (node.type === 'JSXOpeningElement') {
                 const tag = node.name;
                 if (tag.type === 'JSXIdentifier' ? /^[a-z]/u.test(tag.name) : tag.type === 'JSXNamespacedName' || !uiNamespaces.has(rootOf(tag)))
@@ -370,23 +599,36 @@ function presentationCounts(directory, policy, parseAst) {
                     add(name, 'styling');
                 if (node.name.name === 'dangerouslySetInnerHTML')
                     add(name, 'inner-html');
+                if (node.name.name === 'className') {
+                    visitNodes(node.value, part => {
+                        if (part.type === 'Literal' && typeof part.value === 'string' && part.value.includes('t98-')
+                            || part.type === 'TemplateElement' && String(part.value.cooked ?? part.value.raw).includes('t98-'))
+                            add(name, 't98-class');
+                    });
+                }
             }
             else if (node.type === 'JSXSpreadAttribute') {
                 if (node.argument.type === 'ObjectExpression' && node.argument.properties.some((property) => ['className', 'style'].includes(property.key?.name ?? property.key?.value)))
                     add(name, 'styling');
             }
-            else if (node.type === 'CallExpression' && typeof node.arguments[0]?.value === 'string' && node.arguments[0].type === 'Literal') {
-                const callee = node.callee;
-                if (callee.type === 'Identifier' ? CREATE_ELEMENT.has(callee.name) : callee.type === 'MemberExpression' && callee.object.name === 'React' && callee.property.name === 'createElement')
+            else if (node.type === 'CallExpression' || node.type === 'TaggedTemplateExpression') {
+                const callee = unwrap(node.type === 'CallExpression' ? node.callee : node.tag), method = memberName(callee), object = method === undefined ? undefined : unwrap(callee.object);
+                if (callee.type === 'Identifier' ? DIALOGS.has(callee.name) && !declared.has(callee.name)
+                    : method !== undefined && DIALOGS.has(method) && object?.type === 'Identifier' && DIALOG_GLOBALS.has(object.name))
+                    add(name, 'native-dialog');
+                if (node.type !== 'CallExpression')
+                    return;
+                if (method !== undefined && (DOM_QUERIES.has(method) || CLASS_LIST.has(method) && memberName(object) === 'classList')
+                    && /t98-|data-t98/u.test(literalText(node.arguments[0]) ?? ''))
+                    add(name, 't98-dom');
+                const written = node.callee;
+                if (jsx && typeof node.arguments[0]?.value === 'string' && node.arguments[0].type === 'Literal'
+                    && (written.type === 'Identifier' ? CREATE_ELEMENT.has(written.name) : written.type === 'MemberExpression' && written.object.name === 'React' && written.property.name === 'createElement'))
                     add(name, 'create-element');
             }
-            for (const value of Object.values(node))
-                if (value && typeof value === 'object')
-                    visit(value);
-        };
-        visit(program.body);
+        });
     }
-    return { counts, errors };
+    return scan;
 }
 // rolldown arrives through the pinned vite; strict layouts (pnpm) expose it only from vite's own scope.
 function resolveParseAst(directory) {
@@ -404,45 +646,207 @@ function resolveParseAst(directory) {
     }
     return undefined;
 }
-// Ratchet: a file may not exceed its baseline count for any rule; unlisted files and rules allow 0.
-// parseAst is injectable for tests; the CLI always resolves it from the consumer and fails closed.
-export function checkPresentation(directory, name, { parseAst = resolveParseAst(directory) } = {}) {
-    const policy = resolveProfile(name)?.profile.presentation;
-    if (!policy)
-        return [];
-    if (typeof parseAst !== 'function')
-        return ['Cannot resolve rolldown/parseAst from the consumer; install the pinned build tooling to check presentation ownership.'];
-    directory = resolve(directory);
-    const { counts, errors } = presentationCounts(directory, policy, parseAst);
-    const file = policy.baseline && resolve(directory, policy.baseline);
-    const baseline = file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+// The shared-flow list ships in the owner package, so it is read from the consumer's install, the way rolldown is:
+// each app is held to the list of the release it pins. Anything but a well-formed schemaVersion 1 list fails closed.
+function readSharedFlowList(directory, owner, policy) {
+    let file;
+    try {
+        file = createRequire(resolve(directory, 'package.json')).resolve(`${owner}/shared-flows.json`);
+    }
+    catch {
+        return { version: '', errors: [`The installed ${owner} ships no shared-flows.json; the shared-flow register needs ${owner} ${policy.firstUiVersion} or later.`] };
+    }
+    let version = '(unknown version)';
+    try {
+        const manifest = JSON.parse(readFileSync(resolve(dirname(file), 'package.json'), 'utf8'));
+        if (isRecord(manifest) && typeof manifest.version === 'string')
+            version = manifest.version;
+    }
+    catch { /* reported as an unknown version; a ui review trigger then counts as due */ }
+    const label = `${owner} ${version} shared-flows.json`;
+    let parsed;
+    try {
+        parsed = JSON.parse(readFileSync(file, 'utf8'));
+    }
+    catch (error) {
+        return { version, errors: [`${label} cannot be parsed: ${messageOf(error)}`] };
+    }
+    if (!isRecord(parsed) || parsed.schemaVersion !== 1)
+        return { version, errors: [`${label} has schemaVersion ${isRecord(parsed) ? JSON.stringify(parsed.schemaVersion) : '(none)'}; this checker reads schemaVersion 1.`] };
+    if (!isRecord(parsed.features))
+        return { version, errors: [`${label} has no features map.`] };
+    const list = {}, errors = [];
+    const isExport = (item) => isRecord(item) && typeof item.name === 'string' && item.name.length > 0 && typeof item.entry === 'string' && item.entry.length > 0;
+    for (const [id, feature] of Object.entries(parsed.features)) {
+        const exports = isRecord(feature) ? feature.exports : undefined;
+        if (Array.isArray(exports) && exports.length && exports.every(isExport))
+            list[id] = exports.map(({ name, entry }) => ({ name, entry }));
+        else
+            errors.push(`${label}: feature ${id} has no exports with a name and an entry.`);
+    }
+    return errors.length ? { version, errors } : { list, version, errors };
+}
+function readSharedFlowRegister(directory, policy) {
+    const file = resolve(directory, policy.register);
+    if (!existsSync(file))
+        return { errors: [`${policy.register} is missing; record it once with check.mjs --record-shared-flows, then write each reason.`] };
+    let parsed;
+    try {
+        parsed = JSON.parse(readFileSync(file, 'utf8'));
+    }
+    catch (error) {
+        return { errors: [`${policy.register} cannot be parsed: ${messageOf(error)}`] };
+    }
+    if (!isRecord(parsed) || !isRecord(parsed.features))
+        return { errors: [`${policy.register} must hold { "leaveGuardAdapter": "<file>", "features": { "<id>": { "status": … } } }.`] };
+    return { register: { leaveGuardAdapter: parsed.leaveGuardAdapter, features: parsed.features }, errors: [] };
+}
+// Each listed feature is declared once: "uses" needs every export imported from its entry and referred to again,
+// "absent" a reason and no import of the export, "exception" a reason and a review trigger that has not yet come due.
+function inspectSharedFlowRegister(policy, list, version, register, scan, adapter) {
+    const file = policy.sharedFlows.register, roots = policy.roots.join(', '), errors = [], installed = versionParts(version);
+    if (adapter === undefined || !scan.files.has(adapter))
+        errors.push(`${file}: leaveGuardAdapter must name the app's leave-guard adapter, a script file under ${roots}.`);
+    for (const id of Object.keys(list))
+        if (!Object.hasOwn(register.features, id))
+            errors.push(`${file}: ${id} is missing; declare it "uses", "absent" or "exception".`);
+    for (const [id, value] of Object.entries(register.features)) {
+        if (!Object.hasOwn(list, id)) {
+            errors.push(`${file}: ${id} is not a shared flow in ${policy.owner} ${version}; remove it.`);
+            continue;
+        }
+        const entry = isRecord(value) ? value : {}, { status, reason, review } = entry;
+        const needsReason = () => {
+            if (typeof reason !== 'string' || !reason.trim() || reason.length > 500)
+                errors.push(`${file}: ${id} needs a reason of 1 to 500 characters.`);
+        };
+        if (status === 'uses') {
+            for (const { name, entry: source } of list[id])
+                if (!scan.used.has(exportKey(source, name)))
+                    errors.push(`${file}: ${id} is "uses", but no file under ${roots} imports ${name} from ${source} and refers to it.`);
+        }
+        else if (status === 'absent') {
+            needsReason();
+            for (const { name, entry: source } of list[id])
+                if (scan.imported.has(exportKey(source, name)))
+                    errors.push(`${file}: ${id} is "absent", but ${name} is imported from ${source}.`);
+        }
+        else if (status === 'exception') {
+            needsReason();
+            const single = isRecord(review) && Object.keys(review).length === 1, due = single ? versionParts(review.ui) : undefined;
+            const issue = single && typeof review.issue === 'string' && URL.canParse(review.issue) && new URL(review.issue).protocol === 'https:';
+            if (!due && !issue)
+                errors.push(`${file}: ${id} needs a review trigger, { "ui": "<x.y.z>" } or { "issue": "<https URL>" }.`);
+            else if (due && (!installed || (installed[0] - due[0] || installed[1] - due[1] || installed[2] - due[2]) >= 0)) {
+                errors.push(`${file}: ${id} is due for review: ${policy.owner} ${version} has reached ${String(isRecord(review) && review.ui)}; move it to "uses" or record a new reason and trigger.`);
+            }
+        }
+        else
+            errors.push(`${file}: ${id} has unknown status ${JSON.stringify(status) ?? '(none)'}; use "uses", "absent" or "exception".`);
+    }
+    return errors;
+}
+// The scan, with the register's adapter exempt from router-blocker and the register checked against the list.
+function presentationFindings(directory, policy, parseAst) {
+    const { sharedFlows } = policy;
+    if (!sharedFlows)
+        return scanPresentation(directory, policy, parseAst);
+    const { register, errors } = readSharedFlowRegister(directory, sharedFlows);
+    const value = register?.leaveGuardAdapter;
+    const adapter = typeof value === 'string' && value.trim() ? relative(directory, resolve(directory, value)).replaceAll('\\', '/') : undefined;
+    const scan = scanPresentation(directory, policy, parseAst, adapter);
+    const { list, version, errors: listErrors } = readSharedFlowList(directory, policy.owner, sharedFlows);
+    scan.errors.push(...listErrors, ...errors);
+    if (list && register)
+        scan.errors.push(...inspectSharedFlowRegister({ ...policy, sharedFlows }, list, version, register, scan, adapter));
+    return scan;
+}
+// The ratchet rules' remaining counts across all files, which the CLI prints on every run.
+function ratchetTotals(counts) {
+    return Object.fromEntries(RATCHET_RULES.map(rule => [rule, Object.values(counts).reduce((sum, rules) => sum + (rules[rule] ?? 0), 0)]));
+}
+// A baseline maps each file to its allowed count per rule, and `$rules` to the rules it was recorded for. A baseline
+// from before `$rules` was recorded for the five JSX rules.
+function readPresentationBaseline(file) {
+    const { $rules, ...allowed } = JSON.parse(readFileSync(file, 'utf8'));
+    return { allowed: allowed, recorded: new Set(Array.isArray($rules) ? $rules : JSX_RULES) };
+}
+function presentationRises(counts, allowed, owner, ratcheted) {
+    const errors = [];
     for (const [path, rules] of Object.entries(counts)) {
         for (const [rule, found] of Object.entries(rules)) {
-            const allowed = baseline[path]?.[rule] ?? 0;
-            if (found > allowed)
-                errors.push(`${path}: ${rule} ${found} exceeds baseline ${allowed} (presentation is owned by ${policy.owner}).`);
+            const limit = allowed[path]?.[rule] ?? 0;
+            if (ratcheted(rule) && found > limit)
+                errors.push(`${path}: ${rule} ${found} exceeds baseline ${limit} (presentation is owned by ${owner}).`);
         }
     }
     return errors;
 }
-// Only lowers or removes entries: any rise or new violation refuses and reports the errors instead.
-// A missing baseline is recorded once from current counts; that first file is reviewed in the app's diff.
+// Ratchet: a file may not exceed its baseline count for any rule; unlisted files and rules allow 0.
+// parseAst is injectable for tests; the CLI always resolves it from the consumer and fails closed.
+export function checkPresentation(directory, name, { parseAst = resolveParseAst(directory), onTotals } = {}) {
+    const policy = resolveProfile(name)?.profile.presentation;
+    if (!policy)
+        return [];
+    if (typeof parseAst !== 'function')
+        return [PARSER_MISSING];
+    directory = resolve(directory);
+    const scan = presentationFindings(directory, policy, parseAst);
+    onTotals?.(ratchetTotals(scan.counts));
+    const file = policy.baseline && resolve(directory, policy.baseline);
+    const allowed = file && existsSync(file) ? readPresentationBaseline(file).allowed : {};
+    return [...scan.errors, ...presentationRises(scan.counts, allowed, policy.owner, () => true)];
+}
+// Only lowers or removes entries for the rules the baseline was recorded for, and records any other rule once from
+// current counts; a rise in a recorded rule, a parse error or a register error refuses and reports instead. A
+// missing baseline is recorded once from current counts. Each recording is reviewed in the app's diff.
 export function updatePresentationBaseline(directory, name, options = {}) {
     const policy = resolveProfile(name)?.profile.presentation;
     if (!policy?.baseline)
         return [];
     const parseAst = options.parseAst ?? resolveParseAst(directory);
-    if (existsSync(resolve(directory, policy.baseline)) || typeof parseAst !== 'function') {
-        const errors = checkPresentation(directory, name, { parseAst });
-        if (errors.length)
-            return errors;
+    if (typeof parseAst !== 'function')
+        return [PARSER_MISSING];
+    directory = resolve(directory);
+    const scan = presentationFindings(directory, policy, parseAst);
+    options.onTotals?.(ratchetTotals(scan.counts));
+    if (scan.errors.length)
+        return scan.errors;
+    const file = resolve(directory, policy.baseline);
+    if (existsSync(file)) {
+        const { allowed, recorded } = readPresentationBaseline(file);
+        const rises = presentationRises(scan.counts, allowed, policy.owner, rule => recorded.has(rule));
+        if (rises.length)
+            return rises;
     }
-    // A missing parser always makes checkPresentation return an error above, so a function is present here.
-    const { counts, errors } = presentationCounts(resolve(directory), policy, parseAst);
-    if (errors.length)
-        return errors;
-    writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1)), null, 2)}\n`);
+    const counts = Object.entries(scan.counts).sort(([a], [b]) => a < b ? -1 : 1);
+    writeFileSync(file, `${JSON.stringify({ $rules: [...JSX_RULES, ...RATCHET_RULES], ...Object.fromEntries(counts) }, null, 2)}\n`);
     return [];
+}
+// Writes the app's first register: "uses" where every export of a feature is already imported and referred to, and
+// otherwise an exception with an empty reason and no trigger, which fails until someone writes the reason and trigger
+// or changes it to "absent". leaveGuardAdapter is left empty for the same reason. An existing register is never replaced.
+export function recordSharedFlows(directory, name, options = {}) {
+    const policy = resolveProfile(name)?.profile.presentation, sharedFlows = policy?.sharedFlows;
+    if (!policy || !sharedFlows)
+        return [`${name} declares no shared-flow register.`];
+    const parseAst = options.parseAst ?? resolveParseAst(directory);
+    if (typeof parseAst !== 'function')
+        return [PARSER_MISSING];
+    directory = resolve(directory);
+    const file = resolve(directory, sharedFlows.register);
+    if (existsSync(file))
+        return [`${sharedFlows.register} already exists; edit it instead of recording it again.`];
+    const { list, errors } = readSharedFlowList(directory, policy.owner, sharedFlows);
+    if (!list)
+        return errors;
+    const scan = scanPresentation(directory, policy, parseAst);
+    if (scan.errors.length)
+        return scan.errors;
+    const features = Object.fromEntries(Object.entries(list).map(([id, exports]) => [id,
+        exports.every(({ name: exported, entry }) => scan.used.has(exportKey(entry, exported))) ? { status: 'uses' } : { status: 'exception', reason: '' }]));
+    writeFileSync(file, `${JSON.stringify({ leaveGuardAdapter: '', features }, null, 2)}\n`);
+    return checkPresentation(directory, name, { ...options, parseAst });
 }
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 // Container files at the app root and one folder below it (deploy/, docker/), skipping installed and built output.
@@ -752,9 +1156,10 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
     for (const error of runtimeErrors)
         console.error(error);
     let failures = runtimeErrors.length;
-    const flag = '--update-presentation-baseline', rawFlag = '--update-raw-statement-baseline', args = process.argv.slice(2);
+    const flag = '--update-presentation-baseline', rawFlag = '--update-raw-statement-baseline', recordFlag = '--record-shared-flows', args = process.argv.slice(2);
     const release = args[0] === '--release', drift = args[0] === '--drift', update = !release && args.includes(flag), updateRaw = !release && args.includes(rawFlag);
-    const directories = args.filter(arg => arg !== flag && arg !== rawFlag);
+    const record = !release && args.includes(recordFlag);
+    const directories = args.filter(arg => arg !== flag && arg !== rawFlag && arg !== recordFlag);
     if (!failures && release) {
         try {
             console.log(JSON.stringify(releaseArguments(args.slice(1)), null, 2));
@@ -792,8 +1197,10 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
                 errors.push(...(updateRaw ? updateRawStatementBaseline : checkDataAccess)(directory, String(manifest.name)));
             if (!errors.length)
                 errors.push(...checkSourceLanguage(directory, String(manifest.name)));
+            // The remaining ratchet counts are printed whether or not the check passes, so their fall is visible.
+            const onTotals = (totals) => console.log(`${directory}: presentation counts remaining: ${Object.entries(totals).map(([rule, count]) => `${rule} ${count}`).join(', ')}.`);
             if (!errors.length)
-                errors.push(...(update ? updatePresentationBaseline : checkPresentation)(directory, String(manifest.name)));
+                errors.push(...(record ? recordSharedFlows : update ? updatePresentationBaseline : checkPresentation)(directory, String(manifest.name), { onTotals }));
             for (const error of errors)
                 console.error(`${directory}: ${error}`);
             failures += errors.length;

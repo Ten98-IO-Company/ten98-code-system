@@ -13,6 +13,10 @@ interface PresentationPolicy {
     roots: string[];
     baseline?: string;
     owner: string;
+    sharedFlows?: {
+        register: string;
+        firstUiVersion: string;
+    };
 }
 interface DataPolicy {
     roots: string[];
@@ -101,12 +105,13 @@ export declare function checkVendoredFloors(directory: string, manifest: Package
 export declare function checkManifest(manifest: PackageManifest): string[];
 export declare function inspectSourcePolicy(directory: string, policy: SourceLanguagePolicy, compilation: Compilation): string[];
 export declare function checkSourceLanguage(directory: string, name: string): string[];
-export declare function checkPresentation(directory: string, name: string, { parseAst }?: {
+type PresentationOptions = {
     parseAst?: ParseAst;
-}): string[];
-export declare function updatePresentationBaseline(directory: string, name: string, options?: {
-    parseAst?: ParseAst;
-}): string[];
+    onTotals?: (totals: Record<string, number>) => void;
+};
+export declare function checkPresentation(directory: string, name: string, { parseAst, onTotals }?: PresentationOptions): string[];
+export declare function updatePresentationBaseline(directory: string, name: string, options?: PresentationOptions): string[];
+export declare function recordSharedFlows(directory: string, name: string, options?: PresentationOptions): string[];
 export declare function checkDeployment(directory: string, packageName: string): string[];
 export declare function checkDataAccess(directory: string, packageName: string): string[];
 export declare function updateRawStatementBaseline(directory: string, packageName: string): string[];
