@@ -243,7 +243,7 @@ test('approved profile-specific development tools keep their reviewed declaratio
   const { '@types/node': _campaignNode, '@types/pg': _campaignPg, ...sharedDevDependencies } = campaign().devDependencies;
   const manifest: ManifestFixture = {
     name: '@ten98/ui', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
-    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.28.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { ...sharedDevDependencies, '@playwright/test': '1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.28.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };
@@ -251,10 +251,29 @@ test('approved profile-specific development tools keep their reviewed declaratio
   // The ui-pnpm transition is closed (UI v0.39.0 is on pnpm): an npm-era manifest without packageManager is refused.
   const { packageManager: _pnpm, ...npmEra } = manifest;
   assert.match(checkManifest(npmEra).join('\n'), /packageManager: expected pnpm@11\.19\.0, found \(missing\)/);
-  manifest.devDependencies['@playwright/test'] = '*';
-  assert.match(checkManifest(manifest).join('\n'), /devDependencies.@playwright\/test/);
-  delete manifest.devDependencies['@playwright/test'];
-  assert.match(checkManifest(manifest).join('\n'), /devDependencies.@playwright\/test/);
+  // The design system requires the shared Playwright pin, exactly: its earlier ^1.64.1 range, any other version and its absence are refused.
+  for (const spec of ['^1.64.1', '~1.64.1', '>=1.64.1', '1.x', 'latest', '*', '1.63.0', '1.64.2']) {
+    const changed = structuredClone(manifest); changed.devDependencies['@playwright/test'] = spec;
+    assert.match(checkManifest(changed).join('\n'), /devDependencies\.@playwright\/test: expected 1\.64\.1, found /, spec);
+  }
+  const without = structuredClone(manifest); delete without.devDependencies['@playwright/test'];
+  assert.match(checkManifest(without).join('\n'), /devDependencies\.@playwright\/test: expected 1\.64\.1, found \(missing\)/);
+  // It uses the runner only: the library is not approved for it, and neither package is a runtime dependency.
+  const library = structuredClone(manifest); library.devDependencies.playwright = '1.64.1';
+  assert.match(checkManifest(library).join('\n'), /Unapproved development dependency playwright/);
+  const runtime = structuredClone(manifest); runtime.dependencies = { '@playwright/test': '1.64.1' };
+  assert.match(checkManifest(runtime).join('\n'), /Unapproved runtime dependency @playwright\/test/);
+});
+
+test('Playwright has one pinned version, declared once in the shared versions', () => {
+  const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
+  assert.equal(contract.sharedVersions['@playwright/test'], '1.64.1');
+  assert.equal(contract.sharedVersions.playwright, '1.64.1');
+  // A profile references the pin by name. A literal that remains can only equal it, so the number lives in one place.
+  const literals = [contract.appStack, ...Object.values<Record<string, StringMap | undefined>>(contract.profiles)]
+    .flatMap(profile => [profile.dependencies, profile.devDependencies].flatMap(section => Object.entries(section ?? {})))
+    .filter(([name]) => name === '@playwright/test' || name === 'playwright');
+  for (const [name, version] of literals) assert.equal(version, contract.sharedVersions[name], name);
 });
 
 test('test and build gates must execute first and propagate architecture failure', () => {
