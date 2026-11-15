@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { eq, sql, type SQL } from 'drizzle-orm';
@@ -44,13 +45,16 @@ test('forceRowLevelSecurity() writes one FORCE statement per table with drizzle-
 
 // A pool that hands out one scripted connection, so a failing BEGIN or ROLLBACK needs no real server. Drizzle treats a
 // client as a pool by its constructor's name, as it does pg's Pool.
+// A pg Pool stand-in: `totalCount` is how the runtime recognises a pool, so a minified class name still counts.
 class ScriptedPool {
   readonly sent: string[] = [];
   readonly released: unknown[] = [];
+  readonly connections: EventEmitter[] = [];
+  readonly totalCount = 0;
   readonly fail: Partial<Record<'begin' | 'rollback' | 'commit', Error>>;
   constructor(fail: Partial<Record<'begin' | 'rollback' | 'commit', Error>>) { this.fail = fail; }
   async connect() {
-    return {
+    const connection = Object.assign(new EventEmitter(), {
       query: async (config: string | { text: string }) => {
         const text = typeof config === 'string' ? config : config.text;
         this.sent.push(text.split(/\s/u)[0]!.toLowerCase());
@@ -60,7 +64,9 @@ class ScriptedPool {
         return { rows: text.startsWith('select "workspace"') ? [[fakeWorkspace, 'W', 'owner']] : [], fields: [], command: 'SELECT', rowCount: 0 };
       },
       release: (destroy?: unknown) => { this.released.push(destroy); },
-    };
+    });
+    this.connections.push(connection);
+    return connection;
   }
 }
 const fakeWorkspace = '00000000-0000-4000-8000-000000000001';
@@ -107,6 +113,42 @@ test('the exported transaction releases a connection whose BEGIN failed and keep
   const working = new ScriptedPool({});
   assert.equal(await transaction(drizzle(working as never), async () => 'done'), 'done');
   assert.deepEqual([broken.released, working.sent, working.released], [[true], ['begin', 'commit'], [false]]);
+});
+
+test('the exported transaction keeps the error of a failed COMMIT and discards the connection, even when ROLLBACK would fail too', async () => {
+  const lost = new Error('commit failed'), causedBy = (error: unknown) => error === lost || (error as { cause?: unknown }).cause === lost;
+  for (const fail of [{ commit: lost }, { commit: lost, rollback: new Error('rollback failed') }]) {
+    const pool = new ScriptedPool(fail);
+    await assert.rejects(transaction(drizzle(pool as never), async () => 'unreached'), causedBy);
+    // The server ended the transaction with the failed COMMIT; the connection is discarded rather than rolled back.
+    assert.deepEqual([pool.sent, pool.released], [['begin', 'commit'], [true]]);
+  }
+});
+
+test('a connection the server terminates mid-transaction fails the transaction instead of crashing the process', async () => {
+  const pool = new ScriptedPool({}), terminated = new Error('terminating connection due to administrator command');
+  await assert.rejects(transaction(drizzle(pool as never), async tx => {
+    // pg emits `error` on a checked-out client whose backend ends; with no listener the emit itself throws.
+    pool.connections[0]!.emit('error', terminated);
+    await tx.execute(sql`SELECT 1`);
+    throw terminated;
+  }), error => error === terminated);
+  assert.deepEqual([pool.released, pool.connections[0]!.listenerCount('error')], [[true], 0]);
+});
+
+test('the exported transaction refuses a database it cannot run safely instead of falling back silently', async () => {
+  const refusedDatabase = (error: unknown) => error instanceof TypeError && /node-postgres Drizzle database/u.test(error.message);
+  // Neither a pool nor a client, and not a Drizzle database at all.
+  await assert.rejects(transaction(drizzle({ connect: async () => undefined } as never), async () => 'unreached'), refusedDatabase);
+  await assert.rejects(transaction({ transaction: async () => 'leaked' } as never, async () => 'unreached'), refusedDatabase);
+  // A pool whose class name was minified still takes the checked-out path.
+  const Minified = class a extends ScriptedPool {}, minified = new Minified({});
+  assert.equal(await transaction(drizzle(minified as never), async () => 'done'), 'done');
+  assert.deepEqual([minified.sent, minified.released], [['begin', 'commit'], [false]]);
+  // A single client is Drizzle's own transaction on that client: nothing to check out or release.
+  const sent: string[] = [], client = { query: async (config: string | { text: string }) => { sent.push(typeof config === 'string' ? config : config.text); return { rows: [], fields: [] }; } };
+  assert.equal(await transaction(drizzle(client as never), async () => 'done'), 'done');
+  assert.deepEqual(sent, ['begin', 'commit']);
 });
 
 // Integration tests on real PostgreSQL, opt-in: set TEN98_TEST_DATABASE_URL to a disposable server (a superuser URL; each
@@ -322,6 +364,24 @@ test('a nested scoped call gives the caller its own scope back, after success an
     await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w2, 'write', async () => { throw inner; }, tx), error => error === inner);
     assert.deepEqual(await visible(tx), [fixture.w1]);
   });
+});
+
+test('a scoped call nested in a READ ONLY transaction checks membership without the refused share lock', { skip }, async () => {
+  const db = appDb(), readOnly = (error: unknown) => sqlState(error) === '25006';
+  const visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note).orderBy(note.id)).map(row => row.id);
+  // Inside the helper's own read transaction, in a savepoint each time.
+  assert.deepEqual(await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', async tx => [
+    await tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible),
+    await tenancy.withWorkspaces(tx, fixture.a, [fixture.w1, fixture.w2], visible),
+    await visible(tx),
+  ]), [[fixture.w2], [fixture.w1, fixture.w2], [fixture.w1]]);
+  assert.deepEqual(await tenancy.withWorkspaces(db, fixture.a, [fixture.w1], async tx => tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible)), [fixture.w2]);
+  // In a READ ONLY transaction the caller owns, joined as outer.
+  assert.deepEqual(await db.transaction(outer => tenancy.withWorkspace(db, fixture.a, fixture.w2, 'read', visible, outer), { accessMode: 'read only' }), [fixture.w2]);
+  // Membership is still checked, and writes are still refused.
+  await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', tx => tenancy.withWorkspace(tx, fixture.a, fixture.w3, 'read', visible)), refused);
+  await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', tx =>
+    tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'write', inner => inner.insert(note).values({ workspaceId: fixture.w1, body: 'x' }))), readOnly);
 });
 
 // Last: this changes D's membership.

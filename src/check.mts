@@ -533,31 +533,36 @@ function afterTypeArgument(text: string, index: number): number {
   return index;
 }
 
-// Counts raw statements in one file: a pg `.query(` call (also `['query'](` and `.query.call(`, `.apply(`, `.bind(`),
-// Drizzle `sql.raw(`, and `.execute(` given SQL text or a `sql` template, each with or without a type argument, and
-// with `sql` under any name it is imported as from drizzle-orm. Text matching, not parsing: a statement passed by
-// variable to `.execute(` or reached through a computed key is not counted, while a comment or an unrelated
-// `.query(` method is; the per-file allowlist absorbs the second kind.
+// Counts raw statements in one file: a pg `.query(` call (also `?.(`, `!(`, `['query'](` and `.query.call(`, `.apply(`,
+// `.bind(`), Drizzle `sql.raw(`, and `.execute(` given SQL text, a `sql` template or `sql.join(` (also inside extra
+// parentheses or after a comment), each with or without a type argument, and with `sql` under any name it is imported
+// as from drizzle-orm, a namespace import included. Text matching, not parsing: the adoption guide lists the forms it
+// misses, while a comment or an unrelated `.query(` method is counted; the per-file allowlist absorbs the second kind.
 function countRawStatements(text: string): number {
-  const names = ['sql'];
+  const names = ['sql'], escape = (name: string) => name.replaceAll('$', '\\$');
   for (const [, list] of text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]drizzle-orm(?:\/[^'"]*)?['"]/gu)) {
-    for (const [, alias] of list.matchAll(/\bsql\s+as\s+([A-Za-z_$][\w$]*)/gu)) names.push(alias.replaceAll('$', '\\$'));
+    for (const [, alias] of list.matchAll(/\bsql\s+as\s+([A-Za-z_$][\w$]*)/gu)) names.push(escape(alias));
+  }
+  for (const [, namespace] of text.matchAll(/import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]drizzle-orm(?:\/[^'"]*)?['"]/gu)) {
+    names.push(String.raw`${escape(namespace)}\s*\.\s*sql`);
   }
   const sqlName = `(?:${names.join('|')})`, tag = new RegExp(String.raw`^${sqlName}\b`, 'u');
-  const call = /^\s*\(/u, method = /^\s*\.\s*(?:call|apply|bind)\s*\(/u, opening = /^\s*\(\s*/u, quote = /^\s*[`'"]/u;
+  const call = /^\s*(?:\?\.|!)?\s*\(/u, method = /^\s*!?\s*\??\.\s*(?:call|apply|bind)\s*\(/u, quote = /^\s*[`'"]/u, join = /^\s*\.\s*join\s*\(/u;
+  // `.execute`'s opening parenthesis, with any further parentheses and comments before its argument.
+  const opening = /^\s*\((?:\s|\(|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*/u;
   let count = 0;
   for (const match of text.matchAll(new RegExp(String.raw`\.query\b|\[\s*['"]query['"]\s*\]|\b${sqlName}\.raw\b|\.execute\b`, 'gu'))) {
     const rest = text.slice(afterTypeArgument(text, match.index + match[0].length));
     if (match[0].endsWith('.raw')) count += Number(call.test(rest));
     else if (match[0] !== '.execute') count += Number(call.test(rest) || method.test(rest));
     else {
-      // `.execute(` counts when its argument is SQL text or a `sql` template, itself with an optional type argument.
+      // `.execute(` counts when its argument is SQL text, a `sql` template (with an optional type argument) or `sql.join(`.
       const opened = opening.exec(rest);
       if (!opened) continue;
       let argument = rest.slice(opened[0].length);
       const named = tag.exec(argument);
       if (named) argument = argument.slice(afterTypeArgument(argument, named[0].length));
-      count += Number(quote.test(argument));
+      count += Number(quote.test(argument) || (named !== null && join.test(argument)));
     }
   }
   return count;

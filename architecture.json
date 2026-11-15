@@ -292,7 +292,8 @@
         "ua-parser-js": "1.0.41"
       },
       "devDependencies": {
-        "@types/ua-parser-js": "0.7.39"
+        "@types/ua-parser-js": "0.7.39",
+        "playwright": "1.64.1"
       },
       "sourceLanguage": {
         "default": "typescript",

@@ -3,6 +3,10 @@
     "count": 8,
     "reason": "Not statements: the raw-statement scanner's own comments and patterns name the forms it counts."
   },
+  "src/db.mts": {
+    "count": 3,
+    "reason": "transaction() sends BEGIN, COMMIT and ROLLBACK on its checked-out connection so it can release or discard it; Drizzle has no builder for transaction control."
+  },
   "src/migration-ledger.mts": {
     "count": 16,
     "reason": "The migration ledger applies migration files as SQL text and takes its advisory locks and schema_version rows on a pg client before any app schema exists."

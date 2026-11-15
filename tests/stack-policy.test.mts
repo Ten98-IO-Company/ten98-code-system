@@ -135,7 +135,8 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
 
     // Typed Drizzle, a prepared statement, a builder's `.execute()` and names that only start like `query` are not raw.
     writeFileSync(source, ["import { db } from './db.ts';", 'export const rows = await db.select().from(ledger).where(eq(ledger.companyId, id));',
-      'await db.select().from(ledger).execute();', 'await prepared.execute({ id });', 'await db.execute(sqlFromBuilder);', 'client.queryKey(id);', ''].join('\n'));
+      'await db.select().from(ledger).execute();', 'await prepared.execute({ id });', 'await db.execute(sqlFromBuilder);', 'await db.execute((statement));',
+      'await db.execute(join(parts));', 'client.queryKey(id);', ''].join('\n'));
     assert.equal(run().status, 0, run().stderr);
     for (const statement of ["await pool.query('SELECT 1')", 'await client.query<{ id: string }>(`SELECT id FROM t`)', 'await db.execute(sql`SELECT 1`)', "sql.raw('now()')",
       'await db.execute<{ id: string }>(sql`SELECT 1`)', 'await db.execute(sql<number>`SELECT 1`)', "await tx.execute<{ pid: number }>('SELECT pg_backend_pid()')",
@@ -143,7 +144,11 @@ test('check.mjs refuses a raw statement outside the allowlist and accepts it onc
       // Object types with several fields carry `;`, which the first pattern stopped at (issue found at b5c9d57).
       "await pool.query<{ id: string; name: string }>('SELECT id, name FROM t', [])", 'await db.execute<{ a: number; b: number }>(sql`SELECT 1 AS a, 2 AS b`)',
       'await client.query<{\n  rolsuper: boolean;\n  owned: string[];\n}>(\n  `SELECT 1`, [])', 'await db.execute(sql<{ a: number; b: string }>`SELECT 1`)',
-      "const run = pool.query.bind(pool); await run('SELECT 1')", "import { sql as q } from 'drizzle-orm';\nawait db.execute(q`SELECT 1`)", "import { eq, sql as q } from 'drizzle-orm';\nq.raw('now()')"]) {
+      "const run = pool.query.bind(pool); await run('SELECT 1')", "import { sql as q } from 'drizzle-orm';\nawait db.execute(q`SELECT 1`)", "import { eq, sql as q } from 'drizzle-orm';\nq.raw('now()')",
+      // Forms the check of c2a9a90 found uncounted (#115).
+      "await pool.query?.('SELECT 1')", "await pool.query!('SELECT 1')", "await pool.query?.call(pool, 'SELECT 1')", 'await db.execute(sql.join([sql`SELECT 1`]))',
+      'await db.execute((sql`SELECT 1`))', 'await db.execute(/* report */ sql`SELECT 1`)', 'await db.execute(\n  // report\n  sql`SELECT 1`)',
+      "import * as d from 'drizzle-orm';\nawait db.execute(d.sql`SELECT 1`)", "import * as d from 'drizzle-orm';\nd.sql.raw('now()')"]) {
       writeFileSync(source, `${statement};\n`);
       const refused = run();
       assert.equal(refused.status, 1, statement);

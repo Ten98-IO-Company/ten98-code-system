@@ -42,46 +42,49 @@ export function createTenancy({ setting, column, tables }) {
     const storedScope = `${column}=ANYstring_to_arraycurrent_setting'${setting}',true,','`;
     // Parameterised `sql` statements by necessity: Drizzle has no builder for set_config or current_setting.
     const setScope = (tx, value) => tx.execute(sql `SELECT set_config(${setting}, ${value}, true)`);
-    const readScope = async (tx) => (await tx.execute(sql `SELECT current_setting(${setting}, true) AS scope`)).rows[0]?.scope ?? '';
+    // What a nested call must respect: the caller's scope, to put back, and whether its transaction is READ ONLY.
+    const readCaller = async (tx) => {
+        const { rows } = (await tx.execute(sql `SELECT current_setting(${setting}, true) AS scope, current_setting('transaction_read_only') AS read_only`));
+        return { scope: rows[0]?.scope ?? '', readOnly: rows[0]?.read_only === 'on' };
+    };
     /**
      * Runs `run` with row-level security admitting `workspaceIds`. In a transaction of its own the scope lasts to its end.
-     * `nested` (a caller's transaction or a savepoint, which may already hold a scope) puts the caller's scope back when
-     * `run` settles, so the caller never goes on in the inner workspace. After an error the transaction may be aborted
-     * and refuse the restore; the caller's ROLLBACK, or the savepoint's, then undoes the inner scope instead.
+     * A nested call (`caller`: a caller's transaction or a savepoint, which may already hold a scope) puts the caller's
+     * scope back when `run` settles, so the caller never goes on in the inner workspace. After an error the transaction
+     * may be aborted and refuse the restore; the caller's ROLLBACK, or the savepoint's, then undoes the inner scope.
+     * Nested calls on one transaction must be awaited in turn: run at once, their scopes and restores interleave.
      */
-    async function inScope(tx, workspaceIds, nested, run) {
-        if (!nested) {
-            await setScope(tx, workspaceIds.join(','));
-            return run();
-        }
-        const previous = await readScope(tx);
+    async function inScope(tx, workspaceIds, caller, run) {
         await setScope(tx, workspaceIds.join(','));
+        if (!caller)
+            return run();
         let result;
         try {
             result = await run();
         }
         catch (error) {
-            await setScope(tx, previous).catch(() => undefined);
+            await setScope(tx, caller.scope).catch(() => undefined);
             throw error;
         }
-        await setScope(tx, previous);
+        await setScope(tx, caller.scope);
         return result;
     }
     /**
      * The caller's memberships among `workspaceIds`, taken inside the transaction. Each membership row is share-locked
      * until commit (the team controller's caller-membership convention), so a removal or demotion waits for an in-flight
      * workspace transaction and cannot commit between this check and its writes. The workspace row is not locked: team
-     * changes lock it first, and tenant transactions must not queue behind them or hold them up.
+     * changes lock it first, and tenant transactions must not queue behind them or hold them up. A READ ONLY transaction
+     * refuses the lock and makes no writes for it to protect, so there the check runs without it.
      */
-    async function memberships(tx, userId, workspaceIds) {
+    async function memberships(tx, userId, workspaceIds, readOnly = false) {
         const ids = workspaceIds.filter(id => typeof id === 'string' && uuid.test(id)).map(id => id.toLowerCase());
         if (!ids.length || typeof userId !== 'string')
             return [];
-        return tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role })
+        const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role })
             .from(membership).innerJoin(workspace, eq(workspace.id, membership.workspaceId))
             .where(and(eq(membership.userId, userId), inArray(membership.workspaceId, ids)))
-            .orderBy(workspace.createdAt, workspace.id)
-            .for('share', { of: membership });
+            .orderBy(workspace.createdAt, workspace.id);
+        return readOnly ? query : query.for('share', { of: membership });
     }
     return {
         setting, column, tables,
@@ -106,12 +109,13 @@ export function createTenancy({ setting, column, tables }) {
         async withWorkspace(db, userId, workspaceId, mode, run, outer) {
             const nested = outer !== undefined || db instanceof PgTransaction;
             const scoped = async (tx) => {
-                const [access] = await memberships(tx, userId, [workspaceId]);
+                const caller = nested ? await readCaller(tx) : undefined;
+                const [access] = await memberships(tx, userId, [workspaceId], caller?.readOnly);
                 if (!access || (mode !== 'read' && !writers.includes(access.role)))
                     throw new WorkspaceAccessError();
                 if (mode === 'read' && !nested)
                     await tx.setTransaction({ accessMode: 'read only' });
-                return inScope(tx, [access.workspaceId], nested, () => run(tx, access));
+                return inScope(tx, [access.workspaceId], caller, () => run(tx, access));
             };
             return outer ? scoped(outer) : transaction(db, scoped);
         },
@@ -123,10 +127,11 @@ export function createTenancy({ setting, column, tables }) {
         withWorkspaces(db, userId, workspaceIds, run) {
             const nested = db instanceof PgTransaction;
             return transaction(db, async (tx) => {
-                const access = await memberships(tx, userId, workspaceIds);
+                const caller = nested ? await readCaller(tx) : undefined;
+                const access = await memberships(tx, userId, workspaceIds, caller?.readOnly);
                 if (!nested)
                     await tx.setTransaction({ accessMode: 'read only' });
-                return inScope(tx, access.map(item => item.workspaceId), nested, () => run(tx, access));
+                return inScope(tx, access.map(item => item.workspaceId), caller, () => run(tx, access));
             });
         },
         /**
