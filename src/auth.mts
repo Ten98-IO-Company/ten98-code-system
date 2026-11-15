@@ -169,15 +169,6 @@ function singleCookie(headers: HeadersInit | undefined, name: string): string | 
   const values = cookiePairs(headers).filter(([key]) => key === name).map(([, value]) => value);
   return values.length === 1 ? values[0] : undefined;
 }
-/** One cookie from a Cookie header; undefined when absent. */
-function cookieFrom(headers: HeadersInit | undefined, name: string): string | undefined {
-  const header = headers === undefined ? null : new Headers(headers).get('cookie');
-  for (const pair of header?.split(';') ?? []) {
-    const at = pair.indexOf('=');
-    if (at > 0 && pair.slice(0, at).trim() === name) return pair.slice(at + 1).trim();
-  }
-  return undefined;
-}
 
 /**
  * The `verification.identifier` the preset stores for a raw identifier, for an app that locks or reads the row with its
@@ -493,11 +484,12 @@ export interface Ten98Auth {
    */
   assertSchema(db: AnyDatabase): Promise<void>;
   /**
-   * Completes a sign-in's two-factor challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
-   * `two_factor` cookie) under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge that is
-   * unknown or expired, gets one uniform 401, and a session for any other account rolls back. The instance the app holds
-   * refuses a challenge outside it. Pass the request as received; verification with a session (enabling two-factor) still
-   * goes to `handler`.
+   * Handles every two-factor request (a POST to `/two-factor/*`); the instance the app holds refuses them, naming this
+   * function. Completing a sign-in's challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
+   * `two_factor` cookie) runs under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge
+   * that is unknown or expired, gets one uniform 401, and a session for any other account rolls back. Every other
+   * request (enrolling and confirming a factor, disabling it, recovery codes, the TOTP URI) needs a session and runs
+   * under that user's lock; without one it gets better-auth's own 401. Pass the request as received.
    */
   verifyTwoFactor(db: AnyDatabase, request: Request): Promise<Response>;
 }
@@ -974,29 +966,30 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     storedVerificationIdentifier: (identifier: string) => storedIdentifier(keys, raw(identifier)),
     sessionTokenKey: (token: string) => tokenHandle(keys, raw(token)),
   };
-  // The two-factor challenge cookie's name, as better-auth's createAuthCookie builds it for this instance.
-  const challengeCookie = `${origin.startsWith('https:') ? '__Secure-' : ''}${prefix}.two_factor`;
-  /** Which locked sign-in a route needs: a password sign-in, the completion of a challenge, or neither. */
-  const signInKind = (path: string, headers: HeadersInit | undefined): 'password' | 'twoFactor' | undefined =>
-    passwordRoute.test(path) ? 'password' : challengeRoute.test(path) && cookieFrom(headers, challengeCookie) !== undefined ? 'twoFactor' : undefined;
+  /** Which locked route a request needs: a password sign-in, any two-factor request, or neither. */
+  const signInKind = (path: string): 'password' | 'twoFactor' | undefined =>
+    passwordRoute.test(path) ? 'password' : twoFactorRoute.test(path) ? 'twoFactor' : undefined;
+  /** The server calls of the two-factor routes, by name: they too go only through verifyTwoFactor. */
+  const twoFactorCalls = new Set(Object.entries(auth.api as unknown as Record<string, { path?: unknown }>)
+    .filter(([, endpoint]) => typeof endpoint?.path === 'string' && endpoint.path.startsWith('/two-factor/')).map(([name]) => name));
+  // better-auth's own handler, for a two-factor request without a session: it answers that request's 401 itself.
+  const unlocked = auth.handler.bind(auth);
   if (!locking) return Object.assign(auth, helpers) as unknown as LockedTen98Auth;
   // On the instance the app holds, better-auth's own password sign-in has no limit, no lock and no constant-cost check,
   // so it is off: the route (any case, any trailing slash) answers 404 and api.signInEmail throws.
-  // A sign-in's two-factor challenge is completed only through verifyTwoFactor, under the account's lock, for the same
-  // reason; verification with a session (enabling two-factor) carries no challenge cookie and still goes through.
+  // Every two-factor request (completing a sign-in's challenge, enrolling, disabling, recovery codes) goes only through
+  // verifyTwoFactor, under the account's lock, for the same reason; the refusal names it, so a missed route fails loudly.
   if (options.allowRawPasswordSignIn !== true) {
     const route = auth.handler.bind(auth);
-    const routed = (request: Request) => signInKind(new URL(request.url).pathname, request.headers) ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
+    const routed = (request: Request) => {
+      const kind = signInKind(new URL(request.url).pathname);
+      if (kind === 'twoFactor') return Promise.resolve(refusal(404, 'NOT_FOUND', twoFactorRouting));
+      return kind ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
+    };
     Object.assign(auth, { handler: routed, fetch: routed });
     const api = auth.api as unknown as Record<string, (input?: { headers?: HeadersInit }) => unknown>;
     Object.assign(api, { signInEmail() { throw new TypeError('Password sign-in is only supported through signInWithPassword.'); } });
-    for (const name of twoFactorEndpoints) {
-      const original = api[name];
-      if (typeof original === 'function') api[name] = input => {
-        if (cookieFrom(input?.headers, challengeCookie) !== undefined) throw new TypeError('A two-factor sign-in challenge is only completed through verifyTwoFactor.');
-        return original(input);
-      };
-    }
+    for (const name of twoFactorCalls) Object.assign(api, { [name]() { throw new TypeError(`auth.api.${name}: ${twoFactorRouting}`); } });
   }
   const { lockTimeoutMs = 5000 } = options;
   if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000) throw new TypeError('lockTimeoutMs must be an integer from 1 to 600000.');
@@ -1039,25 +1032,24 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     // the account first.
     const refusals = {
       password: 'Password sign-in inside a locked-auth transaction holds a pool connection while it hashes; use signInWithPassword.',
-      twoFactor: 'A two-factor sign-in challenge is only completed through verifyTwoFactor.',
+      twoFactor: twoFactorRouting,
     } as const;
     const check = (kind: 'password' | 'twoFactor' | undefined) => {
       if (!open) throw closed();
       if (kind && kind !== allowed) throw new TypeError(refusals[kind]);
     };
-    const apiKind = (key: PropertyKey, input: unknown) => key === 'signInEmail' ? 'password'
-      : twoFactorEndpoints.includes(key as never) && cookieFrom((input as { headers?: HeadersInit } | undefined)?.headers, challengeCookie) !== undefined ? 'twoFactor' : undefined;
+    const apiKind = (key: PropertyKey) => key === 'signInEmail' ? 'password' : typeof key === 'string' && twoFactorCalls.has(key) ? 'twoFactor' : undefined;
     const api = bound.api as unknown as Record<PropertyKey, unknown>;
     const handler = bound.handler.bind(bound);
     Object.assign(bound, {
       userId: hold.userId,
       api: new Proxy(api, { get(target, key) {
         const value = target[key];
-        return typeof value === 'function' ? (...args: unknown[]) => { check(apiKind(key, args[0])); return (value as (...input: unknown[]) => unknown).apply(target, args); } : value;
+        return typeof value === 'function' ? (...args: unknown[]) => { check(apiKind(key)); return (value as (...input: unknown[]) => unknown).apply(target, args); } : value;
       } }),
-      handler(request: Request) { check(signInKind(new URL(request.url).pathname, request.headers)); return handler(request); },
+      handler(request: Request) { check(signInKind(new URL(request.url).pathname)); return handler(request); },
       // better-auth's fetch is the same handler; it gets the same checks.
-      fetch(request: Request) { check(signInKind(new URL(request.url).pathname, request.headers)); return handler(request); },
+      fetch(request: Request) { check(signInKind(new URL(request.url).pathname)); return handler(request); },
       async revokeAllSessions() {
         check(undefined);
         if (hold.userId === undefined) return;
@@ -1242,7 +1234,11 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     assertSchema: db => instanceSchema(db),
     async verifyTwoFactor(db, request) {
       await ready(db, () => undefined);
-      if (!(request instanceof Request) || !challengeRoute.test(new URL(request.url).pathname)) throw new TypeError('verifyTwoFactor completes a request to /two-factor/verify-totp, -backup-code or -otp.');
+      if (!(request instanceof Request) || request.method !== 'POST' || !twoFactorRoute.test(new URL(request.url).pathname)) throw new TypeError('verifyTwoFactor takes a POST to a /two-factor/* route.');
+      // A request that is not the completion of a sign-in's challenge needs a session, and runs under that user's lock.
+      if (!challengeRoute.test(new URL(request.url).pathname) || !cookiePairs(request.headers).some(([name]) => name === cookieName('two_factor'))) {
+        return sessionTwoFactor(db, request);
+      }
       // The challenge the one signed two_factor cookie names, and the account it was issued for; a cookie sent twice is
       // refused, and expired so the next sign-in starts clean.
       const read = await readChallenge(auth, request.headers);
@@ -1275,6 +1271,27 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       }
       return response.status === 401 ? challengeRefused() : response;
     },
+  };
+  /**
+   * A session-bound two-factor request (enrolling and confirming a factor, disabling it, recovery codes, the TOTP URI):
+   * better-auth's own route, run by an instance bound to a transaction that holds the session user's row. Without a
+   * session it is better-auth's own 401.
+   */
+  const sessionTwoFactor = async (db: AnyDatabase, request: Request) => {
+    const current = await auth.api.getSession({ headers: request.headers });
+    if (!current) return unlocked(request);
+    try {
+      return await transaction(db, async tx => {
+        await limitLockWaits(tx);
+        const [row] = await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, current.user.id)).for('no key update');
+        if (!row) return challengeRefused();
+        return bind(tx, { userId: row.id, email: undefined }, bound => bound.handler(request), 'twoFactor');
+      });
+    } catch (error) {
+      if (retryable(error)) return refusal(503, 'TWO_FACTOR_RETRY', 'The request was interrupted. Try again.', { 'retry-after': '1' });
+      if (error instanceof TransactionRolledBackError) return refusal(500, 'TWO_FACTOR_FAILED', 'The request failed. Try again.');
+      throw error;
+    }
   };
   /**
    * Replaces a legacy hash once, under the lock, in a savepoint: a failure (a trigger, a constraint) rolls back the
@@ -1310,6 +1327,10 @@ const disabledRoutes: Readonly<Record<string, string>> = Object.freeze({
 });
 /** better-auth's password route, in any case and with any trailing slash. */
 const passwordRoute = /\/sign-in\/email\/*$/i;
+/** Every two-factor route, in any case and with any trailing slash. */
+const twoFactorRoute = /\/two-factor\/[^/]+\/*$/i;
+/** What the instance an app holds answers a two-factor request, so a missed route fails loudly in the app's tests. */
+const twoFactorRouting = 'route /two-factor/* through verifyTwoFactor(db, request)';
 /** The two-factor routes that complete a sign-in's challenge, in any case and with any trailing slash. */
 const challengeRoute = /\/two-factor\/verify-(?:totp|backup-code|otp)\/*$/i;
 const twoFactorPaths = new Set(['/two-factor/verify-totp', '/two-factor/verify-backup-code', '/two-factor/verify-otp']);
@@ -1317,8 +1338,6 @@ const twoFactorPaths = new Set(['/two-factor/verify-totp', '/two-factor/verify-b
 const authCookieNames = ['session_token', 'session_data', 'dont_remember', 'account_data', 'two_factor', 'trust_device', 'known_device'] as const;
 /** A sign-in challenge the two-factor plugin opens: '2fa-' and 20 characters of better-auth's generateRandomString. */
 const challengeIdentifier = /^2fa-[A-Za-z0-9_-]{20}$/;
-/** The two-factor plugin's server calls for those routes. */
-const twoFactorEndpoints = ['verifyTOTP', 'verifyBackupCode', 'verifyTwoFactorOTP'] as const;
 /** The value of a cookie better-call signed with `secret`, or undefined when it is missing, malformed or forged. */
 function signedValue(cookie: string | undefined, secret: string): string | undefined {
   if (cookie === undefined || cookie.length > 512) return undefined;

@@ -310,11 +310,12 @@ export interface Ten98Auth {
      */
     assertSchema(db: AnyDatabase): Promise<void>;
     /**
-     * Completes a sign-in's two-factor challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
-     * `two_factor` cookie) under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge that is
-     * unknown or expired, gets one uniform 401, and a session for any other account rolls back. The instance the app holds
-     * refuses a challenge outside it. Pass the request as received; verification with a session (enabling two-factor) still
-     * goes to `handler`.
+     * Handles every two-factor request (a POST to `/two-factor/*`); the instance the app holds refuses them, naming this
+     * function. Completing a sign-in's challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
+     * `two_factor` cookie) runs under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge
+     * that is unknown or expired, gets one uniform 401, and a session for any other account rolls back. Every other
+     * request (enrolling and confirming a factor, disabling it, recovery codes, the TOTP URI) needs a session and runs
+     * under that user's lock; without one it gets better-auth's own 401. Pass the request as received.
      */
     verifyTwoFactor(db: AnyDatabase, request: Request): Promise<Response>;
 }

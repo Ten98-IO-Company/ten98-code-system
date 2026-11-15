@@ -1018,16 +1018,17 @@ function totp(uri: string, offset = 0): string {
 const post = (path: string, cookie: string, body: unknown) => new Request(`${ORIGIN}/api/auth${path}`, {
   method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN, ...(cookie ? { cookie } : {}) }, body: JSON.stringify(body),
 });
-// An account with TOTP enrolled through the preset (enabling needs a session, not a challenge), and its pending challenge.
+// An account with TOTP enrolled through verifyTwoFactor (enabling needs a session, not a challenge), and its pending challenge.
 async function challenged(label: string) {
   const email = address(label);
   const id = await account_(email);
   const session = cookieOf(await signIn(email));
-  const { totpURI } = await (await auth.handler(post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string };
-  assert.equal((await auth.handler(post('/two-factor/verify-totp', session, { code: totp(totpURI) }))).status, 200);
+  const { totpURI } = await (await auth.verifyTwoFactor(db, post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string };
+  const enrolCode = totp(totpURI);
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', session, { code: enrolCode }))).status, 200);
   const challenge = await signIn(email);
   assert.equal((await challenge.clone().json() as { twoFactorRedirect?: boolean }).twoFactorRedirect, true);
-  return { email, id, uri: totpURI, challenge: cookieOf(challenge) };
+  return { email, id, uri: totpURI, challenge: cookieOf(challenge), enrolCode };
 }
 
 test('an account closed after its two-factor challenge does not complete the sign-in, nor get a known device', { skip }, async () => {
@@ -2279,8 +2280,8 @@ test('completing a challenge counts only a strict true from isAccountUsable as u
   const email = address('strict-completion');
   await account_(email);
   const session = cookieOf(await strict.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
-  const { totpURI } = await (await strict.handler(post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string };
-  assert.equal((await strict.handler(post('/two-factor/verify-totp', session, { code: totp(totpURI) }))).status, 200);
+  const { totpURI } = await (await strict.verifyTwoFactor(db, post('/two-factor/enable', session, { password: PASSWORD }))).json() as { totpURI: string };
+  assert.equal((await strict.verifyTwoFactor(db, post('/two-factor/verify-totp', session, { code: totp(totpURI) }))).status, 200);
   const challenge = cookieOf(await strict.signInWithPassword(db, { source: SOURCE, email, password: PASSWORD }, allow));
   for (const truthy of [1, 'yes', {}]) {
     answer = truthy;
@@ -2574,4 +2575,53 @@ test('a known-device cookie sent twice counts as not known and is expired; the n
   assert.equal(browser.count(name), 1);
   await attempt(browser.header(`${ORIGIN}/api/auth/sign-in/email`));
   assert.equal(known, true);
+});
+
+// ---- Every two-factor request through verifyTwoFactor ----
+const twoFactorRouting = /route \/two-factor\/\* through verifyTwoFactor\(db, request\)/;
+
+test('the held and bound instances refuse every two-factor route and server call, naming verifyTwoFactor', { skip }, async () => {
+  const email = address('routing');
+  const id = await account_(email);
+  const session = cookieOf(await signIn(email));
+  for (const path of ['/two-factor/enable', '/two-factor/verify-totp', '/two-factor/disable', '/two-factor/get-totp-uri', '/two-factor/generate-backup-codes', '/Two-Factor/Enable/']) {
+    const refused = await auth.handler(post(path, session, { password: PASSWORD, code: '000000' }));
+    assert.equal(refused.status, 404, path);
+    assert.match(((await refused.json()) as { message: string }).message, twoFactorRouting, path);
+  }
+  const calls = (target: { api: unknown }) => target.api as unknown as Record<string, (input: unknown) => unknown>;
+  for (const name of ['enableTwoFactor', 'disableTwoFactor', 'getTOTPURI', 'verifyTOTP', 'verifyBackupCode', 'generateBackupCodes']) {
+    assert.throws(() => calls(auth)[name]!({ body: { password: PASSWORD }, headers: { cookie: session } }), (error: unknown) => error instanceof TypeError && twoFactorRouting.test(error.message), name);
+  }
+  await auth.withLockedAuth(db, id, async bound => {
+    assert.throws(() => bound.handler(post('/two-factor/enable', session, { password: PASSWORD })), twoFactorRouting);
+    assert.throws(() => calls(bound).enableTwoFactor!({ body: { password: PASSWORD }, headers: { cookie: session } }), twoFactorRouting);
+  });
+  assert.equal((await pool!.query('SELECT 1 FROM "twoFactor" WHERE "userId"=$1', [id])).rowCount, 0);
+});
+
+test('verifyTwoFactor serves a session-bound two-factor request under the user\'s lock, and refuses one without a session', { skip }, async () => {
+  const email = address('locked-enrol');
+  const id = await account_(email);
+  const session = cookieOf(await signIn(email));
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/enable', '', { password: PASSWORD }))).status, 401);
+  await assert.rejects(auth.verifyTwoFactor(db, new Request(`${ORIGIN}/api/auth/get-session`)), TypeError);
+  const enabled = await auth.verifyTwoFactor(db, post('/two-factor/enable', session, { password: PASSWORD }));
+  assert.equal(enabled.status, 200);
+  const { totpURI } = await enabled.json() as { totpURI: string };
+  // While another transaction holds the user's row, a request that writes nothing to it (reading the TOTP URI of the
+  // pending enrolment) still waits: it takes that row's lock first.
+  const holder = await pool!.connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT 1 FROM "user" WHERE id = $1 FOR UPDATE', [id]);
+    let settled = false;
+    const reading = auth.verifyTwoFactor(db, post('/two-factor/get-totp-uri', session, { password: PASSWORD })).then(response => { settled = true; return response; });
+    await delay(400);
+    assert.equal(settled, false);
+    await holder.query('COMMIT');
+    assert.equal((await reading).status, 200);
+  } finally { holder.release(); }
+  assert.equal((await auth.verifyTwoFactor(db, post('/two-factor/verify-totp', session, { code: totp(totpURI) }))).status, 200);
+  assert.equal((await pool!.query<{ on: boolean }>('SELECT "twoFactorEnabled" AS on FROM "user" WHERE id = $1', [id])).rows[0]!.on, true);
 });
