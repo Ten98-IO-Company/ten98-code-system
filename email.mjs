@@ -4,6 +4,7 @@
 // Needs the optional zod peer. SMTP also needs the optional nodemailer peer, imported only when an SMTP message is sent,
 // so the entry loads without it.
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createRequire } from 'node:module';
 import { Socket, isIP } from 'node:net';
 import { z } from 'zod';
 import { sendCloudflareEmail } from './cloudflare-email.mjs';
@@ -46,18 +47,33 @@ function configuration(env) {
             token: z.string().min(1).max(4096).regex(/^[A-Za-z0-9_-]+$/).parse(read('EMAIL_CLOUDFLARE_API_TOKEN')),
         };
     const tls = z.enum(['starttls', 'tls']).parse(read('EMAIL_SMTP_TLS') || 'starttls');
-    // A name, never an IP literal, so the certificate is verified against the configured host.
-    const host = z.string().max(253).regex(hostname).refine(v => !isIP(v)).parse(read('EMAIL_SMTP_HOST'));
+    // A name, never an IP literal, so the certificate is verified against the configured host. A last label of digits
+    // only is refused too: no top-level domain is numeric, and resolvers read `2130706433` or `127.1` as addresses.
+    const host = z.string().max(253).regex(hostname).refine(v => !isIP(v) && !/(?:^|\.)\d+$/u.test(v)).parse(read('EMAIL_SMTP_HOST'));
     const portText = z.string().regex(/^[1-9]\d{0,4}$/).parse(read('EMAIL_SMTP_PORT') || (tls === 'tls' ? '465' : '587'));
     const port = z.number().int().min(1).max(65_535).parse(Number(portText));
     const user = z.string().min(1).max(256).refine(v => !/[\u0000-\u001f\u007f]/.test(v) && !malformedUnicode.test(v)).parse(read('EMAIL_SMTP_USER'));
     const password = z.string().min(1).max(4096).refine(v => !/[\u0000\r\n]/.test(v) && !malformedUnicode.test(v)).parse(read('EMAIL_SMTP_PASSWORD'));
     return { transport, from, host, port, tls, user, password };
 }
-/** Configuration only: never throws, contacts no provider and promises no delivery. Read `.configured`. */
+// Whether the optional nodemailer peer can be loaded, without loading it.
+const nodemailerAvailable = () => { try {
+    createRequire(import.meta.url).resolve('nodemailer');
+    return true;
+}
+catch {
+    return false;
+} };
+/**
+ * Configuration only: never throws, contacts no provider and promises no delivery. Read `.configured`. SMTP counts as
+ * configured only when the optional nodemailer peer is installed (or a test SMTP sender is in place), since a send
+ * would otherwise refuse.
+ */
 export function getEmailStatus(env = process.env) {
     try {
         const config = configuration(env);
+        if (config.transport === 'smtp' && !testTransports.getStore()?.smtp && !nodemailerAvailable())
+            return { configured: false, transport: 'smtp' };
         return { configured: config.transport !== 'disabled', transport: config.transport };
     }
     catch {
@@ -110,10 +126,16 @@ async function sendSmtp(config, mail, signal) {
  * Success means the provider accepted the message, never that it was delivered. Every failure is the same
  * EmailDeliveryError (status 503) with no cause attached; nothing is logged.
  */
-export async function sendTransactionalEmail(input, { env = process.env, isSuppressed } = {}) {
-    let config, message;
+export async function sendTransactionalEmail(input, options) {
+    let config, message, isSuppressed;
     try {
-        config = configuration(env);
+        // Missing options, or an isSuppressed that is neither a function nor the literal false, refuse like any bad input.
+        if (typeof options !== 'object' || options === null)
+            throw new EmailDeliveryError();
+        ({ isSuppressed } = options);
+        if (isSuppressed !== false && typeof isSuppressed !== 'function')
+            throw new EmailDeliveryError();
+        config = configuration(options.env ?? process.env);
         message = messageInput.parse(input);
     }
     catch {
@@ -125,8 +147,12 @@ export async function sendTransactionalEmail(input, { env = process.env, isSuppr
     const escaped = message.text.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
     const mail = { from: config.from, ...message, html: '<div>' + escaped.replace(/\r\n|\r|\n/g, '<br>') + '</div>' };
     try {
-        if (isSuppressed && await untilAborted(Promise.resolve().then(() => isSuppressed(message.to)), controller.signal))
-            throw new EmailDeliveryError();
+        if (isSuppressed !== false) {
+            const lookup = isSuppressed;
+            // Only an explicit false lets the message go; undefined, a truthy value or anything else refuses.
+            if (await untilAborted(Promise.resolve().then(() => lookup(message.to)), controller.signal) !== false)
+                throw new EmailDeliveryError();
+        }
         const fetch = testTransports.getStore()?.fetch;
         if (config.transport === 'ses') {
             await untilAborted(sendSesEmail({ region: config.region, credentials: config.credentials, message: mail, configurationSetName: config.configurationSetName,

@@ -109,3 +109,43 @@ test('requestId keeps a valid incoming x-request-id and replaces anything else w
   }
   assert.notEqual(requestId(withId()), requestId(withId()));
 });
+
+test('every common secret name is redacted, in any case and separator style (check of 9e03146)', () => {
+  const { log, records } = capture();
+  const names = ['pass', 'passwd', 'pwd', 'passphrase', 'auth', 'credential', 'credentials', 'session', 'sessionId', 'sid', 'jwt', 'bearer',
+    'signature', 'otp', 'dsn', 'databaseUrl', 'DATABASE_URL', 'connectionString', 'connection-string', 'privateKey', 'x-api-key', 'refresh_token'];
+  log.info('config', Object.fromEntries(names.map(name => [name, 'visible-secret'])));
+  const line = records()[0]!;
+  for (const name of names) assert.equal(line[name], '[redacted]', name);
+  assert.doesNotMatch(JSON.stringify(line), /visible-secret/);
+  // The SMTP shape the email entry builds.
+  log.info('smtp', { auth: { user: 'login', pass: 'visible-secret' }, smtp: { user: 'login', pass: 'visible-secret' } });
+  assert.doesNotMatch(JSON.stringify(records()[1]), /visible-secret/);
+});
+
+test('credentials embedded in a URL are removed from any string value, whatever the field is called', () => {
+  const { log, records } = capture();
+  log.error('connect failed postgres://app:p4ss@db.internal:5432/app', {
+    target: 'postgres://app:p4ss@db.internal:5432/app', mirror: 'redis://:t0ken@cache:6379', hook: 'https://user@example.com/x',
+    note: 'retrying smtp://mailer:hunter2@smtp.example.com now', error: new Error('ECONNREFUSED postgres://app:p4ss@db.internal/app'), plain: 'https://example.com/a@b',
+  });
+  const text = JSON.stringify(records()[0]);
+  for (const secret of ['p4ss', 't0ken', 'hunter2', 'user@']) assert.doesNotMatch(text, new RegExp(secret), secret);
+  assert.match(text, /postgres:\/\/\[redacted\]@db\.internal:5432\/app/);
+  assert.equal(records()[0]!.plain, 'https://example.com/a@b', 'an @ in the path is not a credential');
+});
+
+test('a log call never throws: throwing getters, unserialisable values and a failing sink', () => {
+  const { log, records } = capture();
+  const hostile = { get boom() { throw new Error('getter'); } };
+  assert.doesNotThrow(() => log.info('getter', hostile));
+  assert.doesNotThrow(() => log.info('symbol id', { requestId: Symbol('x') as never }));
+  assert.doesNotThrow(() => log.info('bigint id', { requestId: 10n as never }));
+  assert.doesNotThrow(() => log.child(hostile).info('child of hostile'));
+  const lines = records();
+  assert.equal(lines[0]!.logError, 'fields could not be read');
+  assert.equal(lines[0]!.message, 'getter');
+  assert.equal(lines.length, 4);
+  const failing = createLogger({ service: 's', write: () => { throw new Error('sink down'); } });
+  assert.doesNotThrow(() => failing.error('lost'));
+});
