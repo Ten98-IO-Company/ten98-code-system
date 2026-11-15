@@ -1,5 +1,6 @@
 // Structured JSON-line logger for ten98 Node services, exported as @ten98/runtime/log only.
 // One call writes one line; the line's shape is built in record() alone, so the field names change in one place.
+// It is for service logs. Operator CLI output (ready, migrate and restore summaries) stays plain stdout, not logger lines.
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 export type LogFields = Readonly<Record<string, unknown>>;
 

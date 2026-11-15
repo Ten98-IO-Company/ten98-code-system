@@ -62,6 +62,19 @@ test('an Error is written as its name, message and stack, also when nested', () 
   assert.equal((line!.context as { cause: { message: string } }).cause.message, 'inner');
 });
 
+test('a caught Error passed to error() on a child logger, or bound by child(), keeps its name, message and stack', () => {
+  const { log, records } = capture();
+  const caught = new TypeError('bad input');
+  log.child({ requestId: 'abcdefgh' }).error('Request failed.', { error: caught });
+  log.child({ error: caught }).error('Request failed.');
+  const expected = { name: 'TypeError', message: 'bad input', stack: caught.stack };
+  assert.match(caught.stack!, /^TypeError: bad input\n\s+at /u);
+  assert.deepEqual(records().map(line => ({ ...line, time: undefined })), [
+    { time: undefined, level: 'error', service: 'discover', message: 'Request failed.', requestId: 'abcdefgh', error: expected },
+    { time: undefined, level: 'error', service: 'discover', message: 'Request failed.', error: expected },
+  ]);
+});
+
 test('secret-looking field names are redacted case-insensitively at every depth', () => {
   const { log, lines, records } = capture();
   log.info('login', {
