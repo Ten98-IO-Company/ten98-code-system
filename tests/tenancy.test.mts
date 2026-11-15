@@ -396,22 +396,66 @@ test('a nested scoped call gives the caller its own scope back, after success an
   });
 });
 
-test('a scoped call nested in a READ ONLY transaction checks membership without the refused share lock', { skip }, async () => {
+const unlocked = (error: unknown) => error instanceof Error && /nested in a READ ONLY transaction may admit only workspaces/u.test(error.message);
+
+test('a scoped call nested in a READ ONLY transaction admits only memberships a helper share-locked, and fails closed otherwise', { skip }, async () => {
   const db = appDb(), readOnly = (error: unknown) => sqlState(error) === '25006';
   const visible = async (tx: Pick<typeof db, 'select'>) => (await tx.select({ id: note.workspaceId }).from(note).orderBy(note.id)).map(row => row.id);
-  // Inside the helper's own read transaction, in a savepoint each time.
-  assert.deepEqual(await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', async tx => [
+  // The outer read share-locked W1 and W2 before turning READ ONLY; nested calls, savepoints within savepoints included, may use them.
+  assert.deepEqual(await tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], async tx => [
     await tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible),
     await tenancy.withWorkspaces(tx, fixture.a, [fixture.w1, fixture.w2], visible),
+    await tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', inner => tenancy.withWorkspace(inner, fixture.a, fixture.w1, 'read', visible)),
+    await tenancy.withWorkspace(db, fixture.a, fixture.w2, 'read', visible, tx),
     await visible(tx),
-  ]), [[fixture.w2], [fixture.w1, fixture.w2], [fixture.w1]]);
-  assert.deepEqual(await tenancy.withWorkspaces(db, fixture.a, [fixture.w1], async tx => tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible)), [fixture.w2]);
-  // In a READ ONLY transaction the caller owns, joined as outer.
-  assert.deepEqual(await db.transaction(outer => tenancy.withWorkspace(db, fixture.a, fixture.w2, 'read', visible, outer), { accessMode: 'read only' }), [fixture.w2]);
-  // Membership is still checked, and writes are still refused.
+  ]), [[fixture.w2], [fixture.w1, fixture.w2], [fixture.w1], [fixture.w2], [fixture.w1, fixture.w2]]);
+  // A workspace the outer call did not lock is refused, not read unlocked.
+  await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', tx => tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible)), unlocked);
+  await assert.rejects(tenancy.withWorkspaces(db, fixture.a, [fixture.w1], tx => tenancy.withWorkspaces(tx, fixture.a, [fixture.w1, fixture.w2], visible)), unlocked);
+  // So is every workspace in a READ ONLY transaction the caller opened itself, as outer or as a savepoint.
+  await assert.rejects(db.transaction(outer => tenancy.withWorkspace(db, fixture.a, fixture.w2, 'read', visible, outer), { accessMode: 'read only' }), unlocked);
+  await assert.rejects(db.transaction(outer => tenancy.withWorkspaces(outer, fixture.a, [fixture.w2], visible), { accessMode: 'read only' }), unlocked);
+  // A non-member still gets the plain refusal, and a write is still refused by PostgreSQL.
   await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', tx => tenancy.withWorkspace(tx, fixture.a, fixture.w3, 'read', visible)), refused);
   await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', tx =>
     tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'write', inner => inner.insert(note).values({ workspaceId: fixture.w1, body: 'x' }))), readOnly);
+  // A savepoint rolled back releases the locks taken inside it, so they no longer count.
+  const inner = new Error('the inner callback failed');
+  await tenancy.withWorkspace(db, fixture.a, fixture.w1, 'write', async tx => {
+    await assert.rejects(tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', async () => { throw inner; }), error => error === inner);
+    await tx.setTransaction({ accessMode: 'read only' });
+    await assert.rejects(tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', visible), unlocked);
+    assert.deepEqual(await tenancy.withWorkspace(tx, fixture.a, fixture.w1, 'read', visible), [fixture.w1]);
+  });
+});
+
+test('a removal waits for a nested read of a locked membership, and cannot commit under an unlocked one', { skip }, async () => {
+  const db = appDb(), notLocked = (error: unknown) => sqlState(error) === '55P03';
+  const remove = async () => {
+    const client = await root!.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("SET LOCAL lock_timeout = '300ms'");
+      await client.query('DELETE FROM membership WHERE workspace_id = $1 AND user_id = $2', [fixture.w2, fixture.a]);
+      await client.query('COMMIT');
+    } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; } finally { client.release(); }
+  };
+  try {
+    // Locked by the outer read: the removal times out on the share lock while the nested read runs.
+    await tenancy.withWorkspaces(db, fixture.a, [fixture.w1, fixture.w2], tx => tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', async () => {
+      await assert.rejects(remove(), notLocked);
+    }));
+    // Not locked: without the refusal the removal would commit here and the callback would still read W2's rows.
+    let ran = false;
+    await assert.rejects(tenancy.withWorkspace(db, fixture.a, fixture.w1, 'read', tx => tenancy.withWorkspace(tx, fixture.a, fixture.w2, 'read', async inner => {
+      ran = true;
+      await remove();
+      return inner.select().from(note);
+    })), unlocked);
+    assert.equal(ran, false);
+  } finally {
+    await root!.query("INSERT INTO membership(workspace_id, user_id, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING", [fixture.w2, fixture.a]);
+  }
 });
 
 // Last: this changes D's membership.

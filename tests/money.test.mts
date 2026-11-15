@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { addMoney, allocateMoney, assertMoneyInRange, compareMoney, formatMoney, MONEY_MAX, MONEY_MIN, multiplyMoney, parseMoney, percentOfMoney, subtractMoney } from '../index.mjs';
+import { addMoney, allocateMoney, assertMoneyInRange, compareMoney, convertMoney, formatMoney, MONEY_MAX, MONEY_MIN, multiplyMoney, parseMoney, percentOfMoney, rateOfAmounts, subtractMoney } from '../index.mjs';
 import type { MoneyExponent, MoneyRounding } from '../index.mjs';
 
 const EXPONENTS: MoneyExponent[] = [0, 2, 3];
@@ -173,4 +173,148 @@ test('allocation always sums to the total, favours larger remainders, then earli
   assert.throws(() => allocateMoney(1n, [1 as unknown as bigint]), TypeError);
   assert.throws(() => allocateMoney(1n, [0n, 0n]), RangeError);
   assert.throws(() => allocateMoney(1 as unknown as bigint, [1n]), TypeError);
+});
+
+// An independent reference for any rational n / d (d > 0): take the floor and the unit above it, then pick the nearer
+// by exact cross-multiplication, settling a tie by the mode. It shares no code or remainder logic with the module.
+function rationalOracle(numerator: bigint, denominator: bigint, mode: MoneyRounding): bigint {
+  const negative = numerator < 0n, n = negative ? -numerator : numerator;
+  const low = n / denominator, high = low + 1n;
+  let kept = low;
+  if (low * denominator !== n && mode !== 'down') {
+    const below = n - low * denominator, above = high * denominator - n;
+    if (above < below || above === below && (mode === 'half-up' || low % 2n === 1n)) kept = high;
+  }
+  return negative ? -kept : kept;
+}
+const pow10 = (digits: number): bigint => 10n ** BigInt(digits);
+const unitsOf = (rate: string): bigint => BigInt(rate.replace('.', ''));
+const placesOf = (rate: string): number => rate.includes('.') ? rate.length - rate.indexOf('.') - 1 : 0;
+// The rate text for integer units at `digits` places, as a caller would store it.
+function formatRate(value: bigint, digits: number): string {
+  const text = value.toString().padStart(digits + 1, '0');
+  return digits ? `${text.slice(0, text.length - digits)}.${text.slice(text.length - digits)}` : text;
+}
+
+test('convertMoney gives the specified cases, across exponents, with one rounding', () => {
+  assert.equal(convertMoney(10000n, 2, '3.75', 2, 'half-up'), 37500n);
+  assert.equal(convertMoney(700n, 2, '3.67', 2, 'half-up'), 2569n);
+  assert.equal(convertMoney(25n, 2, '3.70', 2, 'half-up'), 93n);
+  assert.equal(convertMoney(25n, 2, '3.70', 2, 'half-even'), 92n);
+  assert.equal(convertMoney(25n, 2, '3.70', 2, 'down'), 92n);
+  assert.equal(convertMoney(120125n, 3, '12.0503', 2, 'half-up'), 144754n);
+  // JPY 1000 at 0.0245 is USD 24.50; USD 24.50 at 40.8163 is JPY 1000 (999.99935 rounded).
+  assert.equal(convertMoney(1000n, 0, '0.0245', 2, 'half-up'), 2450n);
+  assert.equal(convertMoney(2450n, 2, '40.8163', 0, 'half-up'), 1000n);
+  // BHD 1.000 at 9.7400 is AED 9.74, and AED 9.74 at 0.1027 is BHD 1.000 (1.000298 rounded).
+  assert.equal(convertMoney(1000n, 3, '9.7400', 2, 'half-up'), 974n);
+  assert.equal(convertMoney(974n, 2, '0.1027', 3, 'half-up'), 1000n);
+  // JPY 5 at 0.0001 is 0.5 of a fils, an exact half; whole units scale exactly in both directions.
+  assert.equal(convertMoney(5n, 0, '0.0001', 3, 'half-up'), 1n);
+  assert.equal(convertMoney(5n, 0, '0.0001', 3, 'half-even'), 0n);
+  assert.equal(convertMoney(1n, 0, '1', 3, 'half-up'), 1000n);
+  assert.equal(convertMoney(1999n, 3, '1', 0, 'half-up'), 2n);
+  assert.equal(convertMoney(-25n, 2, '3.70', 2, 'half-up'), -93n);
+  // A negative exact half rounds away from zero; PostgreSQL's plain div form would give ...475 here.
+  assert.equal(convertMoney(-9439157537n, 0, '2848253956.97801', 2, 'half-up'), -2688511780529905683476n);
+  assert.equal(convertMoney(0n, 2, '3.67', 3, 'half-up'), 0n);
+});
+
+test('rateOfAmounts gives the specified cases and rounds a half by the mode', () => {
+  assert.equal(rateOfAmounts(37033n, 2, 10000n, 2, 4, 'half-up'), '3.7033');
+  assert.equal(rateOfAmounts(2571n, 2, 700n, 2, 4, 'half-up'), '3.6729');
+  assert.equal(rateOfAmounts(2571n, 2, 700n, 2, 4, 'down'), '3.6728');
+  // 12.49 rounds once to 0.12; rounding first to 0.125 and then to two places would give 0.13.
+  assert.equal(rateOfAmounts(1249n, 0, 10000n, 0, 2, 'half-up'), '0.12');
+  // 1 / 8 = 0.125 and 3 / 8 = 0.375 exactly: halves at two places.
+  assert.equal(rateOfAmounts(1n, 2, 8n, 2, 2, 'half-up'), '0.13');
+  assert.equal(rateOfAmounts(1n, 2, 8n, 2, 2, 'half-even'), '0.12');
+  assert.equal(rateOfAmounts(3n, 2, 8n, 2, 2, 'half-even'), '0.38');
+  assert.equal(rateOfAmounts(-1n, 2, 8n, 2, 2, 'half-up'), '-0.13');
+  assert.equal(rateOfAmounts(1n, 2, -8n, 2, 2, 'half-even'), '-0.12');
+  // Too small to show at four places: returned as zero, and the caller refuses it.
+  assert.equal(rateOfAmounts(1n, 2, 10n ** 9n, 2, 4, 'half-up'), '0.0000');
+  assert.equal(rateOfAmounts(0n, 2, 700n, 2, 4, 'half-up'), '0.0000');
+  // Across exponents: AED 9.74 per BHD 1.000, JPY 1000 per USD 24.50, and zero or ten places.
+  assert.equal(rateOfAmounts(974n, 2, 1000n, 3, 4, 'half-up'), '9.7400');
+  assert.equal(rateOfAmounts(1000n, 0, 2450n, 2, 4, 'half-up'), '40.8163');
+  assert.equal(rateOfAmounts(2450n, 2, 1000n, 0, 6, 'half-up'), '0.024500');
+  assert.equal(rateOfAmounts(7n, 0, 2n, 0, 0, 'half-up'), '4');
+  assert.equal(rateOfAmounts(7n, 0, 2n, 0, 0, 'half-even'), '4');
+  assert.equal(rateOfAmounts(5n, 0, 2n, 0, 0, 'half-even'), '2');
+  assert.equal(rateOfAmounts(1n, 0, 3n, 0, 10, 'half-up'), '0.3333333333');
+});
+
+test('conversion and rate derivation refuse malformed arguments', () => {
+  for (const rate of ['0', '0.0000', '-3.67', '-0.0001']) assert.throws(() => convertMoney(1n, 2, rate, 2, 'half-up'), RangeError, rate);
+  assert.throws(() => convertMoney(1n, 2, '1.00000000001', 2, 'half-up'), RangeError);
+  assert.equal(convertMoney(10n ** 10n, 2, '1.0000000001', 2, 'half-up'), 10n ** 10n + 1n);
+  for (const rate of ['', '3.', '.5', '1e2', '3,67', ' 3.67', '+1', 3.67]) assert.throws(() => convertMoney(1n, 2, rate as string, 2, 'half-up'), TypeError, String(rate));
+  assert.throws(() => convertMoney(1 as unknown as bigint, 2, '1', 2, 'half-up'), TypeError);
+  assert.throws(() => convertMoney(1n, 1 as MoneyExponent, '1', 2, 'half-up'), RangeError);
+  assert.throws(() => convertMoney(1n, 2, '1', 4 as MoneyExponent, 'half-up'), RangeError);
+  assert.throws(() => convertMoney(1n, 2, '1', 2, 'ceiling' as MoneyRounding), TypeError);
+  assert.throws(() => rateOfAmounts(1n, 2, 0n, 2, 4, 'half-up'), RangeError);
+  for (const count of [-1, 11, 2.5, NaN, Infinity, '4']) assert.throws(() => rateOfAmounts(1n, 2, 1n, 2, count as number, 'half-up'), RangeError, String(count));
+  assert.throws(() => rateOfAmounts(1 as unknown as bigint, 2, 1n, 2, 4, 'half-up'), TypeError);
+  assert.throws(() => rateOfAmounts(1n, 2, 1 as unknown as bigint, 2, 4, 'half-up'), TypeError);
+  assert.throws(() => rateOfAmounts(1n, 5 as MoneyExponent, 1n, 2, 4, 'half-up'), RangeError);
+  assert.throws(() => rateOfAmounts(1n, 2, 1n, 2, 4, 'up' as MoneyRounding), TypeError);
+});
+
+test('conversion and rate derivation match an independent rational reference and are sign-symmetric', () => {
+  for (let index = 0; index < 4000; index++) {
+    const from = EXPONENTS[index % 3]!, to = EXPONENTS[Math.floor(index / 3) % 3]!, mode = MODES[Math.floor(index / 9) % 3]!;
+    const amount = signed(10n ** 15n), rate = formatRate(next(10n ** 9n) + 1n, Number(next(9n)));
+    const expected = rationalOracle(amount * unitsOf(rate) * pow10(to), pow10(placesOf(rate) + from), mode);
+    assert.equal(convertMoney(amount, from, rate, to, mode), expected, `${amount}@${from} × ${rate} → ${to} ${mode}`);
+    assert.equal(convertMoney(-amount, from, rate, to, mode), -expected);
+
+    const target = signed(10n ** 15n), source = (next(10n ** 12n) + 1n) * (next(2n) ? -1n : 1n), count = Number(next(11n));
+    const derived = rateOfAmounts(target, to, source, from, count, mode), sign = source < 0n ? -1n : 1n;
+    assert.equal(unitsOf(derived), rationalOracle(sign * target * pow10(from + count), sign * source * pow10(to), mode), `${target}@${to} / ${source}@${from} at ${count} ${mode}`);
+    assert.equal(placesOf(derived), count);
+    const negated = derived.startsWith('-') ? derived.slice(1) : unitsOf(derived) === 0n ? derived : `-${derived}`;
+    assert.equal(rateOfAmounts(-target, to, source, from, count, mode), negated);
+    assert.equal(rateOfAmounts(target, to, -source, from, count, mode), negated);
+  }
+});
+
+test('the derived rate agrees with the PostgreSQL integer form, and converting back stays within the documented bound', () => {
+  for (let index = 0; index < 10000; index++) {
+    const f = EXPONENTS[index % 3]!, b = EXPONENTS[Math.floor(index / 3) % 3]!;
+    const foreign = next(10n ** 13n) + 1n, rate = formatRate(next(10n ** 8n) + 1n, 4);
+    // Rate entered, as the database guard writes it: B = (2 × F × R × 10^b + 10^(4 + f)) div (2 × 10^(4 + f)).
+    const base = convertMoney(foreign, f, rate, b, 'half-up');
+    assert.equal(base, (2n * foreign * unitsOf(rate) * pow10(b) + pow10(4 + f)) / (2n * pow10(4 + f)));
+    if (base === 0n) continue;
+    // Base entered: R = (2 × B × 10^(4 + f − b) + F) div (2 × F), with 10^b moved to the divisor so no power is negative.
+    const derived = rateOfAmounts(base, b, foreign, f, 4, 'half-up');
+    assert.equal(unitsOf(derived), (2n * base * pow10(4 + f) + foreign * pow10(b)) / (2n * foreign * pow10(b)), `${base}@${b} / ${foreign}@${f}`);
+    if (unitsOf(derived) === 0n) continue;
+    // Before rounding: 2 × |F × R' × 10^b − B × 10^(4 + f)| ≤ F × 10^b.
+    const drift = foreign * unitsOf(derived) * pow10(b) - base * pow10(4 + f);
+    assert.ok(2n * (drift < 0n ? -drift : drift) <= foreign * pow10(b), `drift ${drift} for ${foreign}@${f} → ${base}@${b}`);
+    // After rounding: 2 × |B' − B| × 10^(4 + f) ≤ F × 10^b + 10^(4 + f).
+    const moved = convertMoney(foreign, f, derived, b, 'half-up') - base;
+    assert.ok(2n * (moved < 0n ? -moved : moved) * pow10(4 + f) <= foreign * pow10(b) + pow10(4 + f), `moved ${moved}`);
+  }
+});
+
+test('conversion and rate derivation hold at the bigint range limits', () => {
+  assert.equal(convertMoney(MONEY_MAX, 2, '1', 2, 'half-up'), MONEY_MAX);
+  assert.equal(convertMoney(MONEY_MIN, 3, '1.0000', 3, 'half-even'), MONEY_MIN);
+  assert.equal(convertMoney(MONEY_MAX, 3, '1', 2, 'half-up'), (MONEY_MAX + 5n) / 10n);
+  assert.equal(convertMoney(MONEY_MIN, 3, '1', 2, 'down'), MONEY_MIN / 10n);
+  // A result past the range is returned exactly, and the caller's guard refuses it.
+  const over = convertMoney(MONEY_MAX, 2, '1', 3, 'half-up');
+  assert.equal(over, MONEY_MAX * 10n);
+  assert.throws(() => assertMoneyInRange(over), RangeError);
+  assert.throws(() => assertMoneyInRange(convertMoney(MONEY_MAX, 2, '1.0001', 2, 'half-up')), RangeError);
+  assertMoneyInRange(convertMoney(MONEY_MAX, 2, '0.9999', 2, 'half-up'));
+  assert.equal(rateOfAmounts(MONEY_MAX, 2, MONEY_MAX, 2, 4, 'half-up'), '1.0000');
+  assert.equal(rateOfAmounts(MONEY_MIN, 3, MONEY_MAX, 3, 10, 'half-up'), '-1.0000000000');
+  assert.equal(rateOfAmounts(MONEY_MAX, 2, 1n, 2, 4, 'half-up'), `${MONEY_MAX}.0000`);
+  assert.equal(rateOfAmounts(1n, 0, MONEY_MAX, 0, 10, 'half-up'), '0.0000000000');
+  assert.equal(rateOfAmounts(MONEY_MIN, 3, -1n, 0, 0, 'half-up'), (-MONEY_MIN / 1000n + 1n).toString());
 });

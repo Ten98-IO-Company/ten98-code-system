@@ -20,6 +20,8 @@ export const MONEY_MAX: bigint = 2n ** 63n - 1n;
 const MAX_TEXT = 64;
 const DECIMAL = /^(-?)(\d+)(?:\.(\d+))?$/u;
 const ROUNDING: readonly string[] = ['half-up', 'half-even', 'down'] satisfies MoneyRounding[];
+// Rates accept and produce at most this many fraction digits.
+const MAX_RATE_PLACES = 10;
 
 function amountOf(value: unknown, label: string): bigint {
   if (typeof value !== 'bigint') throw new TypeError(`${label} must be a bigint amount in minor units.`);
@@ -43,6 +45,21 @@ function decimalOf(text: unknown, label: string): { units: bigint; scale: number
   const [, sign, whole, fraction = ''] = match;
   const units = BigInt(whole + fraction);
   return { units: sign ? -units : units, scale: fraction.length };
+}
+
+// A rate for convertMoney: a plain decimal above zero with at most MAX_RATE_PLACES fraction digits.
+function rateOf(text: unknown): { units: bigint; scale: number } {
+  const rate = decimalOf(text, 'Rate');
+  if (rate.units <= 0n) throw new RangeError('Rate must be above zero.');
+  if (rate.scale > MAX_RATE_PLACES) throw new RangeError(`Rate has more than ${MAX_RATE_PLACES} fraction digits.`);
+  return rate;
+}
+
+// The decimal text of `value / 10^digits`, with exactly `digits` fraction digits and no grouping.
+function decimalText(value: bigint, digits: number): string {
+  const magnitude = (value < 0n ? -value : value).toString().padStart(digits + 1, '0');
+  const split = magnitude.length - digits;
+  return `${value < 0n ? '-' : ''}${magnitude.slice(0, split)}${digits ? `.${magnitude.slice(split)}` : ''}`;
 }
 
 // The exact quotient numerator / denominator (denominator > 0) rounded to an integer by the given mode.
@@ -79,10 +96,7 @@ export function parseMoney(text: string, exponent: MoneyExponent): bigint {
 
 /** The canonical decimal string for minor units: `formatMoney(-5n, 3) === '-0.005'`. No grouping or currency sign. */
 export function formatMoney(amount: bigint, exponent: MoneyExponent): string {
-  const value = amountOf(amount, 'Amount'), digits = exponentOf(exponent);
-  const magnitude = (value < 0n ? -value : value).toString().padStart(digits + 1, '0');
-  const split = magnitude.length - digits;
-  return `${value < 0n ? '-' : ''}${magnitude.slice(0, split)}${digits ? `.${magnitude.slice(split)}` : ''}`;
+  return decimalText(amountOf(amount, 'Amount'), exponentOf(exponent));
 }
 
 /** `a + b` for bigint minor units of one currency; the caller keeps currencies apart. */
@@ -111,6 +125,56 @@ export function multiplyMoney(amount: bigint, rate: string, rounding: MoneyRound
 export function percentOfMoney(amount: bigint, percent: string, rounding: MoneyRounding): bigint {
   const value = amountOf(amount, 'Amount'), mode = roundingOf(rounding), { units, scale } = decimalOf(percent, 'Percent');
   return divideRounded(value * units, 10n ** BigInt(scale + 2), mode);
+}
+
+/**
+ * `amount × rate` from one currency's minor units to another's, with one rounding: `convertMoney(700n, 2, '3.67', 2,
+ * 'half-up') === 2569n` (USD 7.00 at 3.67 is AED 25.69). The rate is target units per source unit, a plain decimal
+ * above zero with at most 10 fraction digits; anything else is a TypeError or RangeError. The result equals
+ * `round(amount × units × 10^(toExponent − fromExponent) / 10^places)` computed on exact integers.
+ *
+ * The result is NOT range-checked: it can exceed the PostgreSQL `bigint` range, so call `assertMoneyInRange` on it
+ * before storing it.
+ *
+ * In PostgreSQL, half-up is `sign(F) * div(2 * abs(F) * R * power(10::numeric, b) + power(10::numeric, p + f),
+ * 2 * power(10::numeric, p + f))` on `numeric` values, where `R` is the rate's integer units, `p` its places, `f` and
+ * `b` the exponents. `div` truncates toward zero, so the form without `sign` and `abs` is exact only for positive
+ * amounts.
+ */
+export function convertMoney(amount: bigint, fromExponent: MoneyExponent, rate: string, toExponent: MoneyExponent, rounding: MoneyRounding): bigint {
+  const value = amountOf(amount, 'Amount'), from = exponentOf(fromExponent), to = exponentOf(toExponent);
+  const mode = roundingOf(rounding), { units, scale } = rateOf(rate);
+  const up = to > from ? BigInt(to - from) : 0n, down = from > to ? BigInt(from - to) : 0n;
+  return divideRounded(value * units * 10n ** up, 10n ** (BigInt(scale) + down), mode);
+}
+
+/**
+ * The rate (target units per source unit) that two amounts imply, as a decimal string with exactly `places` digits
+ * (an integer from 0 to 10), rounded once: `rateOfAmounts(2571n, 2, 700n, 2, 4, 'half-up') === '3.6729'`. It is the
+ * exact `target × 10^(sourceExponent + places) / (source × 10^targetExponent)` rounded by one integer division, so
+ * it never rounds twice. A zero `source` is a RangeError.
+ *
+ * Amounts of opposite sign give a negative rate, and a result can be zero (`'0.0000'`) or too large for the caller's
+ * column; all are returned, not refused. `convertMoney` refuses zero and negative rates, so a caller that feeds this
+ * result into it must check the rate first. Converting `source` back at this rate drifts from `target` by at most
+ * `|source| × 10^(targetExponent − sourceExponent − places) / 2` before rounding, plus half a unit after it, and
+ * that converted amount is NOT range-checked: call `assertMoneyInRange` on it before storing it.
+ *
+ * In PostgreSQL, the half-up rate units are `sign(T) * sign(S) * div(2 * abs(T) * power(10::numeric, s + places) +
+ * abs(S) * power(10::numeric, t), 2 * abs(S) * power(10::numeric, t))` on `numeric` values, where `t` and `s` are the
+ * target and source exponents. `div` truncates toward zero, so the form without `sign` and `abs` is exact only for
+ * positive amounts.
+ */
+export function rateOfAmounts(target: bigint, targetExponent: MoneyExponent, source: bigint, sourceExponent: MoneyExponent, places: number, rounding: MoneyRounding): string {
+  const to = amountOf(target, 'Target'), toDigits = exponentOf(targetExponent);
+  const from = amountOf(source, 'Source'), fromDigits = exponentOf(sourceExponent), mode = roundingOf(rounding);
+  if (!Number.isSafeInteger(places) || places < 0 || places > MAX_RATE_PLACES) {
+    throw new RangeError(`Places must be an integer from 0 to ${MAX_RATE_PLACES}.`);
+  }
+  if (from === 0n) throw new RangeError('Source amount must not be zero.');
+  // divideRounded needs a positive denominator; moving the source's sign onto the numerator keeps the quotient.
+  const numerator = to * 10n ** BigInt(fromDigits + places), denominator = from * 10n ** BigInt(toDigits);
+  return decimalText(divideRounded(from < 0n ? -numerator : numerator, from < 0n ? -denominator : denominator, mode), places);
 }
 
 /**

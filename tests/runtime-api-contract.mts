@@ -29,3 +29,5 @@ export const allocateMoneyType: (total: bigint, weights: readonly bigint[]) => b
 export const bahrainiDinar: current.MoneyExponent = 3;
 export const moneyRangeType: (value: unknown) => asserts value is bigint = current.assertMoneyInRange;
 export const moneyBounds: readonly [bigint, bigint] = [current.MONEY_MIN, current.MONEY_MAX];
+export const convertMoneyType: (amount: bigint, fromExponent: current.MoneyExponent, rate: string, toExponent: current.MoneyExponent, rounding: current.MoneyRounding) => bigint = current.convertMoney;
+export const rateOfAmountsType: (target: bigint, targetExponent: current.MoneyExponent, source: bigint, sourceExponent: current.MoneyExponent, places: number, rounding: current.MoneyRounding) => string = current.rateOfAmounts;
