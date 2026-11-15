@@ -55,7 +55,8 @@ export declare class TransactionRolledBackError extends Error {
  * ended in a rollback because a statement failed and the callback caught it. While the connection is checked out it has an
  * `error` listener, so a backend the server terminates fails the transaction instead of crashing the process.
  *
- * Given a transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. Any other
+ * A database on a single pg Client runs the same BEGIN, COMMIT and tag check on that client, and leaves it to its owner
+ * (never released or discarded). Given a transaction (a savepoint), it uses Drizzle's own `transaction`. Any other
  * database is refused with a TypeError rather than silently taking the leaking path: a second copy of drizzle-orm or
  * pg, or a driver other than node-postgres. `config` is Drizzle's, such as `{ accessMode: 'read only' }`; a
  * savepoint ignores it.

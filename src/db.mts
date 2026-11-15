@@ -105,7 +105,8 @@ export class TransactionRolledBackError extends Error {
  * ended in a rollback because a statement failed and the callback caught it. While the connection is checked out it has an
  * `error` listener, so a backend the server terminates fails the transaction instead of crashing the process.
  *
- * Given a transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. Any other
+ * A database on a single pg Client runs the same BEGIN, COMMIT and tag check on that client, and leaves it to its owner
+ * (never released or discarded). Given a transaction (a savepoint), it uses Drizzle's own `transaction`. Any other
  * database is refused with a TypeError rather than silently taking the leaking path: a second copy of drizzle-orm or
  * pg, or a driver other than node-postgres. `config` is Drizzle's, such as `{ accessMode: 'read only' }`; a
  * savepoint ignores it.
@@ -113,9 +114,12 @@ export class TransactionRolledBackError extends Error {
 export async function transaction<TDatabase extends AnyDatabase, T>(db: TDatabase, run: (tx: ScopedTransaction<TDatabase>) => Promise<T>, config?: PgTransactionConfig): Promise<T> {
   const pooled = db as unknown as PooledDatabase, session = pooled._?.session;
   const nodePg = session instanceof NodePgSession, pool = nodePg && isPool(pooled.$client);
-  if (db instanceof PgTransaction || (nodePg && !pool && isClient(pooled.$client))) return db.transaction(tx => run(tx as ScopedTransaction<TDatabase>), config);
-  if (!pool) throw new TypeError('transaction() needs a node-postgres Drizzle database from this copy of drizzle-orm, on a pg Pool or Client, or one of its transactions.');
-  const connection = await pooled.$client.connect();
+  if (db instanceof PgTransaction) return db.transaction(tx => run(tx as ScopedTransaction<TDatabase>), config);
+  // A single pg Client (books and discover hand one to getAuth) gets the same BEGIN, COMMIT and tag check on that client,
+  // which stays the caller's: it is never released or discarded here.
+  const single = nodePg && !pool && isClient(pooled.$client) ? pooled.$client as unknown as pg.PoolClient : undefined;
+  if (!pool && !single) throw new TypeError('transaction() needs a node-postgres Drizzle database from this copy of drizzle-orm, on a pg Pool or Client, or one of its transactions.');
+  const connection = single ?? await pooled.$client.connect();
   let broken = false;
   const ended = () => { broken = true; };
   connection.on('error', ended);
@@ -139,7 +143,7 @@ export async function transaction<TDatabase extends AnyDatabase, T>(db: TDatabas
     return result;
   } finally {
     connection.off('error', ended);
-    connection.release(broken);
+    if (!single) connection.release(broken);
   }
 }
 
