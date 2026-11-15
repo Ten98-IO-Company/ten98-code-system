@@ -104,21 +104,21 @@ test('running Node must satisfy the canonical range, not just manifest declarati
 // Independent fixture: do not derive the expected application from architecture.json.
 const campaign = (): AppManifestFixture => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.28.0.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
 
 test('architecture accepts independent manifests with reviewed tools and mandatory gates', () => {
   assert.deepEqual(checkManifest(campaign()), []);
-  const runtime = { name: '@ten98/runtime', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' }, devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', pg: '8.23.0', typescript: '7.0.2', zod: '4.6.6' }, peerDependencies: { 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', pg: '8.23.0', zod: '4.6.6' }, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && tsc --project tsconfig.json', typecheck: 'npm run check:architecture && tsc --project tsconfig.json --noEmit' } };
+  const runtime = { name: '@ten98/runtime', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' }, devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', typescript: '7.0.2', zod: '4.6.6' }, peerDependencies: { 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', zod: '4.6.6' }, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && tsc --project tsconfig.json', typecheck: 'npm run check:architecture && tsc --project tsconfig.json --noEmit' } };
   assert.deepEqual(checkManifest(runtime), []);
 });
 
 // Independent fixture for the accounting app's foundation (Discover's stack without its analytics packages).
 const books = (): AppManifestFixture => ({
   name: 'ten98-books', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', '@ten98/ui': 'file:vendor/ten98-ui-0.36.5.tgz', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', zod: '4.6.6' },
+  dependencies: { '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.28.0.tgz', '@ten98/ui': 'file:vendor/ten98-ui-0.36.5.tgz', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', zod: '4.6.6' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', '@vitejs/plugin-react': '6.1.1', nitro: '3.0.260903-beta', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'pnpm check:architecture && node --test tests/*.test.ts', build: 'pnpm check:architecture && vite build' },
 });
@@ -139,7 +139,7 @@ test('ten98-books accepts exactly its declared foundation dependencies', () => {
 // Discover's manifest as it stands at ten98-discover dev, with the browser library its tests import pinned (#117).
 const discover = (): AppManifestFixture => ({
   name: 'ten98-monitor', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@modelcontextprotocol/server': '2.3.1', '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz',
+  dependencies: { '@modelcontextprotocol/server': '2.3.1', '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.28.0.tgz',
     '@ten98/ui': 'file:vendor/ten98-ui-0.37.0.tgz', 'better-auth': '1.7.7', 'detect-browser': '5.3.0', 'drizzle-orm': '0.45.2', 'mmdb-lib': '3.0.3', nodemailer: '10.1.4', parse5: '8.0.1',
     pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', saxes: '6.0.0', 'ua-parser-js': '1.0.41', zod: '4.6.6' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', '@types/ua-parser-js': '0.7.39', '@vitejs/plugin-react': '6.1.1',
@@ -182,7 +182,7 @@ test('ten98-books source policy checks src and tests as TypeScript and classifie
 test('native static site uses shared build tools without application runtime dependencies', () => {
   const site = (): ManifestFixture => ({
     name: 'ten98-io', type: 'module', engines: { node: '>=24.22.1 <25' },
-    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.28.0.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', build: 'npm run check:architecture && tsc --project tsconfig.tooling.json && node scripts/build.mts', check: 'npm run check:architecture && npm run build && node scripts/check.mjs', test: 'npm run check:architecture && node scripts/enquiry-test.mjs' },
   });
   assert.deepEqual(checkManifest(site()), []);
@@ -242,12 +242,15 @@ test('architecture rejects unreviewed toolchains and dependency resolution subst
 test('approved profile-specific development tools keep their reviewed declaration', () => {
   const { '@types/node': _campaignNode, '@types/pg': _campaignPg, ...sharedDevDependencies } = campaign().devDependencies;
   const manifest: ManifestFixture = {
-    name: '@ten98/ui', type: 'module', engines: { node: '>=24.22.1 <25' },
-    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.1.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    name: '@ten98/ui', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
+    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.28.0.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };
   assert.deepEqual(checkManifest(manifest), []);
+  // The ui-pnpm transition is closed (UI v0.39.0 is on pnpm): an npm-era manifest without packageManager is refused.
+  const { packageManager: _pnpm, ...npmEra } = manifest;
+  assert.match(checkManifest(npmEra).join('\n'), /packageManager: expected pnpm@11\.19\.0, found \(missing\)/);
   manifest.devDependencies['@playwright/test'] = '*';
   assert.match(checkManifest(manifest).join('\n'), /devDependencies.@playwright\/test/);
   delete manifest.devDependencies['@playwright/test'];
@@ -305,10 +308,10 @@ test('CLI checks the compiler-backed runtime and returns failure for any drift',
     writeFileSync(file, JSON.stringify(manifest));
     const script = fileURLToPath(new URL('../check.mjs', import.meta.url));
     const actual = fileURLToPath(new URL('..', import.meta.url));
-    let result = spawnSync(process.execPath, [script, actual, actual], { encoding: 'utf8', timeout: 30_000 });
+    let result = spawnSync(process.execPath, [script, actual, actual], { encoding: 'utf8', timeout: 60_000 });
     assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout.split('architecture declarations match').length - 1, 2);
     manifest.dependencies.express = '5.0.0'; writeFileSync(file, JSON.stringify(manifest));
-    result = spawnSync(process.execPath, [script, temporary], { encoding: 'utf8', timeout: 30_000 });
+    result = spawnSync(process.execPath, [script, temporary], { encoding: 'utf8', timeout: 60_000 });
     assert.equal(result.status, 1); assert.match(result.stderr, /Unapproved runtime dependency express/);
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 });

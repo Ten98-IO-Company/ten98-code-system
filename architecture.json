@@ -11,7 +11,7 @@
     "@types/react-dom": "19.2.2"
   },
   "sharedPackages": {
-    "@ten98/runtime": "file:vendor/ten98-runtime-0.27.1.tgz"
+    "@ten98/runtime": "file:vendor/ten98-runtime-0.28.0.tgz"
   },
   "sharedPackageFloors": {
     "@ten98/ui": "0.5.0"
@@ -628,6 +628,7 @@
         "@types/pg": "8.15.6",
         "better-auth": "1.7.7",
         "drizzle-orm": "0.45.2",
+        "nodemailer": "10.1.4",
         "pg": "8.23.0",
         "zod": "4.6.6"
       },
@@ -638,6 +639,7 @@
       "peerDependencies": {
         "better-auth": "1.7.7",
         "drizzle-orm": "0.45.2",
+        "nodemailer": "10.1.4",
         "pg": "8.23.0",
         "zod": "4.6.6"
       },
@@ -722,14 +724,14 @@
           "browser-audit-capsule.d.mts": "Generated declarations from src/browser-audit-capsule.mts.",
           "db.mjs": "Generated PostgreSQL pool and Drizzle entry from src/db.mts, exported as ./db only; needs the optional drizzle-orm and pg peers.",
           "db.d.mts": "Generated declarations from src/db.mts.",
-          "log.mjs": "Generated structured JSON-line logger from src/log.mts, exported as ./log only; Node standard library only.",
-          "log.d.mts": "Generated declarations from src/log.mts.",
           "tenancy.mjs": "Generated row-level security tenancy entry from src/tenancy.mts, exported as ./tenancy only; needs the optional drizzle-orm and pg peers.",
           "tenancy.d.mts": "Generated declarations from src/tenancy.mts.",
           "tenancy-testing.mjs": "Generated test-only scope setter from src/tenancy-testing.mts, exported as ./tenancy/testing only, never from ./tenancy or the root.",
           "tenancy-testing.d.mts": "Generated declarations from src/tenancy-testing.mts.",
           "config.mjs": "Generated environment and secret reader from src/config.mts, exported as ./config only; loadConfig needs the optional zod peer.",
-          "config.d.mts": "Generated declarations from src/config.mts."
+          "config.d.mts": "Generated declarations from src/config.mts.",
+          "email.mjs": "Generated transactional email sender from src/email.mts, exported as ./email only; needs the optional zod peer, and the optional nodemailer peer for SMTP, imported on first SMTP send.",
+          "email.d.mts": "Generated declarations from src/email.mts."
         },
         "compilerProjects": [
           "tsconfig.json",
@@ -889,16 +891,6 @@
       "reason": "Campaign builds on node:24.22.1-alpine.",
       "owner": "ten98-campaign",
       "doneWhen": "Every Dockerfile stage in Campaign uses node:24.22.1-slim."
-    },
-    "ui-pnpm": {
-      "rule": "packageManager",
-      "profile": "@ten98/ui",
-      "items": [
-        "unset"
-      ],
-      "reason": "The design system installs with npm from package-lock.json.",
-      "owner": "@ten98/ui",
-      "doneWhen": "@ten98/ui declares pnpm@11.19.0 and commits pnpm-lock.yaml in place of package-lock.json."
     },
     "io-pnpm": {
       "rule": "packageManager",

@@ -98,7 +98,7 @@ export function createTenancy({ setting, column, tables }) {
         const ids = workspaceIds.filter(id => typeof id === 'string' && uuid.test(id)).map(id => id.toLowerCase());
         if (!ids.length || typeof userId !== 'string')
             return [];
-        const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role, started: sql `transaction_timestamp()::text` })
+        const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role, started: sql `extract(epoch from transaction_timestamp())::text` })
             .from(membership).innerJoin(workspace, eq(workspace.id, membership.workspaceId))
             .where(and(eq(membership.userId, userId), inArray(membership.workspaceId, ids)))
             .orderBy(workspace.createdAt, workspace.id);

@@ -129,7 +129,7 @@ export function createTenancy<TTable extends string>({ setting, column, tables }
     record: LockRecord | undefined, locked: LockRecord | undefined): Promise<WorkspaceAccess[]> {
     const ids = workspaceIds.filter(id => typeof id === 'string' && uuid.test(id)).map(id => id.toLowerCase());
     if (!ids.length || typeof userId !== 'string') return [];
-    const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role, started: sql<string>`transaction_timestamp()::text` })
+    const query = tx.select({ workspaceId: workspace.id, name: workspace.name, role: membership.role, started: sql<string>`extract(epoch from transaction_timestamp())::text` })
       .from(membership).innerJoin(workspace, eq(workspace.id, membership.workspaceId))
       .where(and(eq(membership.userId, userId), inArray(membership.workspaceId, ids)))
       .orderBy(workspace.createdAt, workspace.id);
