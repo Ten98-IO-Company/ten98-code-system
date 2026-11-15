@@ -5,16 +5,16 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { checkManifest, checkRuntimeVersion, inspectSourcePolicy } from '../check.mjs';
+import { checkDeployment, checkManifest, checkRuntimeVersion, driftReport, inspectSourcePolicy, resolveProfile } from '../check.mjs';
 import type { PackageManifest } from '../check.mjs';
 import { inspectDatabasePolicy } from '../database-policy.mjs';
 
 type StringMap = Record<string, string>;
 interface DatabaseDeclaration { engine: string; exception?: string; transition?: string }
 interface DatabaseFixture {
-  policy: { default: string; integration: string; stateless: string;
-    exceptions: Record<string, { engine: string; profiles: string[]; purpose: string; requirement: string; review: string }>;
-    transitions: Record<string, { profile: string; engine: string; target: string; reason: string; review: string }> };
+  policy: { default: string; integration: string; stateless: string; driver: string; postgresql: string; otherDrivers: string[] };
+  exceptions: Record<string, { rule: string; profiles: string[]; items: string[]; purpose: string }>;
+  transitions: Record<string, { rule: string; profile: string; items: string[] }>;
   profiles: Record<string, { database?: DatabaseDeclaration }>;
 }
 // Fixture manifests keep the maps that the tests mutate present.
@@ -23,9 +23,9 @@ type AppManifestFixture = ManifestFixture & { dependencies: StringMap };
 type ManifestChange = [(m: AppManifestFixture) => void, RegExp];
 
 const databaseFixture = (): DatabaseFixture => ({
-  policy: { default: 'postgresql', integration: 'drizzle', stateless: 'none',
-    exceptions: { native: { engine: 'd1', profiles: ['site'], purpose: 'native-platform-binding', requirement: 'Native D1 binding', review: 'issue7' } },
-    transitions: { existing: { profile: 'existing', engine: 'sqlite', target: 'postgresql', reason: 'Preserve installed data pending verified parity', review: 'issue7' } } },
+  policy: { default: 'postgresql', integration: 'drizzle', stateless: 'none', driver: 'pg', postgresql: '18', otherDrivers: ['postgres', 'better-sqlite3'] },
+  exceptions: { native: { rule: 'database.engine', profiles: ['site'], items: ['d1'], purpose: 'native-platform-binding' } },
+  transitions: { existing: { rule: 'database.engine', profile: 'existing', items: ['sqlite'] } },
   profiles: { app: { database: { engine: 'postgresql' } }, library: { database: { engine: 'none' } },
     site: { database: { engine: 'd1', exception: 'native' } }, existing: { database: { engine: 'sqlite', transition: 'existing' } } },
 });
@@ -36,9 +36,9 @@ test('canonical database default is PostgreSQL with Drizzle and no database in s
   assert.equal(contract.databasePolicy.integration, 'drizzle');
   assert.equal(contract.profiles['@ten98/runtime'].database.engine, 'none');
   assert.equal(contract.profiles['@ten98/ui'].database.engine, 'none');
-  assert.deepEqual(inspectDatabasePolicy(contract.databasePolicy, contract.profiles), []);
-  const { policy, profiles } = databaseFixture();
-  assert.deepEqual(inspectDatabasePolicy(policy, profiles), []);
+  assert.deepEqual(inspectDatabasePolicy(contract.databasePolicy, Object.fromEntries(Object.keys(contract.profiles).map(name => [name, resolveProfile(name)?.profile])), contract.exceptions, contract.transitions), []);
+  const { policy, profiles, exceptions, transitions } = databaseFixture();
+  assert.deepEqual(inspectDatabasePolicy(policy, profiles, exceptions, transitions), []);
 });
 
 test('database choices need explicit declarations and centrally reviewed exceptions', () => {
@@ -48,17 +48,20 @@ test('database choices need explicit declarations and centrally reviewed excepti
     f => { f.profiles.app.database = { engine: 'sqlite' }; },
     f => { f.profiles.app.database = { engine: 'sqlite', exception: 'not-recorded' }; },
     f => { f.profiles.app.database = { engine: 'd1', exception: 'native' }; },
-    f => { f.policy.exceptions.native.purpose = 'vector-storage'; },
-    f => { f.policy.exceptions.native.purpose = ['approved-requirement'] as unknown as string; },
-    f => { f.policy.exceptions.native.requirement = ''; },
-    f => { f.policy.exceptions.native.review = ''; },
-    f => { f.policy.transitions.existing.target = 'sqlite'; },
-    f => { f.policy.transitions.existing.reason = ''; },
+    f => { f.exceptions.native.purpose = 'vector-storage'; },
+    f => { f.exceptions.native.purpose = ['approved-requirement'] as unknown as string; },
+    f => { f.exceptions.native.items = ['d1', 'sqlite']; },
+    f => { f.exceptions.native.profiles = ['app']; },
+    f => { f.transitions.existing.items = ['postgresql']; },
+    f => { f.transitions.existing.profile = 'app'; },
+    f => { f.policy.driver = 'postgres'; },
+    f => { f.policy.postgresql = 'latest'; },
+    f => { f.policy.otherDrivers = ['pg']; },
     f => { f.profiles.library.database = { engine: 'none', exception: 'native' }; },
     f => { f.profiles.app.database = [] as unknown as DatabaseDeclaration; },
   ] satisfies ((f: DatabaseFixture) => void)[]) {
     const fixture = databaseFixture(); mutate(fixture);
-    assert.ok(inspectDatabasePolicy(fixture.policy, fixture.profiles).length > 0);
+    assert.ok(inspectDatabasePolicy(fixture.policy, fixture.profiles, fixture.exceptions, fixture.transitions).length > 0);
   }
   assert.ok(inspectDatabasePolicy(null, null).length > 0);
 });
@@ -71,7 +74,7 @@ test('canonical checker CLI enforces database policy before accepting a reviewed
     for (const name of ['check.mjs', 'database-policy.mjs']) writeFileSync(join(checkerFolder, name), readFileSync(new URL('../' + name, import.meta.url)));
     const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
     contract.profiles['fixture-stateful'] = { dependencies: {}, devDependencies: {}, sharedDependencies: [], sharedDevDependencies: [], peerDependencies: {}, checkScripts: ['test'], database: { engine: 'postgresql' } };
-    const manifest = { name: 'fixture-stateful', type: 'module', engines: { node: '>=24.22.1 <25' },
+    const manifest = { name: 'fixture-stateful', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
       scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test' } };
     writeFileSync(join(directory, 'package.json'), JSON.stringify(manifest));
     const run = () => {
@@ -101,21 +104,21 @@ test('running Node must satisfy the canonical range, not just manifest declarati
 // Independent fixture: do not derive the expected application from architecture.json.
 const campaign = (): AppManifestFixture => ({
   name: 'ten98-campaign', type: 'module', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.26.0.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
+  dependencies: { '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.0.tgz', 'drizzle-orm': '0.45.2', 'openid-client': '6.8.8', pg: '8.23.0', 'qrcode-generator': '2.0.4', react: '19.2.8', 'react-dom': '19.2.8' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && vite build' },
 });
 
 test('architecture accepts independent manifests with reviewed tools and mandatory gates', () => {
   assert.deepEqual(checkManifest(campaign()), []);
-  const runtime = { name: '@ten98/runtime', type: 'module', engines: { node: '>=24.22.1 <25' }, devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', 'better-auth': '1.7.7', pg: '8.23.0', typescript: '7.0.2' }, peerDependencies: { 'better-auth': '1.7.7' }, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && tsc --project tsconfig.json', typecheck: 'npm run check:architecture && tsc --project tsconfig.json --noEmit' } };
+  const runtime = { name: '@ten98/runtime', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' }, devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', pg: '8.23.0', typescript: '7.0.2' }, peerDependencies: { 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', pg: '8.23.0' }, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test', build: 'npm run check:architecture && tsc --project tsconfig.json', typecheck: 'npm run check:architecture && tsc --project tsconfig.json --noEmit' } };
   assert.deepEqual(checkManifest(runtime), []);
 });
 
 // Independent fixture for the accounting app's foundation (Discover's stack without its analytics packages).
 const books = (): AppManifestFixture => ({
-  name: 'ten98-books', type: 'module', engines: { node: '>=24.22.1 <25' },
-  dependencies: { '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.26.0.tgz', '@ten98/ui': 'file:vendor/ten98-ui-0.36.5.tgz', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', zod: '4.6.6' },
+  name: 'ten98-books', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
+  dependencies: { '@tanstack/react-router': '1.170.42', '@tanstack/react-start': '1.168.61', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.0.tgz', '@ten98/ui': 'file:vendor/ten98-ui-0.36.5.tgz', 'better-auth': '1.7.7', 'drizzle-orm': '0.45.2', nodemailer: '10.1.4', pg: '8.23.0', 'pg-boss': '12.37.1', react: '19.2.8', 'react-dom': '19.2.8', zod: '4.6.6' },
   devDependencies: { '@types/node': '24.10.1', '@types/pg': '8.15.6', '@types/react': '19.2.2', '@types/react-dom': '19.2.2', '@vitejs/plugin-react': '6.1.1', nitro: '3.0.260903-beta', typescript: '7.0.2', vite: '8.3.4' },
   scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'pnpm check:architecture && node --test tests/*.test.ts', build: 'pnpm check:architecture && vite build' },
 });
@@ -155,7 +158,7 @@ test('ten98-books source policy checks src and tests as TypeScript and classifie
 test('native static site uses shared build tools without application runtime dependencies', () => {
   const site = (): ManifestFixture => ({
     name: 'ten98-io', type: 'module', engines: { node: '>=24.22.1 <25' },
-    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.26.0.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { wrangler: '4.145.0', '@types/node': '24.10.1', typescript: '7.0.2', '@ten98/ui': 'file:vendor/ten98-ui-0.5.2.tgz', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.0.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', build: 'npm run check:architecture && tsc --project tsconfig.tooling.json && node scripts/build.mts', check: 'npm run check:architecture && npm run build && node scripts/check.mjs', test: 'npm run check:architecture && node scripts/enquiry-test.mjs' },
   });
   assert.deepEqual(checkManifest(site()), []);
@@ -216,7 +219,7 @@ test('approved profile-specific development tools keep their reviewed declaratio
   const { '@types/node': _campaignNode, '@types/pg': _campaignPg, ...sharedDevDependencies } = campaign().devDependencies;
   const manifest: ManifestFixture = {
     name: '@ten98/ui', type: 'module', engines: { node: '>=24.22.1 <25' },
-    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.26.0.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
+    devDependencies: { ...sharedDevDependencies, '@playwright/test': '^1.64.1', '@types/node': '24.10.1', '@ten98/runtime': 'file:vendor/ten98-runtime-0.27.0.tgz', react: '19.2.8', 'react-dom': '19.2.8' },
     peerDependencies: { react: '^18.3.0 || ^19.0.0', 'react-dom': '^18.3.0 || ^19.0.0' },
     scripts: campaign().scripts,
   };
@@ -274,7 +277,7 @@ test('architecture detects actual drift without consulting the contract for expe
 test('CLI checks the compiler-backed runtime and returns failure for any drift', () => {
   const temporary = mkdtempSync(join(tmpdir(), 'ten98-architecture-'));
   try {
-    const manifest: PackageManifest & { dependencies: StringMap } = { name: '@ten98/runtime', type: 'module', engines: { node: '>=24.22.1 <25' }, dependencies: {}, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test' } }, file = join(temporary, 'package.json');
+    const manifest: PackageManifest & { dependencies: StringMap } = { name: '@ten98/runtime', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' }, dependencies: {}, scripts: { 'check:architecture': 'node check.mjs .', test: 'npm run check:architecture && node --test' } }, file = join(temporary, 'package.json');
     writeFileSync(file, JSON.stringify(manifest));
     const script = fileURLToPath(new URL('../check.mjs', import.meta.url));
     const actual = fileURLToPath(new URL('..', import.meta.url));

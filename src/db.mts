@@ -1,0 +1,174 @@
+// The Ten98 PostgreSQL connection preset on node-postgres and Drizzle, promoted from Books src/server/db.ts and
+// src/server/schema.ts. It fixes the type parsing, pool defaults and per-process pool slot, and declares the common team
+// tables of workspace-team.sql for typed queries. Each app keeps its own connection URLs, migrations, schema for its own
+// tables and resource-cleanup registration. drizzle-orm and pg are exact, optional peer dependencies.
+import { sql } from 'drizzle-orm';
+import { drizzle, NodePgSession, type NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { bigint, boolean, check, foreignKey, index, pgTable, primaryKey, text, timestamp, unique, uniqueIndex, uuid,
+  type PgDatabase, type PgDialect, type PgQueryResultHKT, type PgTransaction, type PgTransactionConfig } from 'drizzle-orm/pg-core';
+import pg from 'pg';
+import { workspaceRoles } from './browser.mjs';
+
+/**
+ * PostgreSQL int8 (BIGINT, money in minor units) reads as `bigint`, never as a lossy number or a string. DATE is a
+ * calendar date and stays its YYYY-MM-DD text, never a time-zone-shifted Date. Scoped to the pools that pass it, so
+ * libraries with their own connections (pg-boss) keep their own parsing.
+ */
+export const pgTypes = {
+  getTypeParser: ((oid: number, format?: 'text' | 'binary') => format === 'binary' ? pg.types.getTypeParser(oid, format)
+    : oid === pg.types.builtins.INT8 ? (value: string) => BigInt(value)
+    : oid === pg.types.builtins.DATE ? (value: string) => value
+    : pg.types.getTypeParser(oid, 'text')) as typeof pg.types.getTypeParser,
+};
+
+/** A pool with bounded waits (connect 5 s, idle 10 s, statements 10 s) and `pgTypes`; `options` override any of them. */
+export function createPool(connectionString: string, options: pg.PoolConfig = {}): pg.Pool {
+  const pool = new pg.Pool({ connectionString, max: 10, connectionTimeoutMillis: 5000, idleTimeoutMillis: 10000, statement_timeout: 10000, types: pgTypes, ...options });
+  // An idle client's error would otherwise crash the process; the message never carries connection details.
+  pool.on('error', () => console.error('Database connection failed; check database availability.'));
+  return pool;
+}
+
+export type SharedDatabase<TSchema extends Record<string, unknown>> = { pool: pg.Pool; db: NodePgDatabase<TSchema> & { $client: pg.Pool } };
+export interface SharedDatabaseOptions<TSchema extends Record<string, unknown>> {
+  /** Names the slot process-wide (`Symbol.for(key)`), such as `ten98-books.database`. */
+  key: string;
+  /** The URL, or a function read on first use, so configuration is loaded only when the database is. */
+  connectionString: string | (() => string);
+  schema: TSchema;
+  pool?: pg.PoolConfig;
+  /** Runs once per opened pool, for the app's own cleanup registration. */
+  onOpen?(database: SharedDatabase<TSchema>): void;
+}
+
+/**
+ * One pool per process, kept on globalThis. Bundlers can load separate copies of an app module (Nitro's entry and
+ * TanStack Start's SSR routes), and every copy that names the same key shares this slot instead of opening its own pool.
+ */
+export function sharedDatabase<TSchema extends Record<string, unknown>>(options: SharedDatabaseOptions<TSchema>): { get(): SharedDatabase<TSchema>; close(): Promise<void> } {
+  if (typeof options.key !== 'string' || !options.key) throw new TypeError('A shared database needs a key.');
+  const key = Symbol.for(options.key);
+  const shared = globalThis as unknown as Record<symbol, SharedDatabase<TSchema> | undefined>;
+  return {
+    get() {
+      let database = shared[key];
+      if (!database) {
+        const url = typeof options.connectionString === 'function' ? options.connectionString() : options.connectionString;
+        const pool = createPool(url, options.pool);
+        database = shared[key] = { pool, db: drizzle(pool, { schema: options.schema }) };
+        options.onOpen?.(database);
+      }
+      return database;
+    },
+    async close() {
+      // Release the slot before ending, so a concurrent close from another bundle never ends the same pool twice.
+      const database = shared[key];
+      shared[key] = undefined;
+      if (database) await database.pool.end();
+    },
+  };
+}
+
+// Any Drizzle PostgreSQL database; `ScopedTransaction` is the transaction its `transaction` hands out.
+export type AnyDatabase = PgDatabase<PgQueryResultHKT, any, any>;
+export type ScopedTransaction<TDatabase extends AnyDatabase> = TDatabase extends PgDatabase<infer H, infer F, infer S> ? PgTransaction<H, F, S> : never;
+// The parts of a node-postgres Drizzle database that `transaction` rebinds to one checked-out connection. `dialect`
+// and the session's `schema` and `options` are internal to drizzle-orm, which is pinned exactly for this reason.
+type PooledDatabase = { dialect: PgDialect; _?: { session?: unknown }; $client: pg.Pool };
+
+/**
+ * `db.transaction` without drizzle-orm 0.45.2's connection leak. Its node-postgres transaction sends BEGIN before its
+ * `try`, so a failed BEGIN never releases the pooled connection, and a failed ROLLBACK replaces the error that caused
+ * it. Over a pool this checks the connection out itself, as Books' tenancy did: it always releases it, discards it when
+ * BEGIN, COMMIT or ROLLBACK failed (its state is then unknown), and rethrows the callback's own error. Given a
+ * transaction (a savepoint) or a database on a single client, it uses Drizzle's own `transaction`. `config` is
+ * Drizzle's, such as `{ accessMode: 'read only' }`; a savepoint ignores it.
+ */
+export async function transaction<TDatabase extends AnyDatabase, T>(db: TDatabase, run: (tx: ScopedTransaction<TDatabase>) => Promise<T>, config?: PgTransactionConfig): Promise<T> {
+  const pooled = db as unknown as PooledDatabase, client: unknown = pooled.$client;
+  const isPool = client instanceof Object && typeof (client as pg.Pool).connect === 'function' && Object.getPrototypeOf(client).constructor.name.includes('Pool');
+  const session = pooled._?.session;
+  if (!(session instanceof NodePgSession) || !isPool) return db.transaction(tx => run(tx as ScopedTransaction<TDatabase>), config);
+  const connection = await pooled.$client.connect();
+  let failure: { error: unknown } | undefined, broken = false;
+  try {
+    const { schema, options } = session as unknown as { schema: never; options: never };
+    return await new NodePgSession(connection, pooled.dialect, schema, options).transaction(async tx => {
+      try { return await run(tx as unknown as ScopedTransaction<TDatabase>); } catch (error) { failure = { error }; throw error; }
+    }, config);
+  } catch (error) {
+    broken = !failure || error !== failure.error;
+    throw failure ? failure.error : error;
+  } finally { connection.release(broken); }
+}
+
+// The common team tables exactly as workspace-team.sql creates them, constraint names included, so Drizzle queries are
+// typed and a drizzle-kit diff against that schema finds nothing to change. workspace-team.sql stays the definition.
+export const user = pgTable('user', {
+  id: text('id').primaryKey(), name: text('name').notNull(), email: text('email').notNull().unique('user_email_key'),
+  emailVerified: boolean('emailVerified').notNull().default(false), image: text('image'),
+  createdAt: timestamp('createdAt', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updatedAt', { withTimezone: true }).notNull().defaultNow(),
+  twoFactorEnabled: boolean('twoFactorEnabled').notNull().default(false), closedAt: timestamp('closed_at', { withTimezone: true }),
+}, table => [uniqueIndex('user_email_normalized_idx').on(sql`lower(${table.email})`)]);
+
+export const account = pgTable('account', {
+  id: text('id').primaryKey(), accountId: text('accountId').notNull(), providerId: text('providerId').notNull(), userId: text('userId').notNull(),
+  password: text('password'),
+  createdAt: timestamp('createdAt', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updatedAt', { withTimezone: true }).notNull().defaultNow(),
+}, table => [
+  foreignKey({ name: 'account_userId_fkey', columns: [table.userId], foreignColumns: [user.id] }).onDelete('cascade'),
+  unique('account_providerId_accountId_key').on(table.providerId, table.accountId),
+  index('account_user_idx').on(table.userId),
+]);
+
+export const workspace = pgTable('workspace', {
+  id: text('id').primaryKey(), name: text('name').notNull(), createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const membership = pgTable('membership', {
+  workspaceId: text('workspace_id').notNull(), userId: text('user_id').notNull(), role: text('role', { enum: workspaceRoles }).notNull(),
+}, table => [
+  primaryKey({ name: 'membership_pkey', columns: [table.workspaceId, table.userId] }),
+  foreignKey({ name: 'membership_workspace_id_fkey', columns: [table.workspaceId], foreignColumns: [workspace.id] }).onDelete('cascade'),
+  foreignKey({ name: 'membership_user_id_fkey', columns: [table.userId], foreignColumns: [user.id] }).onDelete('cascade'),
+  check('membership_role_check', sql`${table.role} IN ('owner','admin','editor','viewer')`),
+  index('membership_user_idx').on(table.userId),
+]);
+
+export const workspaceInvitation = pgTable('workspace_invitation', {
+  id: uuid('id').primaryKey(), workspaceId: text('workspace_id').notNull(), inviterId: text('inviter_id').notNull(), email: text('email').notNull(),
+  role: text('role', { enum: ['admin', 'editor', 'viewer'] }).notNull(), tokenHash: text('token_hash').notNull().unique('workspace_invitation_token_hash_key'),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(), createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, table => [
+  foreignKey({ name: 'workspace_invitation_workspace_id_fkey', columns: [table.workspaceId], foreignColumns: [workspace.id] }).onDelete('cascade'),
+  foreignKey({ name: 'workspace_invitation_inviter_id_fkey', columns: [table.inviterId], foreignColumns: [user.id] }).onDelete('cascade'),
+  check('workspace_invitation_email_check', sql`${table.email} = lower(${table.email})`),
+  check('workspace_invitation_role_check', sql`${table.role} IN ('admin', 'editor', 'viewer')`),
+  check('workspace_invitation_token_hash_check', sql`length(${table.tokenHash}) = 64`),
+  unique('workspace_invitation_workspace_id_email_key').on(table.workspaceId, table.email),
+]);
+
+export const workspaceTwoFactorRequirement = pgTable('workspace_two_factor_requirement', {
+  workspaceId: text('workspace_id').primaryKey(),
+}, table => [foreignKey({ name: 'workspace_two_factor_requirement_workspace_id_fkey', columns: [table.workspaceId], foreignColumns: [workspace.id] }).onDelete('cascade')]);
+
+export const instanceOperator = pgTable('instance_operator', {
+  userId: text('user_id').primaryKey(), source: text('source', { enum: ['bootstrap', 'host'] }).notNull(),
+  grantedAt: timestamp('granted_at', { withTimezone: true }).notNull().defaultNow(),
+}, table => [
+  foreignKey({ name: 'instance_operator_user_id_fkey', columns: [table.userId], foreignColumns: [user.id] }).onDelete('cascade'),
+  check('instance_operator_source_check', sql`${table.source} IN ('bootstrap','host')`),
+]);
+
+export const instanceOperatorAudit = pgTable('instance_operator_audit', {
+  id: bigint('id', { mode: 'bigint' }).primaryKey().generatedAlwaysAsIdentity(), userId: text('user_id').notNull(),
+  action: text('action', { enum: ['bootstrap', 'grant', 'revoke', 'paid_work_export', 'email_suppression_clear'] }).notNull(), scope: text('scope'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, table => [
+  check('instance_operator_audit_action_check', sql`${table.action} IN ('bootstrap','grant','revoke','paid_work_export','email_suppression_clear')`),
+  check('instance_operator_audit_scope_check', sql`(${table.action} = 'paid_work_export') = (${table.scope} IS NOT NULL)
+    AND (${table.scope} IS NULL OR ${table.scope} ~ '^workspace:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(/website:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$')`),
+]);
+
+/** The team tables as one object, to spread into an app's Drizzle schema. */
+export const teamSchema = { user, account, workspace, membership, workspaceInvitation, workspaceTwoFactorRequirement, instanceOperator, instanceOperatorAudit };

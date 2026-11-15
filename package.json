@@ -1,8 +1,8 @@
 {
   "name": "@ten98/runtime",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "packageManager": "pnpm@11.19.0",
-  "description": "Shared HTTP, provider, email, migration, OIDC and identity primitives for ten98 applications",
+  "description": "Shared framework for ten98 applications: HTTP, provider, email, migration, OIDC, identity, database and tenancy mechanisms",
   "type": "module",
   "license": "MIT",
   "main": "./index.mjs",
@@ -27,6 +27,14 @@
     "./browser-audit-capsule": {
       "types": "./browser-audit-capsule.d.mts",
       "import": "./browser-audit-capsule.mjs"
+    },
+    "./db": {
+      "types": "./db.d.mts",
+      "import": "./db.mjs"
+    },
+    "./tenancy": {
+      "types": "./tenancy.d.mts",
+      "import": "./tenancy.mjs"
     }
   },
   "files": [
@@ -118,7 +126,13 @@
     "src/browser-audit-egress.mts",
     "browser-audit-capsule.mjs",
     "browser-audit-capsule.d.mts",
-    "src/browser-audit-capsule.mts"
+    "src/browser-audit-capsule.mts",
+    "db.mjs",
+    "db.d.mts",
+    "src/db.mts",
+    "tenancy.mjs",
+    "tenancy.d.mts",
+    "src/tenancy.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
@@ -138,14 +152,23 @@
     "@types/node": "24.10.1",
     "@types/pg": "8.15.6",
     "better-auth": "1.7.7",
+    "drizzle-orm": "0.45.2",
     "pg": "8.23.0",
     "typescript": "7.0.2"
   },
   "peerDependencies": {
-    "better-auth": "1.7.7"
+    "better-auth": "1.7.7",
+    "drizzle-orm": "0.45.2",
+    "pg": "8.23.0"
   },
   "peerDependenciesMeta": {
     "better-auth": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    },
+    "pg": {
       "optional": true
     }
   }

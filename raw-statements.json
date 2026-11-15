@@ -1,0 +1,18 @@
+{
+  "src/check.mts": {
+    "count": 8,
+    "reason": "Not statements: the raw-statement scanner's own comments and patterns name the forms it counts."
+  },
+  "src/migration-ledger.mts": {
+    "count": 16,
+    "reason": "The migration ledger applies migration files as SQL text and takes its advisory locks and schema_version rows on a pg client before any app schema exists."
+  },
+  "src/tenancy.mts": {
+    "count": 4,
+    "reason": "The policy expression is DDL, which takes no bind parameters; set_config and current_setting have no Drizzle builder; the boot role check reads system catalogues on a pg pool."
+  },
+  "src/workspace-team.mts": {
+    "count": 51,
+    "reason": "The team controller predates the Drizzle team tables; part two of the framework moves it to typed Drizzle queries and lowers this entry."
+  }
+}

@@ -6,6 +6,58 @@ import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 const contract = JSON.parse(readFileSync(new URL('./architecture.json', import.meta.url), 'utf8'));
+// The rules an exception or transition may relax; anything else is a typo that would silently waive nothing.
+const waivableRules = ['database.engine', 'packageManager', 'baseImage', 'appStack', 'profile.name'];
+export function inspectWaivers() {
+    const errors = [], text = (value) => typeof value === 'string' && value.trim().length > 0;
+    const items = (value) => value === undefined || Array.isArray(value) && value.length > 0 && value.every(text);
+    for (const [name, entry] of Object.entries(contract.exceptions ?? {})) {
+        if (!waivableRules.includes(entry?.rule) || !Array.isArray(entry.profiles) || !entry.profiles.length || entry.profiles.some(profile => !Object.hasOwn(contract.profiles, profile))
+            || !items(entry.items) || !text(entry.reason) || !text(entry.owner) || !text(entry.reviewTrigger) || !text(entry.review)) {
+            errors.push(`exceptions.${name} needs a known rule, known profiles, a reason, an owner, a review trigger and a review record.`);
+        }
+    }
+    const stack = new Set([...Object.keys(contract.appStack?.dependencies ?? {}), ...Object.keys(contract.appStack?.devDependencies ?? {})]);
+    for (const [name, entry] of Object.entries(contract.transitions ?? {})) {
+        // A transition names what it still allows, so it relaxes a rule to the app's recorded current state, not entirely.
+        if (!waivableRules.includes(entry?.rule) || !Object.hasOwn(contract.profiles, entry.profile) || !items(entry.items)
+            || entry.rule !== 'database.engine' && entry.items === undefined
+            || entry.rule === 'appStack' && entry.items?.some(item => !stack.has(item))
+            || !text(entry.reason) || !text(entry.owner) || !text(entry.doneWhen)) {
+            errors.push(`transitions.${name} needs a known rule, a known profile, the items it still allows, a reason, an owner and a done-when condition.`);
+        }
+    }
+    // One shared stack: an app profile adds libraries and its own source and data roots, and cannot restate the stack.
+    const own = new Set(['stack', 'boundary', 'dependencies', 'devDependencies', 'sourceLanguage', 'data']);
+    for (const [name, profile] of Object.entries(contract.profiles)) {
+        if (profile.stack !== 'app')
+            continue;
+        const restated = [...Object.keys(profile).filter(key => !own.has(key)), ...Object.keys({ ...profile.dependencies, ...profile.devDependencies }).filter(item => stack.has(item))];
+        if (restated.length)
+            errors.push(`profiles.${name} restates the shared app stack (${restated.join(', ')}); change appStack or record a transition.`);
+    }
+    return errors;
+}
+// Whether a transition for this profile and rule allows `value`; `unset` stands for an absent field.
+function transitionAllows(profile, rule, value) {
+    return transitionsFor(profile, rule).some(entry => entry.items?.includes(value ?? 'unset'));
+}
+// Open transitions for a profile and rule; their items name what each transition still waives.
+function transitionsFor(profile, rule) {
+    return Object.values(contract.transitions ?? {}).filter(entry => entry.profile === profile && entry.rule === rule);
+}
+/** The profile a package name resolves to, with an app profile merged over the shared app stack. */
+export function resolveProfile(packageName) {
+    const name = Object.hasOwn(contract.profiles, packageName) ? packageName
+        : Object.values(contract.transitions ?? {}).find(entry => entry.rule === 'profile.name' && entry.items?.includes(packageName))?.profile;
+    const declared = name === undefined ? undefined : contract.profiles[name];
+    if (name === undefined || !declared)
+        return undefined;
+    if (declared.stack !== 'app')
+        return { name, profile: declared };
+    const { stack: _stack, ...own } = declared, base = contract.appStack;
+    return { name, profile: { ...base, ...own, dependencies: { ...base.dependencies, ...own.dependencies }, devDependencies: { ...base.devDependencies, ...own.devDependencies } } };
+}
 // Caught values are unknown; Error instances carry the message the CLI reports.
 function messageOf(error) {
     return error instanceof Error ? error.message : String(error);
@@ -50,10 +102,13 @@ export function checkVendoredFloors(directory, manifest) {
 }
 // This checks declared dependencies and build gates, not application security or behavior.
 export function checkManifest(manifest) {
-    const profileName = String(manifest.name);
-    const errors = inspectDatabasePolicy(contract.databasePolicy, contract.profiles), profile = Object.hasOwn(contract.profiles, profileName) ? contract.profiles[profileName] : undefined;
-    if (!profile)
+    const errors = [...inspectDatabasePolicy(contract.databasePolicy, Object.fromEntries(Object.keys(contract.profiles).map(name => [name, resolveProfile(name)?.profile])), contract.exceptions, contract.transitions), ...inspectWaivers()];
+    const resolved = resolveProfile(String(manifest.name));
+    if (!resolved)
         return [`Unknown architecture profile: ${manifest.name ?? '(missing name)'}. Update architecture.json after review.`];
+    const { name: profileName, profile } = resolved;
+    // Shared app-stack libraries an open transition still lets this app go without; present ones must still match.
+    const pending = new Set(transitionsFor(profileName, 'appStack').flatMap(entry => entry.items ?? []));
     const shared = { ...contract.sharedVersions, ...contract.sharedPackages };
     const floors = contract.sharedPackageFloors ?? {};
     const same = (actual, expected, label) => { if (actual !== expected)
@@ -80,9 +135,18 @@ export function checkManifest(manifest) {
     };
     same(manifest.engines?.node, contract.node, 'engines.node');
     same(manifest.type, 'module', 'type');
+    if (!transitionAllows(profileName, 'packageManager', manifest.packageManager))
+        same(manifest.packageManager, contract.packageManager, 'packageManager');
+    const drivers = new Set(contract.databasePolicy.otherDrivers);
+    for (const section of [manifest.dependencies, manifest.optionalDependencies, manifest.devDependencies, manifest.peerDependencies]) {
+        for (const name of Object.keys(section ?? {}))
+            if (drivers.has(name))
+                errors.push(`Second database driver ${name}: applications reach PostgreSQL only through pg and Drizzle.`);
+    }
     const expected = { ...profile.dependencies, ...Object.fromEntries(profile.sharedDependencies.map(name => [name, shared[name]])) };
     for (const [name, version] of Object.entries(expected))
-        pinned(name, manifest.dependencies?.[name], version, `dependencies.${name}`);
+        if (!pending.has(name) || manifest.dependencies?.[name] !== undefined)
+            pinned(name, manifest.dependencies?.[name], version, `dependencies.${name}`);
     for (const name of Object.keys(manifest.dependencies ?? {}))
         if (!Object.hasOwn(expected, name))
             errors.push(`Unapproved runtime dependency ${name}. Update architecture.json after review.`);
@@ -90,7 +154,8 @@ export function checkManifest(manifest) {
         errors.push(`Unapproved optional runtime dependency ${name}. Update architecture.json after review.`);
     const expectedDev = { ...profile.devDependencies, ...Object.fromEntries(profile.sharedDevDependencies.map(name => [name, shared[name]])) };
     for (const [name, version] of Object.entries(expectedDev))
-        pinned(name, manifest.devDependencies?.[name], version, `devDependencies.${name}`);
+        if (!pending.has(name) || manifest.devDependencies?.[name] !== undefined)
+            pinned(name, manifest.devDependencies?.[name], version, `devDependencies.${name}`);
     for (const name of Object.keys(manifest.devDependencies ?? {}))
         if (!Object.hasOwn(expectedDev, name))
             errors.push(`Unapproved development dependency ${name}. Update architecture.json after review.`);
@@ -213,7 +278,7 @@ export function inspectSourcePolicy(directory, policy, compilation) {
     return errors;
 }
 export function checkSourceLanguage(directory, name) {
-    const policy = contract.profiles[name]?.sourceLanguage;
+    const policy = resolveProfile(name)?.profile.sourceLanguage;
     if (!policy)
         return [];
     directory = resolve(directory);
@@ -342,7 +407,7 @@ function resolveParseAst(directory) {
 // Ratchet: a file may not exceed its baseline count for any rule; unlisted files and rules allow 0.
 // parseAst is injectable for tests; the CLI always resolves it from the consumer and fails closed.
 export function checkPresentation(directory, name, { parseAst = resolveParseAst(directory) } = {}) {
-    const policy = contract.profiles[name]?.presentation;
+    const policy = resolveProfile(name)?.profile.presentation;
     if (!policy)
         return [];
     if (typeof parseAst !== 'function')
@@ -363,7 +428,7 @@ export function checkPresentation(directory, name, { parseAst = resolveParseAst(
 // Only lowers or removes entries: any rise or new violation refuses and reports the errors instead.
 // A missing baseline is recorded once from current counts; that first file is reviewed in the app's diff.
 export function updatePresentationBaseline(directory, name, options = {}) {
-    const policy = contract.profiles[name]?.presentation;
+    const policy = resolveProfile(name)?.profile.presentation;
     if (!policy?.baseline)
         return [];
     const parseAst = options.parseAst ?? resolveParseAst(directory);
@@ -378,6 +443,197 @@ export function updatePresentationBaseline(directory, name, options = {}) {
         return errors;
     writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1)), null, 2)}\n`);
     return [];
+}
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+// Container files at the app root and one folder below it (deploy/, docker/), skipping installed and built output.
+function containerFiles(directory, pattern) {
+    const skip = new Set(['node_modules', '.git', 'vendor', 'dist', '.output', 'build', 'coverage']), files = [];
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (entry.isFile() && pattern.test(entry.name))
+            files.push(entry.name);
+        else if (entry.isDirectory() && !skip.has(entry.name)) {
+            for (const inner of readdirSync(resolve(directory, entry.name), { withFileTypes: true }))
+                if (inner.isFile() && pattern.test(inner.name))
+                    files.push(`${entry.name}/${inner.name}`);
+        }
+    }
+    return files.sort();
+}
+// Text matching of the app's Dockerfiles and compose files, not a parser: an image named through a build argument or
+// an environment default without a literal `postgres` reference, or a differently named PostgreSQL image (pgvector,
+// a registry mirror), is outside this check.
+export function checkDeployment(directory, packageName) {
+    const resolved = resolveProfile(packageName);
+    if (!resolved)
+        return [];
+    directory = resolve(directory);
+    const errors = [];
+    const digest = '(?:@sha256:[0-9a-f]{64})?';
+    const allowed = [contract.baseImage, ...transitionsFor(resolved.name, 'baseImage').flatMap(entry => entry.items ?? [])];
+    const base = new RegExp(`^(?:${allowed.map(escapeRegExp).join('|')})${digest}$`, 'u');
+    for (const name of containerFiles(directory, /^(?:Dockerfile|Containerfile)(?:\..+)?$|\.(?:dockerfile|containerfile)$/iu)) {
+        const stages = new Set();
+        for (const line of readFileSync(resolve(directory, name), 'utf8').split(/\r?\n/u)) {
+            const from = /^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?/iu.exec(line);
+            // COPY --from= may name another image instead of a stage, which brings that image's files (and Node) along.
+            const copied = /^\s*COPY\s+(?:--\S+\s+)*?--from=(\S+)/iu.exec(line);
+            const image = from?.[1] ?? copied?.[1];
+            if (image && !stages.has(image.toLowerCase()) && !/^\d+$/u.test(image) && !base.test(image))
+                errors.push(`${name}: base image ${image} must be ${contract.baseImage}, optionally pinned by digest.`);
+            if (from?.[2])
+                stages.add(from[2].toLowerCase());
+        }
+    }
+    const major = contract.databasePolicy.postgresql;
+    const postgres = new RegExp(`^postgres:${major}(?:[.-][\\w.-]*)?${digest}$`, 'u');
+    for (const name of containerFiles(directory, /^(?:docker-)?compose(?:\.[\w-]+)*\.ya?ml$/iu)) {
+        for (const line of readFileSync(resolve(directory, name), 'utf8').split(/\r?\n/u)) {
+            const value = line.replace(/\s#.*$/u, '');
+            if (!/\bimage\b/u.test(value))
+                continue;
+            // Block and inline maps, quoted values and `${VAR:-postgres:16}` defaults; docker.io/library/ is the same image.
+            for (const match of value.matchAll(/(?:^|[\s"'{,=]|:-)((?:docker\.io\/)?(?:library\/)?postgres(?:[:@][^\s"',}]*)?)(?=$|[\s"',}])/gu)) {
+                const image = match[1].replace(/^(?:docker\.io\/)?(?:library\/)?/u, '');
+                if (!postgres.test(image))
+                    errors.push(`${name}: PostgreSQL image ${match[1]} must be major ${major} (postgres:${major}).`);
+            }
+        }
+    }
+    return errors;
+}
+// The index after an optional type argument starting at `index` (whitespace first), or `index` when there is none.
+// Brackets are balanced so object types with `;`, nested generics and `=>` arrows are skipped whole.
+function afterTypeArgument(text, index) {
+    let at = index;
+    while (/\s/u.test(text[at] ?? ''))
+        at++;
+    if (text[at] !== '<')
+        return index;
+    for (let depth = 0, end = Math.min(text.length, at + 4000); at < end; at++) {
+        if (text[at] === '<')
+            depth++;
+        else if (text[at] === '>' && text[at - 1] !== '=' && --depth === 0)
+            return at + 1;
+    }
+    return index;
+}
+// Counts raw statements in one file: a pg `.query(` call (also `['query'](` and `.query.call(`, `.apply(`, `.bind(`),
+// Drizzle `sql.raw(`, and `.execute(` given SQL text or a `sql` template, each with or without a type argument, and
+// with `sql` under any name it is imported as from drizzle-orm. Text matching, not parsing: a statement passed by
+// variable to `.execute(` or reached through a computed key is not counted, while a comment or an unrelated
+// `.query(` method is; the per-file allowlist absorbs the second kind.
+function countRawStatements(text) {
+    const names = ['sql'];
+    for (const [, list] of text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]drizzle-orm(?:\/[^'"]*)?['"]/gu)) {
+        for (const [, alias] of list.matchAll(/\bsql\s+as\s+([A-Za-z_$][\w$]*)/gu))
+            names.push(alias.replaceAll('$', '\\$'));
+    }
+    const sqlName = `(?:${names.join('|')})`, tag = new RegExp(String.raw `^${sqlName}\b`, 'u');
+    const call = /^\s*\(/u, method = /^\s*\.\s*(?:call|apply|bind)\s*\(/u, opening = /^\s*\(\s*/u, quote = /^\s*[`'"]/u;
+    let count = 0;
+    for (const match of text.matchAll(new RegExp(String.raw `\.query\b|\[\s*['"]query['"]\s*\]|\b${sqlName}\.raw\b|\.execute\b`, 'gu'))) {
+        const rest = text.slice(afterTypeArgument(text, match.index + match[0].length));
+        if (match[0].endsWith('.raw'))
+            count += Number(call.test(rest));
+        else if (match[0] !== '.execute')
+            count += Number(call.test(rest) || method.test(rest));
+        else {
+            // `.execute(` counts when its argument is SQL text or a `sql` template, itself with an optional type argument.
+            const opened = opening.exec(rest);
+            if (!opened)
+                continue;
+            let argument = rest.slice(opened[0].length);
+            const named = tag.exec(argument);
+            if (named)
+                argument = argument.slice(afterTypeArgument(argument, named[0].length));
+            count += Number(quote.test(argument));
+        }
+    }
+    return count;
+}
+function rawStatementCounts(directory, policy) {
+    const counts = {};
+    const walk = (folder) => {
+        if (!existsSync(folder))
+            return;
+        for (const entry of readdirSync(folder, { withFileTypes: true })) {
+            const file = resolve(folder, entry.name);
+            if (entry.isDirectory())
+                walk(file);
+            else if (entry.isFile() && /\.(?:[cm]?[jt]s|[jt]sx)$/u.test(entry.name) && !/\.d\.[cm]?ts$/u.test(entry.name)) {
+                const found = countRawStatements(readFileSync(file, 'utf8'));
+                if (found)
+                    counts[relative(directory, file).replaceAll('\\', '/')] = found;
+            }
+        }
+    };
+    for (const root of policy.roots)
+        walk(resolve(directory, root));
+    return counts;
+}
+function readAllowlist(directory, policy) {
+    const file = resolve(directory, policy.baseline);
+    if (!existsSync(file))
+        return { allowed: {}, exists: false, errors: [] };
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+        return { allowed: {}, exists: true, errors: [`${policy.baseline} must map each file to { "count", "reason" }.`] };
+    const allowed = {}, errors = [];
+    for (const [path, entry] of Object.entries(parsed)) {
+        const { count, reason } = (entry ?? {});
+        if (!Number.isSafeInteger(count) || count < 1)
+            errors.push(`${policy.baseline}: ${path} needs a positive whole "count".`);
+        if (typeof reason !== 'string' || !reason.trim())
+            errors.push(`${policy.baseline}: ${path} needs a "reason" saying why its raw statements cannot be typed Drizzle queries.`);
+        allowed[path] = { count: Number.isSafeInteger(count) ? count : 0, reason: typeof reason === 'string' ? reason : '' };
+    }
+    return { allowed, exists: true, errors };
+}
+function rawStatementRises(counts, allowed, baseline) {
+    return Object.entries(counts).filter(([path, found]) => found > (allowed[path]?.count ?? 0))
+        .map(([path, found]) => `${path}: raw statement count ${found} exceeds the allowlist (${allowed[path]?.count ?? 0} in ${baseline}); use a typed Drizzle query.`);
+}
+// Application queries are typed Drizzle queries. Raw statements stay only where the app's committed allowlist names
+// the file with a reason, and never more of them than it records.
+export function checkDataAccess(directory, packageName) {
+    const policy = resolveProfile(packageName)?.profile.data;
+    if (!policy)
+        return [];
+    directory = resolve(directory);
+    const { allowed, errors } = readAllowlist(directory, policy);
+    return [...errors, ...rawStatementRises(rawStatementCounts(directory, policy), allowed, policy.baseline)];
+}
+// Lowers or removes allowlist entries and keeps their reasons; a rise is refused. A missing allowlist is recorded once
+// from current counts. New entries are written with an empty reason, which the check refuses until someone writes it,
+// so the first allowlist is justified file by file in the app's diff.
+export function updateRawStatementBaseline(directory, packageName) {
+    const policy = resolveProfile(packageName)?.profile.data;
+    if (!policy)
+        return [];
+    directory = resolve(directory);
+    const { allowed, exists } = readAllowlist(directory, policy), counts = rawStatementCounts(directory, policy);
+    if (exists) {
+        const rises = rawStatementRises(counts, allowed, policy.baseline);
+        if (rises.length)
+            return rises;
+    }
+    const entries = Object.entries(counts).sort(([a], [b]) => a < b ? -1 : 1).map(([path, count]) => [path, { count, reason: allowed[path]?.reason ?? '' }]);
+    writeFileSync(resolve(directory, policy.baseline), `${JSON.stringify(Object.fromEntries(entries), null, 2)}\n`);
+    return readAllowlist(directory, policy).errors;
+}
+/**
+ * Read-only: each consumer manifest against the current declaration. Nothing is installed, built or written. `status`
+ * is manifest drift; `adoption` lists what the folder's container files and raw statements would still fail once
+ * the consumer installs this release. Source-language and presentation checks need an install and are not run.
+ */
+export function driftReport(directories) {
+    return directories.map(directory => {
+        const manifest = JSON.parse(readFileSync(resolve(directory, 'package.json'), 'utf8'));
+        const runtime = manifest.dependencies?.['@ten98/runtime'] ?? manifest.devDependencies?.['@ten98/runtime'] ?? '(none)';
+        const problems = checkManifest(manifest), name = String(manifest.name);
+        const adoption = [...checkDeployment(directory, name), ...checkDataAccess(directory, name)];
+        return { directory, name, status: problems.length ? 'behind' : 'current', runtime, problems, adoption };
+    });
 }
 // Release mode is separate from ordinary architecture checks and reads committed evidence.
 export function collectReleaseIdentity(directory, { tag = '', commit = '', tagObject, archive, archiveSha256, event } = {}) {
@@ -468,8 +724,9 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
     for (const error of runtimeErrors)
         console.error(error);
     let failures = runtimeErrors.length;
-    const flag = '--update-presentation-baseline', args = process.argv.slice(2), release = args[0] === '--release', update = !release && args.includes(flag);
-    const directories = args.filter(arg => arg !== flag);
+    const flag = '--update-presentation-baseline', rawFlag = '--update-raw-statement-baseline', args = process.argv.slice(2);
+    const release = args[0] === '--release', drift = args[0] === '--drift', update = !release && args.includes(flag), updateRaw = !release && args.includes(rawFlag);
+    const directories = args.filter(arg => arg !== flag && arg !== rawFlag);
     if (!failures && release) {
         try {
             console.log(JSON.stringify(releaseArguments(args.slice(1)), null, 2));
@@ -479,12 +736,32 @@ if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(resolve(proce
             console.error(messageOf(error));
         }
     }
-    for (const directory of runtimeErrors.length || release ? [] : directories.length ? directories : ['.']) {
+    if (!failures && drift) {
+        // A report, not a gate: a consumer being behind is its status, so only an unreadable manifest fails the command.
+        try {
+            for (const row of driftReport(directories.slice(1))) {
+                console.log(`${row.name} (${row.directory}): ${row.status}, runtime ${row.runtime}`);
+                for (const problem of row.problems)
+                    console.log(`  - ${problem}`);
+                if (row.adoption.length)
+                    console.log(`  on adoption, ${row.adoption.length} container or raw-statement findings, first: ${row.adoption[0]}`);
+            }
+        }
+        catch (error) {
+            failures++;
+            console.error(messageOf(error));
+        }
+    }
+    for (const directory of runtimeErrors.length || release || drift ? [] : directories.length ? directories : ['.']) {
         try {
             const manifest = JSON.parse(readFileSync(resolve(directory, 'package.json'), 'utf8'));
             const errors = checkManifest(manifest);
             if (!errors.length)
                 errors.push(...checkVendoredFloors(directory, manifest));
+            if (!errors.length)
+                errors.push(...checkDeployment(directory, String(manifest.name)));
+            if (!errors.length)
+                errors.push(...(updateRaw ? updateRawStatementBaseline : checkDataAccess)(directory, String(manifest.name)));
             if (!errors.length)
                 errors.push(...checkSourceLanguage(directory, String(manifest.name)));
             if (!errors.length)
