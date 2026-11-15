@@ -111,11 +111,19 @@ export interface Ten98AuthOptions {
      * The bound on concurrent `signInWithPassword` verifications in this process: `concurrency` at once (2 by default,
      * each running two scrypt derivations, which together fill libuv's default four threads), at most `queue` waiting
      * (100), each for at most `waitMs` (15000). Past either bound the attempt is answered 503, never left waiting.
+     * `knownDevices` is the reserved lane for an attempt whose known-device claim was verified (1 at once, 20 waiting,
+     * the same `waitMs` by default): such an attempt uses only the lane, so it never takes shared capacity. Its
+     * verifications share the hashing threads: count its `concurrency` in when sizing `UV_THREADPOOL_SIZE`.
      */
     passwordVerification?: {
         concurrency?: number;
         queue?: number;
         waitMs?: number;
+        knownDevices?: {
+            concurrency?: number;
+            queue?: number;
+            waitMs?: number;
+        };
     };
     /** The app's public URL (APP_URL); validated with `appOrigin`. */
     appUrl: string;

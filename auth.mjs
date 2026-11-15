@@ -571,6 +571,8 @@ function build(options, keys, locking, internal = {}) {
     if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000)
         throw new TypeError('lockTimeoutMs must be an integer from 1 to 600000.');
     const slots = boundedSlots(options.passwordVerification);
+    const { concurrency: laneConcurrency = 1, queue: laneQueue = 20, waitMs: laneWaitMs = options.passwordVerification?.waitMs } = options.passwordVerification?.knownDevices ?? {};
+    const lane = boundedSlots({ concurrency: laneConcurrency, queue: laneQueue, waitMs: laneWaitMs }, 'passwordVerification.knownDevices');
     void modernDummy();
     /**
      * Binds an instance to the transaction for `run`. The callback gets its own transaction object over a guarded view of
@@ -763,8 +765,12 @@ function build(options, keys, locking, internal = {}) {
             // No stored password is longer than the policy allows, so a longer one is wrong for every account, unhashed.
             if (password.length > ten98AuthPolicy.password.maxLength)
                 return refused();
-            // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads.
-            const release = await slots();
+            // 2. A verification slot, so concurrent guesses cannot queue without bound on the hashing threads. An attempt whose
+            // known-device claim was verified above (a database read, before anything that differs between a real and an
+            // unknown account) takes the reserved lane and only the lane, so a flood cannot crowd it out and many valid
+            // cookies cannot take shared capacity. Every other attempt (an unknown email, an account without a cookie, a
+            // forged, revoked or foreign cookie) takes the shared queue under one rule, so none can be told apart.
+            const release = claim !== undefined ? await lane() : await slots();
             if (!release) {
                 await unclaim();
                 return refusal(503, 'SIGN_IN_BUSY', 'Sign-in is busy. Try again shortly.', { 'retry-after': '1' });
@@ -1163,10 +1169,10 @@ const refused = () => refusal(401, 'INVALID_EMAIL_OR_PASSWORD', 'Invalid email o
  * At most `concurrency` holders at once and `queue` waiting, each for at most `waitMs`. Resolves a release function, or
  * undefined when no slot came in time or the queue is full, so a caller is answered instead of left waiting.
  */
-function boundedSlots({ concurrency = 2, queue = 100, waitMs = 15_000 } = {}) {
+function boundedSlots({ concurrency = 2, queue = 100, waitMs = 15_000 } = {}, label = 'passwordVerification') {
     for (const [name, value] of Object.entries({ concurrency, queue, waitMs })) {
         if (!Number.isInteger(value) || value < (name === 'concurrency' ? 1 : 0))
-            throw new TypeError(`passwordVerification.${name} must be a whole number${name === 'concurrency' ? ' of at least 1' : ''}.`);
+            throw new TypeError(`${label}.${name} must be a whole number${name === 'concurrency' ? ' of at least 1' : ''}.`);
     }
     let active = 0;
     const waiting = [];
