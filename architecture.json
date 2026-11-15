@@ -628,6 +628,7 @@
         "@types/pg": "8.15.6",
         "better-auth": "1.7.7",
         "drizzle-orm": "0.45.2",
+        "nodemailer": "10.1.4",
         "pg": "8.23.0",
         "zod": "4.6.6"
       },
@@ -638,6 +639,7 @@
       "peerDependencies": {
         "better-auth": "1.7.7",
         "drizzle-orm": "0.45.2",
+        "nodemailer": "10.1.4",
         "pg": "8.23.0",
         "zod": "4.6.6"
       },
@@ -727,7 +729,9 @@
           "tenancy-testing.mjs": "Generated test-only scope setter from src/tenancy-testing.mts, exported as ./tenancy/testing only, never from ./tenancy or the root.",
           "tenancy-testing.d.mts": "Generated declarations from src/tenancy-testing.mts.",
           "config.mjs": "Generated environment and secret reader from src/config.mts, exported as ./config only; loadConfig needs the optional zod peer.",
-          "config.d.mts": "Generated declarations from src/config.mts."
+          "config.d.mts": "Generated declarations from src/config.mts.",
+          "email.mjs": "Generated transactional email sender from src/email.mts, exported as ./email only; needs the optional zod peer, and the optional nodemailer peer for SMTP, imported on first SMTP send.",
+          "email.d.mts": "Generated declarations from src/email.mts."
         },
         "compilerProjects": [
           "tsconfig.json",

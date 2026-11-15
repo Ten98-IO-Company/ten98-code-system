@@ -47,6 +47,10 @@
     "./config": {
       "types": "./config.d.mts",
       "import": "./config.mjs"
+    },
+    "./email": {
+      "types": "./email.d.mts",
+      "import": "./email.mjs"
     }
   },
   "files": [
@@ -153,7 +157,10 @@
     "src/tenancy-testing.mts",
     "config.mjs",
     "config.d.mts",
-    "src/config.mts"
+    "src/config.mts",
+    "email.mjs",
+    "email.d.mts",
+    "src/email.mts"
   ],
   "scripts": {
     "check:architecture": "node check.mjs .",
@@ -174,6 +181,7 @@
     "@types/pg": "8.15.6",
     "better-auth": "1.7.7",
     "drizzle-orm": "0.45.2",
+    "nodemailer": "10.1.4",
     "pg": "8.23.0",
     "typescript": "7.0.2",
     "zod": "4.6.6"
@@ -181,6 +189,7 @@
   "peerDependencies": {
     "better-auth": "1.7.7",
     "drizzle-orm": "0.45.2",
+    "nodemailer": "10.1.4",
     "pg": "8.23.0",
     "zod": "4.6.6"
   },
@@ -189,6 +198,9 @@
       "optional": true
     },
     "drizzle-orm": {
+      "optional": true
+    },
+    "nodemailer": {
       "optional": true
     },
     "pg": {
