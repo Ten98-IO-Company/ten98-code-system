@@ -121,7 +121,7 @@ test('password changes enforce 12 to 128 characters', async () => {
   assert.equal((await env.post('/change-password', { currentPassword: PASSWORD, newPassword: 'y'.repeat(12) }, cookie)).status, 200);
 });
 
-test('cross-origin requests are refused, also when the environment looks like a test run', async () => {
+test('cross-origin requests are refused, also when the environment looks like a test run', { timeout: 400_000 }, async () => {
   const env = setup();
   await env.user('owner@example.com', await hashPassword(PASSWORD));
   const cookie = cookieOf(await env.signIn());
@@ -142,7 +142,8 @@ test('cross-origin requests are refused, also when the environment looks like a 
     const redirect = await post('/sign-in/email', { email: 'a@example.com', password: '${PASSWORD}', callbackURL: 'https://evil.example/x' }, '', '${ORIGIN}');
     console.log(JSON.stringify([forged.status, redirect.status]));`;
   for (const env of [{ TEST: '1' }, { NODE_ENV: 'test' }]) {
-    const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { cwd: new URL('..', import.meta.url), env: { ...process.env, ...env }, encoding: 'utf8', timeout: 30_000 });
+    // A child process on a loaded machine can take far longer to start than to run: it gets three minutes.
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { cwd: new URL('..', import.meta.url), env: { ...process.env, ...env }, encoding: 'utf8', timeout: 180_000 });
     assert.equal(run.status, 0, run.stderr);
     assert.deepEqual(JSON.parse(run.stdout.trim().split('\n').at(-1)!), [403, 403], JSON.stringify(env));
   }

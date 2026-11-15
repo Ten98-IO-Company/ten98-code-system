@@ -1,7 +1,7 @@
 {
   "src/auth.mts": {
-    "count": 8,
-    "reason": "Locked-auth transactions set their lock_timeout (set_config), withLockedAuthByEmail and signInOidcUser take the team controller's email advisory lock (pg_advisory_xact_lock), and the start-up checks read pg_attribute for the tables and columns and pg_index for the unique indexes on lower(email) and on account (providerId, accountId); Drizzle has no builder for any of them. revokeProviderSessions deletes verification rows (the provider's challenges, then the known devices of the users it signed out), which have no Drizzle table in the common schema. The user-row locks, the credential read, the identity rows and the session deletes are typed Drizzle queries."
+    "count": 9,
+    "reason": "Locked-auth transactions set their lock_timeout (set_config), withLockedAuthByEmail and signInOidcUser take the team controller's email advisory lock (pg_advisory_xact_lock), and the start-up checks read pg_attribute for the tables and columns and pg_index for the unique indexes on lower(email) and on account (providerId, accountId); Drizzle has no builder for any of them. revokeProviderSessions deletes verification rows (the provider's challenges, then the known devices of the users it signed out, and the trusted devices its sign-ins set), which have no Drizzle table in the common schema. The user-row locks, the credential read, the identity rows and the session deletes are typed Drizzle queries."
   },
   "src/check.mts": {
     "count": 8,

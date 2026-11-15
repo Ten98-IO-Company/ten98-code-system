@@ -63,6 +63,26 @@
       ],
       "baseline": "raw-statements.json"
     },
+    "authCookie": {
+      "imports": {
+        "better-auth/cookies": [
+          "getSessionCookie",
+          "getCookieCache"
+        ]
+      },
+      "names": [
+        "two_factor",
+        "session_token",
+        "session_data",
+        "dont_remember"
+      ],
+      "prefixes": [
+        "better-auth."
+      ],
+      "allowedCalls": [
+        "cookieName"
+      ]
+    },
     "database": {
       "engine": "postgresql"
     }

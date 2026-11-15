@@ -14,11 +14,22 @@ export declare const ten98AuthPolicy: Readonly<{
         updateAgeSeconds: 86400;
     }>;
     /**
-     * TOTP (RFC 6238, SHA-1). `replaySeconds` is the window in which an accepted code is refused again; the app keeps that
-     * ledger. Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
+     * TOTP (RFC 6238, SHA-1). The preset keeps the replay ledger: per user, the last time step a code was accepted for;
+     * a code whose step is at or before it is refused everywhere a TOTP code is taken. `replaySeconds` is how long that
+     * refusal can matter (the ±1-step window). Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
      * `backupCodeInputLength` characters as typed, with the hyphen.
-     * The lockout counts failures during sign-in challenges only; session-bound step-up checks are limited per user by the
-     * app (`rateLimits.accountSecurityWritesPerUser`).
+     * Two counters. The sign-in lockout (better-auth's) counts failed codes in sign-in challenges, replays included, and
+     * locks completing a challenge for `lockoutSeconds` after `maxFailedAttempts`; a completed challenge resets it. The
+     * factor-action counter (the preset's) counts refused factor proofs outside sign-in (wrong, replayed or missing) and
+     * after `maxFailedAttempts` refuses factor-weakening actions for `lockoutSeconds` with FACTOR_ACTIONS_LOCKED; only a
+     * successful proof resets it, never a sign-in. Neither locks the other.
+     *
+     * Factor proof, when the account has a verified second factor: a current TOTP code or an unused recovery code, checked
+     * under the user's lock through the replay ledger. Required to turn the factor off, to issue, regenerate or view
+     * recovery codes, to re-enrol or replace the authenticator (and to read its TOTP URI), to remove or reset trusted
+     * devices, to change the account email, to link a new sign-in identity and to add a password to an account without one.
+     * Not required to change the password (it needs the current one and ends the other sessions) or to unlink an identity
+     * (the last-method rule applies). A password reset by email never removes or skips the factor.
      */
     twoFactor: Readonly<{
         digits: 6;
@@ -143,6 +154,21 @@ export interface Ten98AuthOptions {
     /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
     cookiePrefix?: string;
     /**
+     * Paths and domains the app's auth cookies were once set with, besides the current `Path=/` with no Domain. A request
+     * carrying an auth cookie twice is refused and every copy is expired, in each of these scopes too, so a cookie left from
+     * an old path or domain cannot strand a user.
+     */
+    legacyCookieScopes?: readonly {
+        path?: string;
+        domain?: string;
+    }[];
+    /**
+     * better-auth routes to serve beyond `ten98AuthRoutes`, by their path as better-auth declares it (`/update-user`,
+     * `/reset-password/:token`). Every other route of the instance, including one a future better-auth or plugin adds, is
+     * off: the handler answers 404 and its server call throws.
+     */
+    allowRoutes?: readonly string[];
+    /**
      * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
      * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
      * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
@@ -154,8 +180,9 @@ export interface Ten98AuthOptions {
         closedAt: Date | null;
     }): boolean | Promise<boolean>;
     /**
-     * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) on the instance the
-     * app holds. It has no rate limit, no lock and no constant-cost check: do not use it outside tests and migrations.
+     * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) and its own two-factor
+     * routes and calls on the instance the app holds. They have no rate limit, no lock, no constant-cost check, no replay
+     * ledger and no factor proof: do not use it outside tests and migrations.
      */
     allowRawPasswordSignIn?: boolean;
 }
@@ -233,6 +260,28 @@ export interface Ten98Auth {
     };
     /** The stored `verification.identifier` for a raw identifier; see the standalone `storedVerificationIdentifier`. */
     storedVerificationIdentifier(identifier: string): string;
+    /**
+     * The exact name of one of the auth cookies (`two_factor`, `session_token`, `known_device`, …) for this instance:
+     * `__Host-<prefix>.<name>` on https, `<prefix>.<name>` on plain-http development.
+     */
+    cookieName(name: string): string;
+    /**
+     * The sign-in challenge a request's `two_factor` cookie names, or null when the cookie is absent, sent more than once,
+     * malformed, unsigned, forged, under another prefix, or names no live challenge of an existing account. `limitKey` is
+     * a stable HMAC of the challenge under its own derived key, never empty: key the app's per-challenge limiter with it.
+     */
+    readTwoFactorChallenge(request: Request): Promise<{
+        identifier: string;
+        userId: string;
+        limitKey: string;
+    } | null>;
+    /**
+     * The Set-Cookie values that expire an auth cookie a request carries more than once (session, challenge or known
+     * device), or none: at `/`, on every prefix of the auth routes and of `path` (the request's own, when given), and in
+     * each `legacyCookieScopes` entry. An app guard that calls `api.getSession` itself appends them
+     * to its response; `handler`, `signInWithPassword` and `verifyTwoFactor` add them on their own.
+     */
+    expiredAuthCookies(headers: HeadersInit, path?: string): string[];
     /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
     sessionTokenKey(token: string): string;
     /**
@@ -279,11 +328,12 @@ export interface Ten98Auth {
      */
     assertSchema(db: AnyDatabase): Promise<void>;
     /**
-     * Completes a sign-in's two-factor challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
-     * `two_factor` cookie) under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge that is
-     * unknown or expired, gets one uniform 401, and a session for any other account rolls back. The instance the app holds
-     * refuses a challenge outside it. Pass the request as received; verification with a session (enabling two-factor) still
-     * goes to `handler`.
+     * Handles every two-factor request (a POST to `/two-factor/*`); the instance the app holds refuses them, naming this
+     * function. Completing a sign-in's challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
+     * `two_factor` cookie) runs under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge
+     * that is unknown or expired, gets one uniform 401, and a session for any other account rolls back. Every other
+     * request (enrolling and confirming a factor, disabling it, recovery codes, the TOTP URI) needs a session and runs
+     * under that user's lock; without one it gets better-auth's own 401. Pass the request as received.
      */
     verifyTwoFactor(db: AnyDatabase, request: Request): Promise<Response>;
 }
@@ -340,6 +390,19 @@ export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'wit
  * as keyed hashes; the cookie cache stays off and no secondary storage is used, so no token is kept anywhere else.
  */
 export declare function createTen98Auth(options: Ten98AuthOptions): Ten98Auth;
+/**
+ * The better-auth routes the instance an app holds serves by default: what the guide documents apps routing (session,
+ * sign-out, password reset and change, session listing and revocation, every two-factor route, which the app sends
+ * through verifyTwoFactor) and those the preset calls itself (`/sign-in/email`, behind signInWithPassword). Everything
+ * else is off unless the app names it in `allowRoutes`.
+ */
+export declare const ten98AuthRoutes: readonly string[];
+/** Factor actions are locked after too many refused proofs; `retryAfterSeconds` says for how long. */
+export declare class FactorActionsLockedError extends Error {
+    readonly code: 'FACTOR_ACTIONS_LOCKED';
+    readonly retryAfterSeconds: number;
+    constructor(retryAfterSeconds: number);
+}
 /** More than one account matches an email: the unique index on lower(email) is missing. Nothing is picked. */
 export declare class AmbiguousAccountError extends Error {
     readonly code: 'AMBIGUOUS_ACCOUNT';
@@ -356,7 +419,7 @@ export declare class SchemaMismatchError extends Error {
     readonly missing: readonly string[];
     constructor(missing: readonly string[]);
 }
-export type OidcIdentityErrorCode = 'OIDC_EMAIL_UNVERIFIED' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OIDC_IDENTITY_NOT_FOUND' | 'OIDC_LAST_SIGN_IN_METHOD';
+export type OidcIdentityErrorCode = 'OIDC_EMAIL_UNVERIFIED' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OIDC_IDENTITY_NOT_FOUND' | 'OIDC_LAST_SIGN_IN_METHOD' | 'OIDC_FACTOR_PROOF_REQUIRED';
 /** A refusal of a linked-identity operation: `status` is the HTTP status that fits and `message` is safe to show. */
 export declare class OidcIdentityError extends Error {
     readonly status: 403 | 404 | 409;
@@ -398,11 +461,20 @@ export declare function signInOidcUser(db: AnyDatabase, claims: OidcClaims, prov
     created: boolean;
 }>;
 /**
+ * Checks a factor proof for an app's own account action, inside `withLockedAuth` on its `tx`, for the user it locked:
+ * true only for a TOTP code of that user's verified factor whose step is newer than the last one accepted anywhere
+ * (sign-in, enrolment, another action), which it records, or an unused recovery code, which it consumes. A refusal
+ * counts toward the factor-action counter; while factor actions are locked it throws FactorActionsLockedError.
+ */
+export declare function verifyCodeForAction(tx: AnyDatabase, userId: string, code: string): Promise<boolean>;
+/**
  * Links an identity to the signed-in user, the one `withLockedAuth` locked: call it inside that callback, on its `tx`,
  * after the app verified an ID token the user obtained while signed in. `linked` is false when the identity already
  * belongs to this user. An identity linked to another account is refused with OIDC_IDENTITY_IN_USE; nothing moves it.
  */
-export declare function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity): Promise<{
+export declare function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity, { code }?: {
+    code?: string;
+}): Promise<{
     linked: boolean;
 }>;
 /** What `unlinkOidcIdentity` counts as another way to sign in. */

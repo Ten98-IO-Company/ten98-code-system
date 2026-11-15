@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 const contract = JSON.parse(readFileSync(new URL('./architecture.json', import.meta.url), 'utf8'));
 // The rules an exception or transition may relax; anything else is a typo that would silently waive nothing.
-const waivableRules = ['database.engine', 'packageManager', 'baseImage', 'appStack', 'profile.name'];
+const waivableRules = ['database.engine', 'packageManager', 'baseImage', 'appStack', 'profile.name', 'auth-cookie'];
 export function inspectWaivers() {
     const errors = [], text = (value) => typeof value === 'string' && value.trim().length > 0;
     const items = (value) => value === undefined || Array.isArray(value) && value.length > 0 && value.every(text);
@@ -623,13 +623,51 @@ function rawStatementRises(counts, allowed, baseline) {
 // Application queries are typed Drizzle queries. Raw statements stay only where the app's committed allowlist names
 // the file with a reason, and never more of them than it records.
 export function checkDataAccess(directory, packageName) {
-    const policy = resolveProfile(packageName)?.profile.data;
+    const resolved = resolveProfile(packageName), policy = resolved?.profile.data;
     if (!policy)
         return [];
     directory = resolve(directory);
     const { allowed, errors } = readAllowlist(directory, policy);
     const sources = dataSources(directory, policy);
-    return [...errors, ...testingTenancyImports(sources), ...rawStatementRises(rawStatementCounts(sources), allowed, policy.baseline)];
+    return [...errors, ...testingTenancyImports(sources), ...rawStatementRises(rawStatementCounts(sources), allowed, policy.baseline),
+        ...authCookieReads(directory, resolved.name, resolved.profile)];
+}
+/**
+ * The auth-cookie rule, a refusal, not a ratchet: under the data and presentation roots, no import of a cookie getter
+ * that assumes better-auth's default prefix, and no string literal naming an auth cookie, except as the argument of an
+ * allowed call. It matches text, so a name built at run time passes it. An open transition for the rule lists the files it
+ * still allows, while an app moves to the preset's helpers.
+ */
+function authCookieReads(directory, profileName, profile) {
+    const policy = profile.authCookie;
+    if (!policy)
+        return [];
+    const roots = [...new Set([...(profile.data?.roots ?? []), ...(profile.presentation?.roots ?? [])])];
+    const waived = new Set(transitionsFor(profileName, 'auth-cookie').flatMap(entry => entry.items ?? []));
+    const sources = new Map(dataSources(directory, { roots, baseline: '' }));
+    const errors = [];
+    const literal = /(['"`])((?:\\.|(?!\1)[^\\\n])*)\1/gu;
+    for (const [path, text] of sources) {
+        if (waived.has(path))
+            continue;
+        const line = (at) => text.slice(0, at).split('\n').length;
+        for (const [module, names] of Object.entries(policy.imports)) {
+            const from = new RegExp(`(?:\\bfrom\\s*|\\bimport\\s*\\(\\s*|\\brequire\\s*\\(\\s*)['"\`]${module.replace(/[.*+?^${}()|[\]\\/]/gu, '\\$&')}['"\`]`, 'u');
+            const named = names.find(name => new RegExp(`\\b${name}\\b`, 'u').test(text));
+            if (from.test(text) && named)
+                errors.push(`${path}: imports ${named} from ${module}, which reads an auth cookie under better-auth's default prefix; use the preset's helpers (auth.cookieName, auth.readTwoFactorChallenge, auth.api.getSession).`);
+        }
+        for (const match of text.matchAll(literal)) {
+            const value = match[2];
+            if (!policy.names.some(name => value.includes(name)) && !policy.prefixes.some(prefix => value.startsWith(prefix)))
+                continue;
+            const before = text.slice(0, match.index).trimEnd();
+            if (policy.allowedCalls.some(call => new RegExp(`(?:^|[^A-Za-z0-9_$])${call}\\s*\\($`, 'u').test(before)))
+                continue;
+            errors.push(`${path}:${line(match.index)}: names an auth cookie ('${value}'); read it through the preset's helpers (auth.cookieName, auth.readTwoFactorChallenge, auth.api.getSession).`);
+        }
+    }
+    return errors;
 }
 // Lowers or removes allowlist entries and keeps their reasons; a rise is refused. A missing allowlist is recorded once
 // from current counts. New entries are written with an empty reason, which the check refuses until someone writes it,

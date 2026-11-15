@@ -16,7 +16,7 @@ import type pg from 'pg';
 import { betterAuth, getCurrentAdapter, type BetterAuthOptions } from 'better-auth';
 import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, isAPIError, sensitiveSessionMiddleware } from 'better-auth/api';
 import { setSessionCookie } from 'better-auth/cookies';
-import { hashPassword, verifyPassword } from 'better-auth/crypto';
+import { hashPassword, symmetricDecrypt, symmetricEncrypt, verifyPassword } from 'better-auth/crypto';
 import { twoFactor } from 'better-auth/plugins/two-factor';
 import { account as accountTable, session as sessionTable, transaction, TransactionRolledBackError, user as userTable, type AnyDatabase, type ScopedTransaction } from './db.mjs';
 import { isEmailAddress } from './email-message.mjs';
@@ -33,11 +33,22 @@ export const ten98AuthPolicy = Object.freeze({
   /** Seven days, extended at most once a day of use. */
   session: Object.freeze({ expiresInSeconds: 604_800, updateAgeSeconds: 86_400 }),
   /**
-   * TOTP (RFC 6238, SHA-1). `replaySeconds` is the window in which an accepted code is refused again; the app keeps that
-   * ledger. Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
+   * TOTP (RFC 6238, SHA-1). The preset keeps the replay ledger: per user, the last time step a code was accepted for;
+   * a code whose step is at or before it is refused everywhere a TOTP code is taken. `replaySeconds` is how long that
+   * refusal can matter (the ±1-step window). Recovery codes are `backupCodes` codes matching `backupCodePattern` (a string, so it survives JSON), each
    * `backupCodeInputLength` characters as typed, with the hyphen.
-   * The lockout counts failures during sign-in challenges only; session-bound step-up checks are limited per user by the
-   * app (`rateLimits.accountSecurityWritesPerUser`).
+   * Two counters. The sign-in lockout (better-auth's) counts failed codes in sign-in challenges, replays included, and
+   * locks completing a challenge for `lockoutSeconds` after `maxFailedAttempts`; a completed challenge resets it. The
+   * factor-action counter (the preset's) counts refused factor proofs outside sign-in (wrong, replayed or missing) and
+   * after `maxFailedAttempts` refuses factor-weakening actions for `lockoutSeconds` with FACTOR_ACTIONS_LOCKED; only a
+   * successful proof resets it, never a sign-in. Neither locks the other.
+   *
+   * Factor proof, when the account has a verified second factor: a current TOTP code or an unused recovery code, checked
+   * under the user's lock through the replay ledger. Required to turn the factor off, to issue, regenerate or view
+   * recovery codes, to re-enrol or replace the authenticator (and to read its TOTP URI), to remove or reset trusted
+   * devices, to change the account email, to link a new sign-in identity and to add a password to an account without one.
+   * Not required to change the password (it needs the current one and ends the other sessions) or to unlink an identity
+   * (the last-method rule applies). A password reset by email never removes or skips the factor.
    */
   twoFactor: Object.freeze({ digits: 6, periodSeconds: 30, replaySeconds: 90, backupCodes: 10, backupCodePattern: '^[A-Za-z0-9]{5}-[A-Za-z0-9]{15}$', backupCodeInputLength: 21, maxFailedAttempts: 10, lockoutSeconds: 900 }),
   reset: Object.freeze({ expiresInSeconds: 3600, revokesSessions: true }),
@@ -73,7 +84,7 @@ export function verifyLegacyScryptHash(hash: string, password: string): Promise<
 // Keys for tokens at rest: HKDF-SHA256 over the secret, one label per use, so neither equals the secret or any other key
 // an app derives from it. Rotating the secret ends every session, reset link and trusted device, and makes enrolled
 // second factors (encrypted with the secret itself) unreadable: it is a re-enrolment event.
-const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1', knownDevice: 'ten98-auth:known-device:v1' } as const;
+const keyLabels = { verification: 'ten98-auth:verification-identifier:v1', session: 'ten98-auth:session-token:v1', knownDevice: 'ten98-auth:known-device:v1', challengeLimit: 'ten98-auth:two-factor-limit:v1' } as const;
 type TokenKeys = Record<keyof typeof keyLabels, Buffer>;
 const checkedSecret = (secret: unknown): string => {
   if (typeof secret !== 'string' || secret.length < 32) throw new TypeError('The auth secret must be at least 32 characters.');
@@ -83,6 +94,7 @@ const deriveKeys = (secret: string): TokenKeys => ({
   verification: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.verification, 32)),
   session: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.session, 32)),
   knownDevice: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.knownDevice, 32)),
+  challengeLimit: Buffer.from(hkdfSync('sha256', secret, '', keyLabels.challengeLimit, 32)),
 });
 const mac = (key: Buffer, value: string) => createHmac('sha256', key).update(value).digest('base64url');
 const raw = (value: unknown): string => {
@@ -100,7 +112,9 @@ const tokenHandle = (keys: TokenKeys, token: string) => handlePrefix + mac(keys.
 // 'oidc-challenge:') || <stored challenge identifier>, which revokeProviderSessions joins on in SQL.
 const attemptsPrefix = '2fa-attempts-';
 const challengeProviderPrefix = 'oidc-challenge:';
-const namingPrefixes = [attemptsPrefix, challengeProviderPrefix] as const;
+/** A trusted device a provider-bound sign-in set: 'oidc-trust:' || <stored trust-device identifier>, holding the provider. */
+const trustProviderPrefix = 'oidc-trust:';
+const namingPrefixes = [attemptsPrefix, challengeProviderPrefix, trustProviderPrefix] as const;
 const keptPrefixes = ['2fa-otp-', '2fa-', 'trust-device-', 'reset-password:', 'known-device-attempt:', 'known-device:'] as const;
 function storedIdentifier(keys: TokenKeys, identifier: string): string {
   let head = '', rest = identifier;
@@ -120,6 +134,16 @@ const device = { cookie: 'known_device', lifetimeSeconds: 90 * 86_400, attempts:
 const devicePrefix = 'known-device', deviceRow = (deviceId: string) => `known-device:${deviceId}`, attemptRow = (deviceId: string) => `known-device-attempt:${deviceId}`;
 type DeviceEntry = { readonly deviceId: string; readonly tag: string; readonly text: string };
 const deviceEntryPattern = /^([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/;
+/**
+ * A device id that carries its own MAC: 16 random bytes (22 characters) and the first 10 characters of an HMAC over them,
+ * so a forged id is told apart before any database read or claim slot. The account tag below still binds it to a user.
+ */
+const newDeviceId = (keys: TokenKeys) => {
+  const random = randomBytes(16).toString('base64url');
+  return random + mac(keys.knownDevice, `device-id\u0000${random}`).slice(0, 10);
+};
+const deviceIdSigned = (keys: TokenKeys, deviceId: string) => deviceId.length === 32
+  && timingSafeEqual(Buffer.from(deviceId.slice(22)), Buffer.from(mac(keys.knownDevice, `device-id\u0000${deviceId.slice(0, 22)}`).slice(0, 10)));
 /** The tag binding a device id to one account: HMAC over userId ‖ deviceId (NUL-separated; neither contains NUL). */
 const deviceTag = (keys: TokenKeys, userId: string, deviceId: string) => mac(keys.knownDevice, `${userId}\u0000${deviceId}`);
 /**
@@ -141,14 +165,22 @@ function deviceFor(keys: TokenKeys, userId: string, entries: readonly DeviceEntr
   }
   return found;
 }
-/** One cookie from a Cookie header; undefined when absent. */
-function cookieFrom(headers: HeadersInit | undefined, name: string): string | undefined {
+/** Every name=value pair of a Cookie header, in order; a pair without a name is skipped. */
+function cookiePairs(headers: HeadersInit | undefined): [string, string][] {
   const header = headers === undefined ? null : new Headers(headers).get('cookie');
-  for (const pair of header?.split(';') ?? []) {
+  return (header?.split(';') ?? []).flatMap(pair => {
     const at = pair.indexOf('=');
-    if (at > 0 && pair.slice(0, at).trim() === name) return pair.slice(at + 1).trim();
-  }
-  return undefined;
+    return at > 0 ? [[pair.slice(0, at).trim(), pair.slice(at + 1).trim()] as [string, string]] : [];
+  });
+}
+/**
+ * The value of the one pair named exactly `name`, or undefined when there is none or more than one. Only the exact name
+ * the library reads counts: other prefixes, and the other scheme's or separator's forms of this one, are never read by
+ * better-auth, so they are ignored rather than refused.
+ */
+function singleCookie(headers: HeadersInit | undefined, name: string): string | undefined {
+  const values = cookiePairs(headers).filter(([key]) => key === name).map(([, value]) => value);
+  return values.length === 1 ? values[0] : undefined;
 }
 
 /**
@@ -349,6 +381,18 @@ export interface Ten98AuthOptions {
   /** Cookie name prefix. Defaults to one derived from the origin, so instances on one host (ports differ) never share cookies. */
   cookiePrefix?: string;
   /**
+   * Paths and domains the app's auth cookies were once set with, besides the current `Path=/` with no Domain. A request
+   * carrying an auth cookie twice is refused and every copy is expired, in each of these scopes too, so a cookie left from
+   * an old path or domain cannot strand a user.
+   */
+  legacyCookieScopes?: readonly { path?: string; domain?: string }[];
+  /**
+   * better-auth routes to serve beyond `ten98AuthRoutes`, by their path as better-auth declares it (`/update-user`,
+   * `/reset-password/:token`). Every other route of the instance, including one a future better-auth or plugin adds, is
+   * off: the handler answers 404 and its server call throws.
+   */
+  allowRoutes?: readonly string[];
+  /**
    * Whether an account may sign in or reset its password: asked by `signInWithPassword` (before and under the lock) and
    * `verifyTwoFactor`, where anything but `true` gets the uniform 401, and by the reset routes, where a request for such an
    * account answers as for an unknown email (no token, nothing sent) and a token issued before is refused as invalid.
@@ -356,8 +400,9 @@ export interface Ten98AuthOptions {
    */
   isAccountUsable?(account: { id: string; email: string; closedAt: Date | null }): boolean | Promise<boolean>;
   /**
-   * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) on the instance the
-   * app holds. It has no rate limit, no lock and no constant-cost check: do not use it outside tests and migrations.
+   * Re-enables better-auth's own password sign-in (`POST /sign-in/email` and `api.signInEmail`) and its own two-factor
+   * routes and calls on the instance the app holds. They have no rate limit, no lock, no constant-cost check, no replay
+   * ledger and no factor proof: do not use it outside tests and migrations.
    */
   allowRawPasswordSignIn?: boolean;
 }
@@ -395,6 +440,24 @@ export interface Ten98Auth {
   options: { readonly telemetry: { readonly enabled: false } };
   /** The stored `verification.identifier` for a raw identifier; see the standalone `storedVerificationIdentifier`. */
   storedVerificationIdentifier(identifier: string): string;
+  /**
+   * The exact name of one of the auth cookies (`two_factor`, `session_token`, `known_device`, …) for this instance:
+   * `__Host-<prefix>.<name>` on https, `<prefix>.<name>` on plain-http development.
+   */
+  cookieName(name: string): string;
+  /**
+   * The sign-in challenge a request's `two_factor` cookie names, or null when the cookie is absent, sent more than once,
+   * malformed, unsigned, forged, under another prefix, or names no live challenge of an existing account. `limitKey` is
+   * a stable HMAC of the challenge under its own derived key, never empty: key the app's per-challenge limiter with it.
+   */
+  readTwoFactorChallenge(request: Request): Promise<{ identifier: string; userId: string; limitKey: string } | null>;
+  /**
+   * The Set-Cookie values that expire an auth cookie a request carries more than once (session, challenge or known
+   * device), or none: at `/`, on every prefix of the auth routes and of `path` (the request's own, when given), and in
+   * each `legacyCookieScopes` entry. An app guard that calls `api.getSession` itself appends them
+   * to its response; `handler`, `signInWithPassword` and `verifyTwoFactor` add them on their own.
+   */
+  expiredAuthCookies(headers: HeadersInit, path?: string): string[];
   /** The stored `session.token` handle for a raw session token; see the standalone `sessionTokenKey`. */
   sessionTokenKey(token: string): string;
   /**
@@ -441,11 +504,12 @@ export interface Ten98Auth {
    */
   assertSchema(db: AnyDatabase): Promise<void>;
   /**
-   * Completes a sign-in's two-factor challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
-   * `two_factor` cookie) under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge that is
-   * unknown or expired, gets one uniform 401, and a session for any other account rolls back. The instance the app holds
-   * refuses a challenge outside it. Pass the request as received; verification with a session (enabling two-factor) still
-   * goes to `handler`.
+   * Handles every two-factor request (a POST to `/two-factor/*`); the instance the app holds refuses them, naming this
+   * function. Completing a sign-in's challenge (`/two-factor/verify-totp`, `-backup-code` or `-otp`, with the signed
+   * `two_factor` cookie) runs under the challenged account's lock: an account `isAccountUsable` refuses, or a challenge
+   * that is unknown or expired, gets one uniform 401, and a session for any other account rolls back. Every other
+   * request (enrolling and confirming a factor, disabling it, recovery codes, the TOTP URI) needs a session and runs
+   * under that user's lock; without one it gets better-auth's own 401. Pass the request as received.
    */
   verifyTwoFactor(db: AnyDatabase, request: Request): Promise<Response>;
 }
@@ -488,6 +552,7 @@ export interface LockedTen98Auth extends Omit<Ten98Auth, 'withLockedAuth' | 'wit
 
 type StoreWhere = { field: string; value: string; operator?: 'eq' | 'starts_with' }[];
 type StoreAdapterSurface = {
+  update(query: { model: string; where: StoreWhere; update: Record<string, unknown> }): Promise<unknown>;
   deleteMany(query: { model: string; where: StoreWhere }): Promise<number>;
   delete(query: { model: string; where: StoreWhere }): Promise<void>;
   findOne<T>(query: { model: string; where: StoreWhere }): Promise<T | null>;
@@ -496,6 +561,7 @@ type StoreAdapterSurface = {
 };
 type StoreContext = {
   adapter: StoreAdapterSurface;
+  secretConfig: unknown;
   internalAdapter: {
     deleteUserSessions(userId: string): Promise<void>;
     createVerificationValue(data: { identifier: string; value: string; expiresAt: Date }): Promise<{ id: string }>;
@@ -528,6 +594,55 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   if (!Number.isInteger(emailLockKey) || emailLockKey < -INT32 || emailLockKey >= INT32) throw new TypeError('emailLockKey must be a 32-bit integer.');
   const prefix = cookiePrefix ?? `ten98-${createHash('sha256').update(origin).digest('hex').slice(0, 16)}`;
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(prefix)) throw new TypeError('cookiePrefix must be 1 to 64 letters, digits, hyphens or underscores.');
+  const scopes = [{ path: '/', domain: undefined as string | undefined }, ...(options.legacyCookieScopes ?? []).map(scope => {
+    const { path = '/', domain } = scope ?? {};
+    if (typeof path !== 'string' || !/^\/[\x21-\x3a\x3c-\x7e]*$/.test(path)) throw new TypeError('legacyCookieScopes: a path starts with / and has no spaces, semicolons or control characters.');
+    if (domain !== undefined && (typeof domain !== 'string' || !/^\.?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/.test(domain))) throw new TypeError('legacyCookieScopes: a domain is a host name.');
+    return { path, domain };
+  })];
+  const secureCookies = origin.startsWith('https:');
+  /** better-auth's routes live under this path (its default); a cookie copy can sit on any prefix of it. */
+  const basePath = '/api/auth';
+  /** The exact name of one of the auth cookies on this instance: __Host-<prefix>.<name> on https, <prefix>.<name> on http. */
+  const cookieName = (name: string) => `${secureCookies ? '__Host-' : ''}${prefix}.${name}`;
+  /** The auth cookies the single-copy rule covers: what the library reads for the session, a challenge and a known device. */
+  const guardedCookies = () => [cookieName('session_token'), cookieName('two_factor'), cookieName(device.cookie)];
+  const duplicated = (headers: HeadersInit | undefined, name: string) => cookiePairs(headers).filter(([key]) => key === name).length > 1;
+  /**
+   * The scopes a copy of an auth cookie can live in, so a refused duplicate is expired in each: `/`, every prefix of the
+   * auth routes' base path and of the request's own path, and each legacy scope (a parent Domain among them). A __Host-
+   * name exists only at Path=/ with no Domain, so it is expired there alone.
+   */
+  const expiryScopes = (name: string, path: string | undefined) => {
+    if (name.startsWith('__Host-')) return [{ path: '/', domain: undefined as string | undefined }];
+    const prefixes = (value: string) => value.split('/').filter(Boolean).map((_, at, parts) => `/${parts.slice(0, at + 1).join('/')}`);
+    const safe = path !== undefined && /^\/[\x21-\x3a\x3c-\x7e]*$/.test(path);
+    const paths = new Set(['/', ...prefixes(basePath), ...(safe ? prefixes(path) : [])]);
+    const all = [...[...paths].map(value => ({ path: value, domain: undefined as string | undefined })), ...scopes.slice(1)];
+    return all.filter((scope, at) => all.findIndex(other => other.path === scope.path && other.domain === scope.domain) === at);
+  };
+  const expiry = (name: string, path: string | undefined) => expiryScopes(name, path).map(({ path: scope, domain }) =>
+    `${name}=; Max-Age=0; Path=${scope}${domain ? `; Domain=${domain}` : ''}; HttpOnly; SameSite=Lax${secureCookies ? '; Secure' : ''}`);
+  const expiredAuthCookies = (headers: HeadersInit | undefined, path?: string) => guardedCookies().filter(name => duplicated(headers, name)).flatMap(name => expiry(name, path));
+  /** `response` with the expiring Set-Cookie values first, so a cookie the response itself sets after them stands. */
+  const withExpired = (response: Response, headers: HeadersInit | undefined, path?: string) => {
+    const expired = expiredAuthCookies(headers, path);
+    if (!expired.length) return response;
+    const merged = new Headers();
+    for (const value of expired) merged.append('set-cookie', value);
+    for (const [key, value] of response.headers) if (key.toLowerCase() !== 'set-cookie') merged.append(key, value);
+    for (const value of response.headers.getSetCookie()) merged.append('set-cookie', value);
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: merged });
+  };
+  /** Headers without the session cookie when it is sent more than once: the request is then answered as signed out. */
+  const withoutDuplicateSession = (headers: HeadersInit | undefined): HeadersInit | undefined => {
+    const name = cookieName('session_token');
+    if (!duplicated(headers, name)) return headers;
+    const kept = new Headers(headers);
+    const pairs = cookiePairs(headers).filter(([key]) => key !== name).map(([key, value]) => `${key}=${value}`);
+    if (pairs.length) kept.set('cookie', pairs.join('; ')); else kept.delete('cookie');
+    return kept;
+  };
   const { twoFactor: factor, password, session, reset } = ten98AuthPolicy;
   const factors = twoFactor({
     issuer: appName,
@@ -587,7 +702,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     path?: string;
     body?: Record<string, unknown>;
     getSignedCookie(name: string, secret: string): Promise<string | null | false>;
-    context: { secret: string; session?: { session?: { oidcProvider?: unknown } } | null; createAuthCookie(name: string): { name: string };
+    context: { secret: string; session?: { session?: { oidcProvider?: unknown } } | null; newSession?: { session?: unknown } | null; createAuthCookie(name: string): { name: string };
       internalAdapter: StoreContext['internalAdapter'] & {
         findVerificationValue(identifier: string): Promise<{ value: string } | null>;
         deleteVerificationByIdentifier(identifier: string): Promise<void>;
@@ -614,6 +729,12 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       // better-auth's generateRandomString (letters, digits, '-' and '_'); its '2fa-attempts-' and '2fa-otp-' rows name
       // the challenge and are always longer. completeOidcSession is a server call (no path); any other is a password sign-in.
       const hook = context as unknown as HookContext;
+      // A trusted device set by a sign-in completed into a provider-bound session is tied to that provider.
+      if (hook && data.identifier.startsWith('trust-device-')) {
+        const provider = providerKey((hook.context.newSession?.session as { oidcProvider?: unknown } | undefined)?.oidcProvider);
+        if (provider !== undefined) await hook.context.internalAdapter.createVerificationValue({ identifier: trustProviderPrefix + data.identifier, value: provider, expiresAt: data.expiresAt });
+        return;
+      }
       if (!hook || !/^2fa-[A-Za-z0-9_-]{20}$/.test(data.identifier)) return;
       const provider = hook.path === undefined && typeof hook.body?.oidcUserId === 'string' ? providerKey(hook.body.provider) : undefined;
       await hook.context.internalAdapter.createVerificationValue({ identifier: challengeProviderPrefix + data.identifier, value: provider ?? '', expiresAt: data.expiresAt });
@@ -649,7 +770,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   };
   const issueDevice = async (context: DeviceHook, userId: string) => {
     const cookie = context.context.createAuthCookie(device.cookie, { maxAge: device.lifetimeSeconds });
-    const entries = deviceEntries(context.getCookie(cookie.name));
+    const entries = deviceEntries(singleCookie((context as unknown as { headers?: Headers }).headers, cookie.name));
     const previous = deviceFor(keys, userId, entries);
     const adapter = await getCurrentAdapter(context.context.adapter as never) as unknown as StoreAdapterSurface;
     if (previous) {
@@ -657,7 +778,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
         await adapter.deleteMany({ model: 'verification', where: [{ field: 'identifier', value: identifier }, { field: 'value', value: userId }] });
       }
     }
-    const deviceId = randomBytes(24).toString('base64url');
+    const deviceId = newDeviceId(keys);
     await context.context.internalAdapter.createVerificationValue({ identifier: deviceRow(deviceId), value: userId, expiresAt: new Date(Date.now() + device.lifetimeSeconds * 1000) });
     const live = await adapter.findMany<{ id: string }>({ model: 'verification', where: [{ field: 'value', value: userId }, { field: 'identifier', operator: 'starts_with', value: 'known-device:' }], sortBy: { field: 'createdAt', direction: 'desc' } });
     for (const stale of live.slice(device.devices)) await adapter.delete({ model: 'verification', where: [{ field: 'id', value: stale.id }] });
@@ -706,6 +827,135 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     },
   } : undefined;
 
+  /**
+   * The TOTP replay ledger (RFC 6238 section 5.2): one verification row per user, `totp-step:<userId>` (stored hashed like
+   * every identifier), holding the last time step a code was accepted for, never the code. better-auth's verifier says
+   * only whether a code matched, so the preset finds the step itself, with the user's secret (decrypted with better-auth's
+   * own key, as its route does) and the same digits, period and ±1 window. Every read and write runs on the transaction
+   * that holds the user's row, so two submissions of one code are serialised and only the first is accepted.
+   */
+  const ledger = {
+    row: (userId: string) => `totp-step:${userId}`,
+    async secretOf(store: StoreContext, userId: string, verifiedOnly: boolean) {
+      const row = await store.adapter.findOne<{ secret: string; verified?: boolean | null }>({ model: 'twoFactor', where: [{ field: 'userId', value: userId }] });
+      if (!row || (verifiedOnly && row.verified === false)) return undefined;
+      return symmetricDecrypt({ key: store.secretConfig as never, data: row.secret });
+    },
+    async last(store: StoreContext, userId: string) {
+      const row = await store.adapter.findOne<{ id: string; value: string; expiresAt: Date | string }>({ model: 'verification', where: [{ field: 'identifier', value: ledger.row(userId) }] });
+      const step = row && new Date(row.expiresAt).getTime() > Date.now() ? Number(row.value) : Number.NEGATIVE_INFINITY;
+      return { row, step: Number.isSafeInteger(step) ? step : Number.NEGATIVE_INFINITY };
+    },
+    // The row expires once no code of that step can match any more: steps up to it then fall outside the window anyway.
+    async record(store: StoreContext, userId: string, step: number) {
+      const { row } = await ledger.last(store, userId);
+      const expiresAt = new Date((step + 2) * factor.periodSeconds * 1000);
+      if (row) await store.adapter.update({ model: 'verification', where: [{ field: 'id', value: row.id }], update: { value: String(step), expiresAt } });
+      else await store.internalAdapter.createVerificationValue({ identifier: ledger.row(userId), value: String(step), expiresAt });
+    },
+    /** The step a TOTP code is accepted for now, or undefined when it matches none, or only one at or before the last. */
+    async fresh(store: StoreContext, userId: string, code: unknown, verifiedOnly: boolean) {
+      return (await ledger.inspect(store, userId, code, verifiedOnly)).fresh;
+    },
+    /** `fresh` as above, and whether the code matched a step that was already used (a replay). */
+    async inspect(store: StoreContext, userId: string, code: unknown, verifiedOnly: boolean) {
+      const secret = await ledger.secretOf(store, userId, verifiedOnly);
+      const { step: last } = await ledger.last(store, userId);
+      const step = secret === undefined || typeof code !== 'string' ? undefined : matchedStep(secret, code);
+      return { fresh: step !== undefined && step > last ? step : undefined, replay: step !== undefined && step <= last };
+    },
+  };
+  /**
+   * The factor-action counter: one verification row per user, `factor-actions:<userId>`, holding the refused proofs in a
+   * row and the time factor actions are locked until. Read and written on the transaction holding the user's row.
+   */
+  const factorActions = {
+    row: (userId: string) => `factor-actions:${userId}`,
+    async read(store: StoreContext, userId: string) {
+      const row = await store.adapter.findOne<{ id: string; value: string }>({ model: 'verification', where: [{ field: 'identifier', value: factorActions.row(userId) }] });
+      let state = { failures: 0, lockedUntil: 0 };
+      try { if (row) state = { failures: 0, lockedUntil: 0, ...JSON.parse(row.value) as object }; } catch { /* a malformed row counts as none */ }
+      const failures = Number.isSafeInteger(state.failures) ? state.failures : 0, lockedUntil = Number.isSafeInteger(state.lockedUntil) ? state.lockedUntil : 0;
+      // An expired lock starts the count again, as better-auth's sign-in lockout does.
+      return { row, failures: lockedUntil && lockedUntil <= Date.now() ? 0 : failures, lockedUntil: lockedUntil > Date.now() ? lockedUntil : 0 };
+    },
+    async write(store: StoreContext, userId: string, failures: number, lockedUntil: number, row: { id: string } | null) {
+      const value = JSON.stringify({ failures, lockedUntil }), expiresAt = new Date(Date.now() + 366 * 86_400_000);
+      if (row) await store.adapter.update({ model: 'verification', where: [{ field: 'id', value: row.id }], update: { value, expiresAt } });
+      else await store.internalAdapter.createVerificationValue({ identifier: factorActions.row(userId), value, expiresAt });
+    },
+    async locked(store: StoreContext, userId: string) {
+      const { lockedUntil } = await factorActions.read(store, userId);
+      return lockedUntil ? Math.max(1, Math.ceil((lockedUntil - Date.now()) / 1000)) : 0;
+    },
+    async failed(store: StoreContext, userId: string) {
+      const { row, failures } = await factorActions.read(store, userId);
+      const count = failures + 1;
+      await factorActions.write(store, userId, count >= factor.maxFailedAttempts ? 0 : count, count >= factor.maxFailedAttempts ? Date.now() + factor.lockoutSeconds * 1000 : 0, row);
+    },
+    async succeeded(store: StoreContext, userId: string) {
+      const { row, failures, lockedUntil } = await factorActions.read(store, userId);
+      if (row && (failures || lockedUntil)) await factorActions.write(store, userId, 0, 0, row);
+    },
+  };
+  /** The user's verified second factor, or undefined (none, or an enrolment not yet confirmed). */
+  const verifiedFactor = async (store: StoreContext, userId: string) => {
+    const row = await store.adapter.findOne<{ id: string; backupCodes: string; verified?: boolean | null }>({ model: 'twoFactor', where: [{ field: 'userId', value: userId }] });
+    return row && row.verified !== false ? row : undefined;
+  };
+  /** Consumes an unused recovery code of the verified factor; false when it is not one of them. */
+  const consumeRecoveryCode = async (store: StoreContext, userId: string, code: string) => {
+    const row = await verifiedFactor(store, userId);
+    if (!row || !new RegExp(factor.backupCodePattern).test(code)) return false;
+    let codes: unknown;
+    try { codes = JSON.parse(await symmetricDecrypt({ key: store.secretConfig as never, data: row.backupCodes })); } catch { return false; }
+    if (!Array.isArray(codes) || !codes.includes(code)) return false;
+    const backupCodes = await symmetricEncrypt({ key: store.secretConfig as never, data: JSON.stringify(codes.filter(item => item !== code)) });
+    await store.adapter.update({ model: 'twoFactor', where: [{ field: 'id', value: row.id }], update: { backupCodes } });
+    return true;
+  };
+  /**
+   * A factor proof for the user the transaction holds: a fresh TOTP code (recorded in the ledger) or an unused recovery
+   * code (consumed). 'locked' while factor actions are locked; a refused proof is counted, a successful one resets the
+   * count.
+   */
+  const proveFactor = async (store: StoreContext, userId: string, code: unknown): Promise<'proved' | 'refused' | { lockedFor: number }> => {
+    const lockedFor = await factorActions.locked(store, userId);
+    if (lockedFor) return { lockedFor };
+    let proved = false;
+    if (typeof code === 'string') {
+      const step = await ledger.fresh(store, userId, code, true);
+      if (step !== undefined) { await ledger.record(store, userId, step); proved = true; }
+      else proved = await consumeRecoveryCode(store, userId, code);
+    }
+    if (proved) await factorActions.succeeded(store, userId);
+    else await factorActions.failed(store, userId);
+    return proved ? 'proved' : 'refused';
+  };
+  /** better-auth's own answer to a wrong code on a session-bound verification, so a refused proof reads the same. */
+  const wrongCode = async (bound: LockedTen98Auth, request: Request) => {
+    const url = new URL(request.url);
+    url.pathname = url.pathname.replace(/\/two-factor\/[^/]+\/*$/i, '/two-factor/verify-totp');
+    return bound.handler(await asJson(new Request(url, { method: 'POST', headers: request.headers }), { code: notACode }));
+  };
+  const factorActionsLocked = (seconds: number) => new Response(JSON.stringify({ code: 'FACTOR_ACTIONS_LOCKED', message: 'Too many wrong codes. Try again later.', retryAfterSeconds: seconds }),
+    { status: 429, headers: { 'content-type': 'application/json', 'retry-after': String(seconds) } });
+  /**
+   * A TOTP request (verify-totp, at sign-in or with a session) run through the ledger: a code that is not fresh reaches
+   * better-auth as a code that matches nothing, so it is refused, counted and answered exactly as a wrong code; a fresh
+   * one is recorded once better-auth accepts it.
+   */
+  const throughLedger = async (bound: object, userId: string, request: Request, run: (request: Request) => Promise<Response>) => {
+    if (!totpRoute.test(new URL(request.url).pathname)) return run(request);
+    const body = await request.clone().json().catch(() => undefined) as { code?: unknown } | undefined;
+    if (!body || typeof body.code !== 'string') return run(request);
+    const store = await storeOf(bound);
+    const step = await ledger.fresh(store, userId, body.code, false);
+    const sent = step !== undefined ? request : await asJson(request, { ...body, code: notACode });
+    const response = await run(sent);
+    if (response.ok && step !== undefined) await ledger.record(store, userId, step);
+    return response;
+  };
   /** The isAccountUsable hook, refusing a closed account by default. */
   const usable = (account: { id: string; email: string; closedAt: Date | null }) => options.isAccountUsable ? options.isAccountUsable(account) : account.closedAt === null;
   /**
@@ -715,10 +965,16 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
    * exists. Through the adapter, whose user model must map closed_at as closedAt: without it the select throws, so the
    * check fails loudly instead of being skipped (instanceSchema refuses such an adapter at start-up).
    */
-  const storedAccount = async (adapter: unknown, where: { field: 'id' | 'email'; value: string }) => {
-    const found = await (adapter as { findOne<T>(query: { model: string; where: { field: string; value: string }[]; select: string[] }): Promise<T | null> })
+  const accountRow = (adapter: unknown, where: { field: 'id' | 'email'; value: string }) =>
+    (adapter as { findOne<T>(query: { model: string; where: { field: string; value: string }[]; select: string[] }): Promise<T | null> })
       .findOne<{ id: string; email: string; closedAt?: Date | null }>({ model: 'user', where: [where], select: ['id', 'email', 'closedAt'] });
-    if (found && found.closedAt === undefined) throw new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
+  // Drizzle cannot build a select of an unmapped field and throws a TypeError: the same 500, naming the mapping, as a row
+  // read without the field, whether or not the start-up check has run.
+  const unmappedClosedAt = () => new APIError('INTERNAL_SERVER_ERROR', { message: 'The Drizzle user table must map closed_at as closedAt.' });
+  const storedAccount = async (adapter: unknown, where: { field: 'id' | 'email'; value: string }) => {
+    let found: Awaited<ReturnType<typeof accountRow>>;
+    try { found = await accountRow(adapter, where); } catch (error) { if (error instanceof TypeError) throw unmappedClosedAt(); throw error; }
+    if (found && found.closedAt === undefined) throw unmappedClosedAt();
     return found;
   };
   const refusedAccount = async (adapter: unknown, where: { field: 'id' | 'email'; value: string }) => {
@@ -726,10 +982,16 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     return found !== null && await usable({ id: found.id, email: found.email, closedAt: found.closedAt ?? null }) !== true;
   };
 
+  const disabledPaths: string[] = [];
   const auth = betterAuth({
     database: protectTokens(database as AdapterFactory, keys) as unknown as BetterAuthOptions['database'], baseURL: origin, secret, appName, trustedOrigins: [origin],
     // better-auth skips these checks when NODE_ENV=test or TEST is set unless they are pinned.
-    advanced: { disableOriginCheck: false, disableCSRFCheck: false, cookiePrefix: prefix },
+    // On https every auth cookie is named __Host-<prefix>.<name> (Secure, Path=/, no Domain), better-auth's and the
+    // preset's alike, so no sibling subdomain or other path can set one the preset reads. better-auth would prefix
+    // __Secure- itself; that is turned off and each name given in full, with Secure on every cookie.
+    advanced: { disableOriginCheck: false, disableCSRFCheck: false, cookiePrefix: prefix,
+      ...(secureCookies ? { useSecureCookies: false, defaultCookieAttributes: { secure: true },
+        cookies: Object.fromEntries(authCookieNames.map(name => [name, { name: cookieName(name), attributes: { secure: true, path: '/' } }])) } : {}) },
     // Self-hosted installs send no data to Ten98 or third parties.
     telemetry: { enabled: false },
     // Adapter failures can contain query parameters, and better-call logs non-API exceptions even with the logger off,
@@ -744,7 +1006,8 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     // better-auth nor returned by it.
     user: { additionalFields: { closedAt: { type: 'date', required: false, input: false, returned: false, defaultValue: () => null } } },
     // Identities are linked and unlinked only through linkOidcIdentity and unlinkOidcIdentity, under the user's lock.
-    disabledPaths: [...Object.keys(disabledRoutes)],
+    // Filled once the instance exists, with every route it has that is not allowed; better-auth reads it per request.
+    disabledPaths,
     databaseHooks,
     plugins: [factors, oidcSessions, sessionRevocation, knownDevices],
     emailAndPassword: {
@@ -815,39 +1078,97 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
   const resetBody = (auth.api as unknown as { requestPasswordReset: { options: { body: { safeParse(input: unknown): { success: boolean } } } } }).requestPasswordReset.options.body;
   // disabledPaths turns a route off in the router only: its server call (auth.api.*) would still run. Each one throws
   // instead, naming what to use, on this instance and on every bound one.
-  for (const [name, endpoint] of Object.entries(auth.api as unknown as Record<string, { path?: unknown }>)) {
-    const path = typeof endpoint?.path === 'string' ? endpoint.path : undefined;
-    if (path === undefined || !Object.hasOwn(disabledRoutes, path)) continue;
-    const message = `auth.api.${name} (${path}) is off in the preset: ${disabledRoutes[path]}.`;
-    Object.assign(auth.api, { [name]() { throw new TypeError(message); } });
+  // The routes this instance serves: the documented ones and the app's additions. Every other route the instance has is
+  // off, in the router (better-auth's disabledPaths, and the handler's own check, which also covers parameterised paths)
+  // and as a server call, which throws naming what to use instead.
+  const endpoints = Object.entries(auth.api as unknown as Record<string, { path?: unknown }>)
+    .flatMap(([name, endpoint]) => typeof endpoint?.path === 'string' ? [[name, endpoint.path] as const] : []);
+  const allowed = new Set<string>([...ten98AuthRoutes, ...(options.allowRoutes ?? []).map(route => {
+    if (typeof route !== 'string' || !endpoints.some(([, path]) => path === route)) throw new TypeError(`allowRoutes: ${String(route)} is not a route of this instance.`);
+    if (Object.hasOwn(disabledRoutes, route)) throw new TypeError(`allowRoutes: ${route} stays off: ${disabledRoutes[route]}.`);
+    return route;
+  })]);
+  const servedRoutes = endpoints.map(([, path]) => path).filter(path => allowed.has(path)).map(routePattern);
+  disabledPaths.push(...new Set(endpoints.map(([, path]) => path).filter(path => !allowed.has(path))));
+  for (const [name, path] of endpoints) {
+    if (allowed.has(path)) continue;
+    const message = `auth.api.${name} (${path}) is off in the preset: ${disabledRoutes[path] ?? 'add it to allowRoutes to serve it'}.`;
+    // The stub keeps the route's path, so the instance's routes can still be listed.
+    Object.assign(auth.api, { [name]: Object.assign(() => { throw new TypeError(message); }, { path }) });
+  }
+  /** Whether a request's path is one of the routes this instance serves (under better-auth's base path). */
+  const served = (pathname: string) => {
+    if (!pathname.toLowerCase().startsWith(`${basePath}/`)) return false;
+    const route = pathname.slice(basePath.length).replace(/\/+$/, '').toLowerCase();
+    return servedRoutes.some(pattern => pattern.test(route));
+  };
+  /** The challenge a request's single, signed two_factor cookie names: a live '2fa-' challenge row of an existing account. */
+  const readChallenge = async (instance: object, headers: HeadersInit | undefined) => {
+    const cookie = singleCookie(headers, cookieName('two_factor'));
+    if (cookie === undefined || cookie.startsWith('"')) return null;
+    const identifier = signedValue(cookie, secret);
+    if (identifier === undefined || !challengeIdentifier.test(identifier)) return null;
+    const { adapter } = await storeOf(instance);
+    const row = await adapter.findOne<{ value: string; expiresAt: Date | string }>({ model: 'verification', where: [{ field: 'identifier', value: identifier }] });
+    if (!row || !(new Date(row.expiresAt).getTime() > Date.now()) || typeof row.value !== 'string' || !row.value) return null;
+    const user = await adapter.findOne<{ id: string }>({ model: 'user', where: [{ field: 'id', value: row.value }] });
+    if (!user) return null;
+    return { identifier, userId: user.id, limitKey: `v1.${mac(keys.challengeLimit, identifier)}` };
+  };
+  {
+    const route = auth.handler.bind(auth);
+    const guarded = async (request: Request) => {
+      if (!served(new URL(request.url).pathname)) return refusal(404, 'NOT_FOUND', 'Not found.');
+      const headers = withoutDuplicateSession(request.headers);
+      return withExpired(await route(headers === request.headers ? request : new Request(request, { headers })), request.headers, new URL(request.url).pathname);
+    };
+    Object.assign(auth, { handler: guarded, fetch: guarded });
+    const api = auth.api as unknown as Record<string, unknown>;
+    for (const [name, call] of Object.entries(api)) {
+      if (typeof call !== 'function') continue;
+      api[name] = Object.assign((input?: { headers?: HeadersInit }) => {
+        const headers = withoutDuplicateSession(input?.headers);
+        return (call as (input?: unknown) => unknown)(headers === input?.headers ? input : { ...input, headers });
+      }, call);
+    }
   }
   const helpers = {
+    cookieName: (name: string) => {
+      if (typeof name !== 'string' || !/^[a-z_]{1,64}$/.test(name)) throw new TypeError('cookieName takes a cookie name such as two_factor or session_token.');
+      return cookieName(name);
+    },
+    readTwoFactorChallenge: (request: Request) => {
+      if (!(request instanceof Request)) throw new TypeError('readTwoFactorChallenge takes the request.');
+      return readChallenge(auth, request.headers);
+    },
+    expiredAuthCookies: (headers: HeadersInit, path?: string) => expiredAuthCookies(headers, typeof path === 'string' ? path : undefined),
     storedVerificationIdentifier: (identifier: string) => storedIdentifier(keys, raw(identifier)),
     sessionTokenKey: (token: string) => tokenHandle(keys, raw(token)),
   };
-  // The two-factor challenge cookie's name, as better-auth's createAuthCookie builds it for this instance.
-  const challengeCookie = `${origin.startsWith('https:') ? '__Secure-' : ''}${prefix}.two_factor`;
-  /** Which locked sign-in a route needs: a password sign-in, the completion of a challenge, or neither. */
-  const signInKind = (path: string, headers: HeadersInit | undefined): 'password' | 'twoFactor' | undefined =>
-    passwordRoute.test(path) ? 'password' : challengeRoute.test(path) && cookieFrom(headers, challengeCookie) !== undefined ? 'twoFactor' : undefined;
+  /** Which locked route a request needs: a password sign-in, any two-factor request, or neither. */
+  const signInKind = (path: string): 'password' | 'twoFactor' | undefined =>
+    passwordRoute.test(path) ? 'password' : twoFactorRoute.test(path) ? 'twoFactor' : undefined;
+  /** The server calls of the two-factor routes, by name: they too go only through verifyTwoFactor. */
+  const twoFactorCalls = new Set(Object.entries(auth.api as unknown as Record<string, { path?: unknown }>)
+    .filter(([, endpoint]) => typeof endpoint?.path === 'string' && endpoint.path.startsWith('/two-factor/')).map(([name]) => name));
+  // better-auth's own handler, for a two-factor request without a session: it answers that request's 401 itself.
+  const unlocked = auth.handler.bind(auth);
   if (!locking) return Object.assign(auth, helpers) as unknown as LockedTen98Auth;
   // On the instance the app holds, better-auth's own password sign-in has no limit, no lock and no constant-cost check,
   // so it is off: the route (any case, any trailing slash) answers 404 and api.signInEmail throws.
-  // A sign-in's two-factor challenge is completed only through verifyTwoFactor, under the account's lock, for the same
-  // reason; verification with a session (enabling two-factor) carries no challenge cookie and still goes through.
+  // Every two-factor request (completing a sign-in's challenge, enrolling, disabling, recovery codes) goes only through
+  // verifyTwoFactor, under the account's lock, for the same reason; the refusal names it, so a missed route fails loudly.
   if (options.allowRawPasswordSignIn !== true) {
     const route = auth.handler.bind(auth);
-    const routed = (request: Request) => signInKind(new URL(request.url).pathname, request.headers) ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
+    const routed = (request: Request) => {
+      const kind = signInKind(new URL(request.url).pathname);
+      if (kind === 'twoFactor') return Promise.resolve(refusal(404, 'NOT_FOUND', twoFactorRouting));
+      return kind ? Promise.resolve(refusal(404, 'NOT_FOUND', 'Not found.')) : route(request);
+    };
     Object.assign(auth, { handler: routed, fetch: routed });
     const api = auth.api as unknown as Record<string, (input?: { headers?: HeadersInit }) => unknown>;
     Object.assign(api, { signInEmail() { throw new TypeError('Password sign-in is only supported through signInWithPassword.'); } });
-    for (const name of twoFactorEndpoints) {
-      const original = api[name];
-      if (typeof original === 'function') api[name] = input => {
-        if (cookieFrom(input?.headers, challengeCookie) !== undefined) throw new TypeError('A two-factor sign-in challenge is only completed through verifyTwoFactor.');
-        return original(input);
-      };
-    }
+    for (const name of twoFactorCalls) Object.assign(api, { [name]() { throw new TypeError(`auth.api.${name}: ${twoFactorRouting}`); } });
   }
   const { lockTimeoutMs = 5000 } = options;
   if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1 || lockTimeoutMs > 600_000) throw new TypeError('lockTimeoutMs must be an integer from 1 to 600000.');
@@ -890,25 +1211,24 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     // the account first.
     const refusals = {
       password: 'Password sign-in inside a locked-auth transaction holds a pool connection while it hashes; use signInWithPassword.',
-      twoFactor: 'A two-factor sign-in challenge is only completed through verifyTwoFactor.',
+      twoFactor: twoFactorRouting,
     } as const;
     const check = (kind: 'password' | 'twoFactor' | undefined) => {
       if (!open) throw closed();
       if (kind && kind !== allowed) throw new TypeError(refusals[kind]);
     };
-    const apiKind = (key: PropertyKey, input: unknown) => key === 'signInEmail' ? 'password'
-      : twoFactorEndpoints.includes(key as never) && cookieFrom((input as { headers?: HeadersInit } | undefined)?.headers, challengeCookie) !== undefined ? 'twoFactor' : undefined;
+    const apiKind = (key: PropertyKey) => key === 'signInEmail' ? 'password' : typeof key === 'string' && twoFactorCalls.has(key) ? 'twoFactor' : undefined;
     const api = bound.api as unknown as Record<PropertyKey, unknown>;
     const handler = bound.handler.bind(bound);
     Object.assign(bound, {
       userId: hold.userId,
       api: new Proxy(api, { get(target, key) {
         const value = target[key];
-        return typeof value === 'function' ? (...args: unknown[]) => { check(apiKind(key, args[0])); return (value as (...input: unknown[]) => unknown).apply(target, args); } : value;
+        return typeof value === 'function' ? (...args: unknown[]) => { check(apiKind(key)); return (value as (...input: unknown[]) => unknown).apply(target, args); } : value;
       } }),
-      handler(request: Request) { check(signInKind(new URL(request.url).pathname, request.headers)); return handler(request); },
+      handler(request: Request) { check(signInKind(new URL(request.url).pathname)); return handler(request); },
       // better-auth's fetch is the same handler; it gets the same checks.
-      fetch(request: Request) { check(signInKind(new URL(request.url).pathname, request.headers)); return handler(request); },
+      fetch(request: Request) { check(signInKind(new URL(request.url).pathname)); return handler(request); },
       async revokeAllSessions() {
         check(undefined);
         if (hold.userId === undefined) return;
@@ -918,7 +1238,24 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       },
     });
     const unmark = markLockedAuth({ email: hold.email, userId: hold.userId }, callbackTx, connection);
-    try { return await lockedContext.run(true, () => run(bound, callbackTx)); } finally { open = false; unmark(); }
+    const lockedUserId = hold.userId;
+    // verifyCodeForAction and linkOidcIdentity find this transaction's code check here, for the user it locked.
+    if (lockedUserId !== undefined && hold.email === undefined) {
+      codeChecks.set(callbackTx, {
+        userId: lockedUserId,
+        async check(code: unknown) {
+          if (!open) throw closed();
+          const proof = await proveFactor(await storeOf(bound), lockedUserId, code);
+          if (typeof proof === 'object') throw new FactorActionsLockedError(proof.lockedFor);
+          return proof === 'proved';
+        },
+        async factorOn() {
+          if (!open) throw closed();
+          return (await verifiedFactor(await storeOf(bound), lockedUserId)) !== undefined;
+        },
+      });
+    }
+    try { return await lockedContext.run(true, () => run(bound, callbackTx)); } finally { open = false; unmark(); codeChecks.delete(callbackTx); }
   };
   // Refused before any statement: without the factory there is nothing to bind; a transaction as `db`, or a database on
   // a locked-auth connection, would put the lock inside another transaction; a second locked-auth transaction opened in
@@ -940,9 +1277,17 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     await schemaOf(db);
     adapterChecked = recheckable(adapterChecked, async () => {
       // Drizzle cannot build a select of an unmapped field and throws a TypeError; any other failure is reported as it is.
-      try { await storedAccount((await storeOf(auth)).adapter, { field: 'id', value: '' }); } catch (error) {
+      const { adapter } = await storeOf(auth);
+      try { await accountRow(adapter, { field: 'id', value: '' }); } catch (error) {
         if (error instanceof TypeError) throw new SchemaMismatchError(['closedAt (closed_at) in the adapter\'s user model']);
         throw error;
+      }
+      // A Drizzle adapter names the column closedAt maps to: it must be closed_at, a timestamp with time zone. Mapped to
+      // another column (updatedAt, a boolean), every account would read as closed or open by accident.
+      const column = (adapter as { options?: { schema?: Record<string, Record<string, { name?: unknown; columnType?: unknown; withTimezone?: unknown } | undefined> | undefined> } })
+        .options?.schema?.user?.closedAt;
+      if (column && (column.name !== 'closed_at' || (column.columnType !== 'PgTimestamp' && column.columnType !== 'PgTimestampString') || column.withTimezone !== true)) {
+        throw new SchemaMismatchError([`closedAt mapped to ${String(column.name)} (${String(column.columnType)}); it must map closed_at, a timestamp with time zone`]);
       }
     });
     return adapterChecked.check;
@@ -969,7 +1314,9 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
    */
   const claimDevice = async (db: AnyDatabase, address: string, headers: HeadersInit | undefined): Promise<string | undefined> => {
     const store = await storeOf(auth);
-    const entries = deviceEntries(cookieFrom(headers, store.createAuthCookie(device.cookie).name));
+    // Only one exact copy, and only entries whose device id carries its own MAC: forged cookies never reach the database
+    // or a claim slot.
+    const entries = deviceEntries(singleCookie(headers, store.createAuthCookie(device.cookie).name)).filter(entry => deviceIdSigned(keys, entry.deviceId));
     if (!entries.length) return undefined;
     // At most `device.claims` claims at once in this process (each one pool read, then one short locked transaction)
     // and a few waiting; past that the browser counts as not known, so its cookie never holds more of the pool than that.
@@ -1083,12 +1430,19 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     assertSchema: db => instanceSchema(db),
     async verifyTwoFactor(db, request) {
       await ready(db, () => undefined);
-      if (!(request instanceof Request) || !challengeRoute.test(new URL(request.url).pathname)) throw new TypeError('verifyTwoFactor completes a request to /two-factor/verify-totp, -backup-code or -otp.');
-      // The challenge the signed two_factor cookie names, and the account it was issued for.
-      const identifier = signedValue(cookieFrom(request.headers, challengeCookie), secret);
-      const challenge = identifier === undefined ? null
-        : await (await storeOf(auth)).adapter.findOne<{ value: string; expiresAt: Date | string }>({ model: 'verification', where: [{ field: 'identifier', value: identifier }] });
-      if (!challenge || !(new Date(challenge.expiresAt).getTime() > Date.now())) return challengeRefused();
+      if (!(request instanceof Request) || request.method !== 'POST' || !twoFactorRoute.test(new URL(request.url).pathname)) throw new TypeError('verifyTwoFactor takes a POST to a /two-factor/* route.');
+      // better-call reads a body by its Content-Type (a form, say), the preset as JSON: read it once, as JSON, and hand
+      // better-auth that body, so a code the ledger or a proof did not see can never reach it.
+      request = await asJson(request);
+      // A request that is not the completion of a sign-in's challenge needs a session, and runs under that user's lock.
+      if (!challengeRoute.test(new URL(request.url).pathname) || !cookiePairs(request.headers).some(([name]) => name === cookieName('two_factor'))) {
+        return sessionTwoFactor(db, request);
+      }
+      // The challenge the one signed two_factor cookie names, and the account it was issued for; a cookie sent twice is
+      // refused, and expired so the next sign-in starts clean.
+      const read = await readChallenge(auth, request.headers);
+      if (!read) return challengeRefused();
+      const challenge = { value: read.userId };
       let response: Response, interrupted = false;
       try {
         response = await transaction(db, async tx => {
@@ -1099,7 +1453,7 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
             // An account closed (or otherwise refused) after its challenge was issued does not complete the sign-in.
             const [account] = await boundTx.select({ id: userTable.id, email: userTable.email, closedAt: userTable.closedAt }).from(userTable).where(eq(userTable.id, row.id));
             if (!account || await usable(account) !== true) return challengeRefused();
-            const verified = await bound.handler(request);
+            const verified = await throughLedger(bound, account.id, request, sent => bound.handler(sent));
             // 503 is onAPIError's answer to a deadlock or serialisation failure inside better-auth (see retryable).
             interrupted = verified.status === 503;
             if (verified.ok && (bound as unknown as Record<symbol, () => string | undefined>)[signedInUser]!() !== account.id) throw new LockedAccountMismatch();
@@ -1118,6 +1472,42 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
     },
   };
   /**
+   * A session-bound two-factor request (enrolling and confirming a factor, disabling it, recovery codes, the TOTP URI):
+   * better-auth's own route, run by an instance bound to a transaction that holds the session user's row. Without a
+   * session it is better-auth's own 401.
+   */
+  const sessionTwoFactor = async (db: AnyDatabase, request: Request) => {
+    const current = await auth.api.getSession({ headers: request.headers });
+    if (!current) return unlocked(request);
+    try {
+      return await transaction(db, async tx => {
+        await limitLockWaits(tx);
+        const [row] = await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, current.user.id)).for('no key update');
+        if (!row) return challengeRefused();
+        return bind(tx, { userId: row.id, email: undefined }, async bound => {
+          const store = await storeOf(bound);
+          const route = /\/two-factor\/([^/]+)\/*$/i.exec(new URL(request.url).pathname)?.[1]?.toLowerCase();
+          // Turning the factor off, recovery codes, re-enrolling and the TOTP URI, while a verified factor is on.
+          if (route !== undefined && factorWeakening.has(route) && await verifiedFactor(store, row.id)) {
+            const body = await request.clone().json().catch(() => undefined) as { code?: unknown } | undefined;
+            const proof = await proveFactor(store, row.id, body?.code);
+            if (typeof proof === 'object') return factorActionsLocked(proof.lockedFor);
+            if (proof === 'refused') return wrongCode(bound, request);
+          }
+          if (route === 'verify-totp') {
+            const body = await request.clone().json().catch(() => undefined) as { code?: unknown } | undefined;
+            if ((await ledger.inspect(store, row.id, body?.code, false)).replay) await factorActions.failed(store, row.id);
+          }
+          return throughLedger(bound, row.id, request, sent => bound.handler(sent));
+        }, 'twoFactor');
+      });
+    } catch (error) {
+      if (retryable(error)) return refusal(503, 'TWO_FACTOR_RETRY', 'The request was interrupted. Try again.', { 'retry-after': '1' });
+      if (error instanceof TransactionRolledBackError) return refusal(500, 'TWO_FACTOR_FAILED', 'The request failed. Try again.');
+      throw error;
+    }
+  };
+  /**
    * Replaces a legacy hash once, under the lock, in a savepoint: a failure (a trigger, a constraint) rolls back the
    * savepoint only, so the sign-in stands and the next one retries.
    */
@@ -1130,6 +1520,12 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
       });
     } catch (error) { if (error instanceof LockedAuthClosedError) throw error; }
   };
+  // A sign-in from a browser that sends an auth cookie twice also expires every copy, before the cookies it sets.
+  const { signInWithPassword: signInOnce, verifyTwoFactor: verifyOnce } = locked;
+  Object.assign(locked, {
+    signInWithPassword: async (db: AnyDatabase, input: PasswordSignIn, limits: PasswordSignInLimits) => withExpired(await signInOnce(db, input, limits), (input as Partial<PasswordSignIn> | undefined)?.headers),
+    verifyTwoFactor: async (db: AnyDatabase, request: Request) => withExpired(await verifyOnce(db, request), request?.headers, request instanceof Request ? new URL(request.url).pathname : undefined),
+  });
   return Object.assign(auth, helpers, locked) as unknown as Ten98Auth;
 }
 
@@ -1138,18 +1534,95 @@ function build(options: Ten98AuthOptions, keys: TokenKeys, locking: boolean, int
 let dummyModernHash: Promise<string> | undefined;
 const modernDummy = () => (dummyModernHash ??= hashPassword('ten98-timing-equaliser'));
 const lockedContext = new AsyncLocalStorage<true>();
-/** The better-auth routes the preset turns off, router and server call alike, and what to use instead. */
+/**
+ * The better-auth routes the instance an app holds serves by default: what the guide documents apps routing (session,
+ * sign-out, password reset and change, session listing and revocation, every two-factor route, which the app sends
+ * through verifyTwoFactor) and those the preset calls itself (`/sign-in/email`, behind signInWithPassword). Everything
+ * else is off unless the app names it in `allowRoutes`.
+ */
+export const ten98AuthRoutes: readonly string[] = Object.freeze(['/get-session', '/sign-out', '/sign-in/email', '/request-password-reset', '/reset-password',
+  '/reset-password/:token', '/change-password', '/verify-password', '/list-sessions', '/revoke-session', '/revoke-sessions', '/revoke-other-sessions', '/ok',
+  '/error', '/two-factor/enable', '/two-factor/disable', '/two-factor/get-totp-uri', '/two-factor/verify-totp', '/two-factor/verify-backup-code',
+  '/two-factor/generate-backup-codes', '/two-factor/send-otp', '/two-factor/verify-otp']);
+/** A route's path as a case-insensitive pattern; a :parameter is one path segment. */
+const routePattern = (path: string) => new RegExp(`^${path.toLowerCase().split('/').map(part => part.startsWith(':') ? '[^/]+' : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('/')}$`);
+/** The better-auth routes the preset always turns off, even if allowed, and what to use instead. */
 const disabledRoutes: Readonly<Record<string, string>> = Object.freeze({
   '/unlink-account': 'use unlinkOidcIdentity inside withLockedAuth',
   '/list-accounts': 'read the user\'s identities from the account table',
 });
 /** better-auth's password route, in any case and with any trailing slash. */
 const passwordRoute = /\/sign-in\/email\/*$/i;
+/** The TOTP verification route. */
+const totpRoute = /\/two-factor\/verify-totp\/*$/i;
+/** The session-bound two-factor routes that weaken or replace a factor, and need a proof of it while it is on. */
+const factorWeakening = new Set(['disable', 'generate-backup-codes', 'enable', 'get-totp-uri', 'view-backup-codes']);
+/** Factor actions are locked after too many refused proofs; `retryAfterSeconds` says for how long. */
+export class FactorActionsLockedError extends Error {
+  readonly code = 'FACTOR_ACTIONS_LOCKED' as const;
+  readonly retryAfterSeconds: number;
+  constructor(retryAfterSeconds: number) {
+    super('Too many wrong codes. Try again later.');
+    this.name = 'FactorActionsLockedError';
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+/**
+ * `request` with a JSON body: `body` when given, otherwise its own body read as JSON (an object, or {} when it is not
+ * one). Content-Type and Content-Length are set for that body, whatever the request said.
+ */
+async function asJson(request: Request, body?: Record<string, unknown>): Promise<Request> {
+  let parsed = body;
+  if (parsed === undefined) {
+    const read: unknown = await request.clone().json().catch(() => undefined);
+    parsed = read !== null && typeof read === 'object' && !Array.isArray(read) ? read as Record<string, unknown> : {};
+  }
+  const headers = new Headers(request.headers);
+  headers.delete('content-length');
+  headers.set('content-type', 'application/json');
+  return new Request(request.url, { method: 'POST', headers, body: JSON.stringify(parsed) });
+}
+/** What a code that is not fresh is replaced with: it matches no step, so better-auth refuses and counts it as wrong. */
+const notACode = '------';
+/** The step in better-auth's window (current ±1) a TOTP code matches, the latest if several, or undefined. */
+function matchedStep(secret: string, code: string, now = Date.now()): number | undefined {
+  const { digits, periodSeconds } = ten98AuthPolicy.twoFactor;
+  const counter = Math.floor(now / 1000 / periodSeconds);
+  const given = Buffer.from(code.padEnd(digits, '\u0000').slice(0, 64));
+  let found: number | undefined;
+  for (let step = counter - 1; step <= counter + 1; step++) {
+    const expected = Buffer.from(hotp(secret, step, digits).padEnd(given.length, '\u0000'));
+    if (expected.length === given.length && timingSafeEqual(given, expected) && code.length === digits) found = step;
+  }
+  return found;
+}
+/** RFC 4226 HOTP with HMAC-SHA1 over the secret's text, as better-auth's createOTP computes it. */
+function hotp(secret: string, counter: number, digits: number): string {
+  const moving = Buffer.alloc(8);
+  moving.writeBigUInt64BE(BigInt(counter));
+  const digest = createHmac('sha1', secret).update(moving).digest();
+  const at = digest[digest.length - 1]! & 15;
+  return String((digest.readUInt32BE(at) & 0x7fffffff) % 10 ** digits).padStart(digits, '0');
+}
+/** The code check of each withLockedAuth callback's transaction, while it runs. */
+const codeChecks = new WeakMap<object, { userId: string; check(code: unknown): Promise<boolean>; factorOn(): Promise<boolean> }>();
+const codeCheckOf = (tx: unknown, operation: string, userId?: string) => {
+  const entry = tx !== null && typeof tx === 'object' ? codeChecks.get(tx) : undefined;
+  if (!entry) throw new TypeError(`${operation} runs inside withLockedAuth, on its transaction, for the signed-in user it locked.`);
+  if (userId !== undefined && userId !== entry.userId) throw new TypeError(`${operation} checks a code for the user withLockedAuth locked.`);
+  return entry;
+};
+/** Every two-factor route, in any case and with any trailing slash. */
+const twoFactorRoute = /\/two-factor\/[^/]+\/*$/i;
+/** What the instance an app holds answers a two-factor request, so a missed route fails loudly in the app's tests. */
+const twoFactorRouting = 'route /two-factor/* through verifyTwoFactor(db, request)';
 /** The two-factor routes that complete a sign-in's challenge, in any case and with any trailing slash. */
 const challengeRoute = /\/two-factor\/verify-(?:totp|backup-code|otp)\/*$/i;
 const twoFactorPaths = new Set(['/two-factor/verify-totp', '/two-factor/verify-backup-code', '/two-factor/verify-otp']);
-/** The two-factor plugin's server calls for those routes. */
-const twoFactorEndpoints = ['verifyTOTP', 'verifyBackupCode', 'verifyTwoFactorOTP'] as const;
+/** Every cookie better-auth and the preset set, named in full on https so each carries the __Host- prefix. */
+const authCookieNames = ['session_token', 'session_data', 'dont_remember', 'account_data', 'two_factor', 'trust_device', 'known_device'] as const;
+/** A sign-in challenge the two-factor plugin opens: '2fa-' and 20 characters of better-auth's generateRandomString. */
+const challengeIdentifier = /^2fa-[A-Za-z0-9_-]{20}$/;
 /** The value of a cookie better-call signed with `secret`, or undefined when it is missing, malformed or forged. */
 function signedValue(cookie: string | undefined, secret: string): string | undefined {
   if (cookie === undefined || cookie.length > 512) return undefined;
@@ -1283,13 +1756,14 @@ function providerKey(value: unknown): string | undefined {
   return typeof value === 'string' && value.length <= 256 && value.trim().length >= 1 && !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
 }
 
-export type OidcIdentityErrorCode = 'OIDC_EMAIL_UNVERIFIED' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OIDC_IDENTITY_NOT_FOUND' | 'OIDC_LAST_SIGN_IN_METHOD';
+export type OidcIdentityErrorCode = 'OIDC_EMAIL_UNVERIFIED' | 'OIDC_ACCOUNT_EXISTS' | 'OIDC_IDENTITY_IN_USE' | 'OIDC_IDENTITY_NOT_FOUND' | 'OIDC_LAST_SIGN_IN_METHOD' | 'OIDC_FACTOR_PROOF_REQUIRED';
 const oidcRefusals: Record<OidcIdentityErrorCode, [403 | 404 | 409, string]> = {
   OIDC_EMAIL_UNVERIFIED: [403, 'This provider cannot create an account here: it did not confirm a verified email, or it is not trusted to.'],
   OIDC_ACCOUNT_EXISTS: [409, 'An account already uses this email. Sign in to it, then link the provider in account settings.'],
   OIDC_IDENTITY_IN_USE: [409, 'This provider identity is linked to another account.'],
   OIDC_IDENTITY_NOT_FOUND: [404, 'This provider identity is not linked to the account.'],
   OIDC_LAST_SIGN_IN_METHOD: [409, 'Set a password or link another provider before unlinking the last way to sign in.'],
+  OIDC_FACTOR_PROOF_REQUIRED: [403, 'Enter a code from your authenticator app, or a recovery code, to link this provider.'],
 };
 /** A refusal of a linked-identity operation: `status` is the HTTP status that fits and `message` is safe to show. */
 export class OidcIdentityError extends Error {
@@ -1337,6 +1811,8 @@ const uniqueViolation = (error: unknown) => [error, (error as { cause?: unknown 
  */
 export async function signInOidcUser(db: AnyDatabase, claims: OidcClaims, provider: OidcProviderTrust, { emailLockKey = 109_859 }: { emailLockKey?: number } = {}): Promise<{ userId: string; created: boolean }> {
   refuseLockedAuth(db, 'signInOidcUser');
+  // The schema check every locked call runs, once per database: without the account index one identity could link twice.
+  await schemaOf(db);
   if (!Number.isInteger(emailLockKey) || emailLockKey < -INT32 || emailLockKey >= INT32) throw new TypeError('emailLockKey must be a 32-bit integer.');
   const key = identityKey(claims?.iss, claims?.sub);
   const found = await linkedUser(db, key);
@@ -1367,12 +1843,25 @@ export async function signInOidcUser(db: AnyDatabase, claims: OidcClaims, provid
 }
 
 /**
+ * Checks a factor proof for an app's own account action, inside `withLockedAuth` on its `tx`, for the user it locked:
+ * true only for a TOTP code of that user's verified factor whose step is newer than the last one accepted anywhere
+ * (sign-in, enrolment, another action), which it records, or an unused recovery code, which it consumes. A refusal
+ * counts toward the factor-action counter; while factor actions are locked it throws FactorActionsLockedError.
+ */
+export async function verifyCodeForAction(tx: AnyDatabase, userId: string, code: string): Promise<boolean> {
+  return codeCheckOf(tx, 'verifyCodeForAction', userId).check(code);
+}
+
+/**
  * Links an identity to the signed-in user, the one `withLockedAuth` locked: call it inside that callback, on its `tx`,
  * after the app verified an ID token the user obtained while signed in. `linked` is false when the identity already
  * belongs to this user. An identity linked to another account is refused with OIDC_IDENTITY_IN_USE; nothing moves it.
  */
-export async function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity): Promise<{ linked: boolean }> {
+export async function linkOidcIdentity(tx: AnyDatabase, identity: OidcIdentity, { code }: { code?: string } = {}): Promise<{ linked: boolean }> {
   const userId = lockedUser(tx, 'linkOidcIdentity');
+  // A new way in for an account with a second factor needs a proof of it, checked like verifyCodeForAction's.
+  const checks = codeCheckOf(tx, 'linkOidcIdentity', userId);
+  if (await checks.factorOn() && (code === undefined || !await checks.check(code))) throw new OidcIdentityError('OIDC_FACTOR_PROOF_REQUIRED');
   const key = identityKey(identity?.issuer, identity?.subject);
   const inserted = await tx.insert(accountTable).values({ id: randomUUID(), userId, ...key })
     .onConflictDoNothing({ target: [accountTable.providerId, accountTable.accountId] }).returning({ id: accountTable.id });
@@ -1435,6 +1924,7 @@ const revocationPasses = 5;
  */
 export async function revokeProviderSessions(db: AnyDatabase, provider: string): Promise<number> {
   refuseLockedAuth(db, 'revokeProviderSessions');
+  await schemaOf(db);
   const key = providerKey(provider);
   if (key === undefined) throw new TypeError('A provider key is at most 256 characters, not blank, with no control characters.');
   const pass = () => transaction(db, async tx => {
@@ -1443,6 +1933,10 @@ export async function revokeProviderSessions(db: AnyDatabase, provider: string):
         WHERE starts_with(identifier, ${challengeProviderPrefix}) AND value = ${key})
       DELETE FROM verification WHERE identifier IN (SELECT identifier FROM bound UNION ALL SELECT challenge FROM bound UNION ALL SELECT ${attemptsPrefix} || challenge FROM bound)`);
     const ended = await tx.delete(sessionTable).where(eq(sessionTable.oidcProvider, key)).returning({ userId: sessionTable.userId });
+    // The trusted devices those sign-ins set, with the rows that tie them to the provider.
+    await tx.execute(sql`WITH bound AS (SELECT identifier, substr(identifier, ${trustProviderPrefix.length + 1}) AS trusted FROM verification
+        WHERE starts_with(identifier, ${trustProviderPrefix}) AND value = ${key})
+      DELETE FROM verification WHERE identifier IN (SELECT identifier FROM bound UNION ALL SELECT trusted FROM bound)`);
     const users = [...new Set(ended.map(row => row.userId))];
     if (users.length) await tx.execute(sql`DELETE FROM verification WHERE value IN ${users} AND starts_with(identifier, ${devicePrefix})`);
     return { sessions: ended.length, challenges: (challenges as unknown as { rowCount: number | null }).rowCount ?? 0 };

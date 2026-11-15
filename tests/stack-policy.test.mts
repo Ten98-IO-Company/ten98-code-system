@@ -248,3 +248,78 @@ test('the declaration keeps one shared app stack and waivers that name what they
     ] satisfies [(contract: Record<string, any>) => void, RegExp][]) assert.match(run(change), expected);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('check.mjs refuses reading an auth cookie by name or through better-auth\'s getters under the data roots', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ten98-auth-cookie-'));
+  try {
+    const checker = join(directory, 'checker');
+    mkdirSync(checker);
+    for (const name of ['check.mjs', 'database-policy.mjs']) writeFileSync(join(checker, name), readFileSync(new URL(`../${name}`, import.meta.url)));
+    const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
+    // A minimal non-app profile with the shared app stack's auth-cookie rule, and a dated transition for one file.
+    contract.profiles['fixture-cookies'] = { dependencies: {}, devDependencies: {}, sharedDependencies: [], sharedDevDependencies: [], peerDependencies: {}, checkScripts: ['test'],
+      data: { roots: ['src'], baseline: 'raw-statements.json' }, authCookie: contract.appStack.authCookie, database: { engine: 'postgresql' } };
+    contract.transitions['fixture-cookies-auth-cookie'] = { rule: 'auth-cookie', profile: 'fixture-cookies', items: ['src/legacy.ts'],
+      reason: 'The fixture still reads its session cookie by name.', owner: 'fixture', doneWhen: '2027-01-31: the fixture reads it through auth.api.getSession.' };
+    writeFileSync(join(checker, 'architecture.json'), JSON.stringify(contract));
+    const app = join(directory, 'app');
+    mkdirSync(join(app, 'src'), { recursive: true });
+    writeFileSync(join(app, 'package.json'), JSON.stringify({ name: 'fixture-cookies', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
+      scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'pnpm check:architecture && node --test' } }));
+    const source = join(app, 'src/guard.ts');
+    const run = () => spawnSync(process.execPath, [join(checker, 'check.mjs'), app], { encoding: 'utf8', timeout: 30_000, windowsHide: true });
+    // The preset's helpers are the allowed route: no hit on them, nor on names that only resemble a cookie's.
+    writeFileSync(source, ["const name = auth.cookieName('session_token');", "const other = auth.cookieName(\"two_factor\");", 'const challenge = await auth.readTwoFactorChallenge(request);',
+      'const expired = auth.expiredAuthCookies(request.headers, path);', "import { parseCookies } from 'better-auth/cookies';", "const label = 'twoFactor';", ''].join('\n'));
+    assert.equal(run().status, 0, run().stderr);
+    for (const statement of ["const name = 'better-auth.session_token'", 'const name = "__Secure-better-auth.two_factor"', 'const name = `${prefix}.session_data`',
+      "cookies.get('dont_remember')", "const challenge = request.cookies['books.two_factor']", "const name = 'better-auth.state'"]) {
+      writeFileSync(source, `${statement};\n`);
+      const refused = run();
+      assert.equal(refused.status, 1, statement);
+      assert.match(refused.stderr, /src\/guard\.ts:1: names an auth cookie/, statement);
+    }
+    for (const statement of ["import { getSessionCookie } from 'better-auth/cookies'", 'import { getCookieCache as cached } from "better-auth/cookies"',
+      "const { getSessionCookie } = await import('better-auth/cookies')", "const { getCookieCache } = require('better-auth/cookies')"]) {
+      writeFileSync(source, `${statement};\n`);
+      const refused = run();
+      assert.equal(refused.status, 1, statement);
+      assert.match(refused.stderr, /src\/guard\.ts: imports get(?:SessionCookie|CookieCache) from better-auth\/cookies/, statement);
+    }
+    // Tests outside the data roots may name cookies; a file a dated transition lists may, until it ends.
+    writeFileSync(source, "const name = auth.cookieName('session_token');\n");
+    mkdirSync(join(app, 'tests'), { recursive: true });
+    writeFileSync(join(app, 'tests/cookies.test.ts'), "assert.equal(name, 'better-auth.session_token');\n");
+    writeFileSync(join(app, 'src/legacy.ts'), "const name = 'better-auth.session_token';\n");
+    assert.equal(run().status, 0, run().stderr);
+    writeFileSync(join(app, 'src/other.ts'), "const name = 'better-auth.session_token';\n");
+    assert.match(run().stderr, /src\/other\.ts:1: names an auth cookie/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('the auth-cookie rule exempts only the cookieName call itself, not a name that ends the same', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ten98-auth-cookie-call-'));
+  try {
+    const checker = join(directory, 'checker');
+    mkdirSync(checker);
+    for (const name of ['check.mjs', 'database-policy.mjs']) writeFileSync(join(checker, name), readFileSync(new URL(`../${name}`, import.meta.url)));
+    const contract = JSON.parse(readFileSync(new URL('../architecture.json', import.meta.url), 'utf8'));
+    contract.profiles['fixture-cookie-call'] = { dependencies: {}, devDependencies: {}, sharedDependencies: [], sharedDevDependencies: [], peerDependencies: {}, checkScripts: ['test'],
+      data: { roots: ['src'], baseline: 'raw-statements.json' }, authCookie: contract.appStack.authCookie, database: { engine: 'postgresql' } };
+    writeFileSync(join(checker, 'architecture.json'), JSON.stringify(contract));
+    const app = join(directory, 'app');
+    mkdirSync(join(app, 'src'), { recursive: true });
+    writeFileSync(join(app, 'package.json'), JSON.stringify({ name: 'fixture-cookie-call', type: 'module', packageManager: 'pnpm@11.19.0', engines: { node: '>=24.22.1 <25' },
+      scripts: { 'check:architecture': 'node node_modules/@ten98/runtime/check.mjs .', test: 'pnpm check:architecture && node --test' } }));
+    const source = join(app, 'src/guard.ts');
+    const run = () => spawnSync(process.execPath, [join(checker, 'check.mjs'), app], { encoding: 'utf8', timeout: 30_000, windowsHide: true });
+    for (const allowed of ["auth.cookieName('session_token')", "cookieName ('two_factor')", "this.auth.cookieName('dont_remember')"]) {
+      writeFileSync(source, `${allowed};\n`);
+      assert.equal(run().status, 0, allowed);
+    }
+    for (const refused of ["readCookieName('session_token')", "xcookieName('two_factor')"]) {
+      writeFileSync(source, `${refused};\n`);
+      assert.match(run().stderr, /src\/guard\.ts:1: names an auth cookie/, refused);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
