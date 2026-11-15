@@ -366,7 +366,7 @@ export interface Ten98Auth {
     /** Replaces the caller's own session with a fresh one and revokes the old one (after the app verified a factor); needs that session's cookie. */
     rotateVerifiedSession: ServerCall<{ verifiedUserId: string }>;
     /**
-     * Signs in a user the app's OIDC flow verified (`findOidcUser`); an account with two-factor enabled gets the TOTP
+     * Signs in a user the app's OIDC flow verified (`signInOidcUser`); an account with two-factor enabled gets the TOTP
      * challenge instead. `provider` is the app's key for the provider configuration it signed in through (1 to 256
      * characters, no control characters): the session, or the session the challenge later creates, stores it as
      * `oidcProvider`, so `revokeProviderSessions` can end it.
@@ -1141,7 +1141,7 @@ export class OidcIdentityError extends Error {
 }
 /** A linked identity: the ID token's `iss` and `sub`, after the app verified the token. */
 export type OidcIdentity = { issuer: string; subject: string };
-/** The verified ID token claims `findOidcUser` reads. */
+/** The verified ID token claims `signInOidcUser` reads. */
 export type OidcClaims = { iss: string; sub: string; email?: unknown; email_verified?: unknown; name?: unknown; [claim: string]: unknown };
 /** The provider configuration's trust setting: only `trustVerifiedEmail: true` lets a verified email create an account. */
 export type OidcProviderTrust = { trustVerifiedEmail?: boolean };
@@ -1171,8 +1171,8 @@ const uniqueViolation = (error: unknown) => [error, (error as { cause?: unknown 
  * password and an account row with no provider tokens. `claims` must come from an ID token the app verified. The
  * account's usability (`closed_at`) is the app's check before it signs the user in with `completeOidcSession`.
  */
-export async function findOidcUser(db: AnyDatabase, claims: OidcClaims, provider: OidcProviderTrust, { emailLockKey = 109_859 }: { emailLockKey?: number } = {}): Promise<{ userId: string; created: boolean }> {
-  refuseLockedAuth(db, 'findOidcUser');
+export async function signInOidcUser(db: AnyDatabase, claims: OidcClaims, provider: OidcProviderTrust, { emailLockKey = 109_859 }: { emailLockKey?: number } = {}): Promise<{ userId: string; created: boolean }> {
+  refuseLockedAuth(db, 'signInOidcUser');
   if (!Number.isInteger(emailLockKey) || emailLockKey < -INT32 || emailLockKey >= INT32) throw new TypeError('emailLockKey must be a 32-bit integer.');
   const key = identityKey(claims?.iss, claims?.sub);
   const found = await linkedUser(db, key);

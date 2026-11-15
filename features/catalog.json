@@ -190,7 +190,7 @@
         "normaliseOidcIssuer",
         "normaliseOidcIssuerSql",
         "oidcProviderId",
-        "findOidcUser",
+        "signInOidcUser",
         "linkOidcIdentity",
         "unlinkOidcIdentity",
         "revokeProviderSessions",

@@ -195,7 +195,7 @@ export interface Ten98Auth {
             verifiedUserId: string;
         }>;
         /**
-         * Signs in a user the app's OIDC flow verified (`findOidcUser`); an account with two-factor enabled gets the TOTP
+         * Signs in a user the app's OIDC flow verified (`signInOidcUser`); an account with two-factor enabled gets the TOTP
          * challenge instead. `provider` is the app's key for the provider configuration it signed in through (1 to 256
          * characters, no control characters): the session, or the session the challenge later creates, stores it as
          * `oidcProvider`, so `revokeProviderSessions` can end it.
@@ -339,7 +339,7 @@ export type OidcIdentity = {
     issuer: string;
     subject: string;
 };
-/** The verified ID token claims `findOidcUser` reads. */
+/** The verified ID token claims `signInOidcUser` reads. */
 export type OidcClaims = {
     iss: string;
     sub: string;
@@ -362,7 +362,7 @@ export type OidcProviderTrust = {
  * password and an account row with no provider tokens. `claims` must come from an ID token the app verified. The
  * account's usability (`closed_at`) is the app's check before it signs the user in with `completeOidcSession`.
  */
-export declare function findOidcUser(db: AnyDatabase, claims: OidcClaims, provider: OidcProviderTrust, { emailLockKey }?: {
+export declare function signInOidcUser(db: AnyDatabase, claims: OidcClaims, provider: OidcProviderTrust, { emailLockKey }?: {
     emailLockKey?: number;
 }): Promise<{
     userId: string;

@@ -148,16 +148,14 @@ export const user = pgTable('user', {
     createdAt: timestamp('createdAt', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updatedAt', { withTimezone: true }).notNull().defaultNow(),
     twoFactorEnabled: boolean('twoFactorEnabled').notNull().default(false), closedAt: timestamp('closed_at', { withTimezone: true }),
 }, table => [uniqueIndex('user_email_normalized_idx').on(sql `lower(${table.email})`), check('user_email_lowercase', sql `${table.email} = lower(${table.email})`)]);
-// better-auth's session table. `token` holds the preset's keyed handle (#131); `oidcProvider` is the app's provider key
-// for a session that began with a provider sign-in, NULL otherwise, and survives the handle because it is its own column.
+// better-auth's session table, as books, discover and campaign (0013) have it, plus `oidcProvider`: the app's provider
+// key for a session that began with a provider sign-in, NULL otherwise, its own column beside the hashed `token` (#131).
+// It declares no index: each app keeps its own on "userId" (session_user_idx or session_user_active_idx).
 export const session = pgTable('session', {
     id: text('id').primaryKey(), expiresAt: timestamp('expiresAt', { withTimezone: true }).notNull(), token: text('token').notNull().unique('session_token_key'),
     createdAt: timestamp('createdAt', { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp('updatedAt', { withTimezone: true }).notNull().defaultNow(),
     ipAddress: text('ipAddress'), userAgent: text('userAgent'), userId: text('userId').notNull(), oidcProvider: text('oidcProvider'),
-}, table => [
-    foreignKey({ name: 'session_userId_fkey', columns: [table.userId], foreignColumns: [user.id] }).onDelete('cascade'),
-    index('session_user_idx').on(table.userId),
-]);
+}, table => [foreignKey({ name: 'session_userId_fkey', columns: [table.userId], foreignColumns: [user.id] }).onDelete('cascade')]);
 export const account = pgTable('account', {
     id: text('id').primaryKey(), accountId: text('accountId').notNull(), providerId: text('providerId').notNull(), userId: text('userId').notNull(),
     password: text('password'),

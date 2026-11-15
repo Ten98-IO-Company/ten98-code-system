@@ -1046,8 +1046,8 @@ const uniqueViolation = (error) => [error, error?.cause].some(item => item?.code
  * password and an account row with no provider tokens. `claims` must come from an ID token the app verified. The
  * account's usability (`closed_at`) is the app's check before it signs the user in with `completeOidcSession`.
  */
-export async function findOidcUser(db, claims, provider, { emailLockKey = 109_859 } = {}) {
-    refuseLockedAuth(db, 'findOidcUser');
+export async function signInOidcUser(db, claims, provider, { emailLockKey = 109_859 } = {}) {
+    refuseLockedAuth(db, 'signInOidcUser');
     if (!Number.isInteger(emailLockKey) || emailLockKey < -INT32 || emailLockKey >= INT32)
         throw new TypeError('emailLockKey must be a 32-bit integer.');
     const key = identityKey(claims?.iss, claims?.sub);

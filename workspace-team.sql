@@ -3,7 +3,8 @@
 -- with better-auth's "user", session and account tables; "twoFactorEnabled" comes from better-auth's two-factor plugin,
 -- closed_at from account closure (#39) and session."oidcProvider" from the provider binding (#143). Campaign adds those
 -- columns and renames its workspaces, memberships and workspace_invitations tables to these with its better-auth
--- migration (#97). Emails are stored lower-case (user_email_lowercase, #143).
+-- migration (#97). Emails are stored lower-case (user_email_lowercase, #143). The session table is better-auth's as books,
+-- discover and campaign (0013) have it, plus "oidcProvider"; each app keeps its own index on "userId".
 CREATE TABLE "user" (id text PRIMARY KEY, name text NOT NULL, email text NOT NULL UNIQUE, "emailVerified" boolean NOT NULL DEFAULT false,
   image text, "createdAt" timestamptz NOT NULL DEFAULT now(), "updatedAt" timestamptz NOT NULL DEFAULT now(),
   "twoFactorEnabled" boolean NOT NULL DEFAULT false, closed_at timestamptz, CONSTRAINT user_email_lowercase CHECK (email = lower(email)));
@@ -11,7 +12,6 @@ CREATE UNIQUE INDEX user_email_normalized_idx ON "user" (lower(email));
 CREATE TABLE session (id text PRIMARY KEY, "expiresAt" timestamptz NOT NULL, token text NOT NULL UNIQUE, "createdAt" timestamptz NOT NULL DEFAULT now(),
   "updatedAt" timestamptz NOT NULL DEFAULT now(), "ipAddress" text, "userAgent" text, "userId" text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
   "oidcProvider" text);
-CREATE INDEX session_user_idx ON session("userId");
 CREATE TABLE account (id text PRIMARY KEY, "accountId" text NOT NULL, "providerId" text NOT NULL, "userId" text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
   password text, "createdAt" timestamptz NOT NULL DEFAULT now(), "updatedAt" timestamptz NOT NULL DEFAULT now(), UNIQUE("providerId", "accountId"));
 CREATE INDEX account_user_idx ON account("userId");

@@ -9,7 +9,7 @@ import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { boolean, integer, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
 import pg from 'pg';
-import { AmbiguousAccountError, createTen98Auth, findOidcUser, linkOidcIdentity, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError,
+import { AmbiguousAccountError, createTen98Auth, signInOidcUser, linkOidcIdentity, LockedAuthClosedError, LockedAuthTransactionError, LockedAuthUserNotFoundError, MissingEmailIndexError,
   normaliseOidcIssuer, normaliseOidcIssuerSql, OidcIdentityError, oidcProviderId, revokeProviderSessions, SchemaMismatchError, tokenStorageUpgradeStatements, unlinkOidcIdentity } from '../auth.mjs';
 import type { PasswordAttempt, Ten98Auth, Ten98AuthOptions } from '../auth.mjs';
 import { session, transaction, TransactionRolledBackError, user } from '../db.mjs';
@@ -1131,11 +1131,11 @@ test('a first provider sign-in creates the account with its verified email, and 
   const email = address('first');
   const sub = subject();
   const tokens = { id_token: 'header.payload.signature', access_token: 'access-token', refresh_token: 'refresh-token' };
-  const first = await findOidcUser(db, claimsFor(` ${email.toUpperCase()} `, sub, tokens), trusted);
+  const first = await signInOidcUser(db, claimsFor(` ${email.toUpperCase()} `, sub, tokens), trusted);
   assert.equal(first.created, true);
   assert.deepEqual((await pool!.query('SELECT email, "emailVerified", name FROM "user" WHERE id=$1', [first.userId])).rows, [{ email, emailVerified: true, name: 'Provider User' }]);
   // Any spelling of the issuer that normalises alike finds the same identity, with no email needed.
-  assert.deepEqual(await findOidcUser(db, { iss: 'HTTPS://IDP.example.com:443/realms/acme/', sub }, {}), { userId: first.userId, created: false });
+  assert.deepEqual(await signInOidcUser(db, { iss: 'HTTPS://IDP.example.com:443/realms/acme/', sub }, {}), { userId: first.userId, created: false });
   assert.deepEqual(await identitiesOf(first.userId), [{ providerId: `oidc:${ISSUER}`, accountId: sub }]);
   // An identity linked explicitly, and one linked by accepting an invitation.
   const linked = await account_(address('linked'));
@@ -1154,27 +1154,27 @@ test('a first provider sign-in creates the account with its verified email, and 
 test('a provider sign-in never links to an existing account, even with a verified email from a trusted provider', { skip }, async () => {
   const email = address('exists');
   const id = await account_(email);
-  await assert.rejects(findOidcUser(db, claimsFor(email.toUpperCase()), trusted), refusedWith('OIDC_ACCOUNT_EXISTS', 409));
+  await assert.rejects(signInOidcUser(db, claimsFor(email.toUpperCase()), trusted), refusedWith('OIDC_ACCOUNT_EXISTS', 409));
   assert.deepEqual(await identitiesOf(id), []);
   assert.equal(await usersAt(email), 1);
   // Not inside a locked-auth transaction either: account creation takes the email lock, which comes before the user row.
-  await assert.rejects(auth.withLockedAuth(db, id, (_bound, tx) => findOidcUser(tx, claimsFor(address('inside')), trusted)), refused);
+  await assert.rejects(auth.withLockedAuth(db, id, (_bound, tx) => signInOidcUser(tx, claimsFor(address('inside')), trusted)), refused);
 });
 
 test('without trustVerifiedEmail: true a verified email creates no account, and an unverified one never does', { skip }, async () => {
   const email = address('untrusted');
   for (const provider of [{}, { trustVerifiedEmail: false }, { trustVerifiedEmail: 'true' as unknown as boolean }, undefined as unknown as {}]) {
-    await assert.rejects(findOidcUser(db, claimsFor(email), provider), refusedWith('OIDC_EMAIL_UNVERIFIED', 403));
+    await assert.rejects(signInOidcUser(db, claimsFor(email), provider), refusedWith('OIDC_EMAIL_UNVERIFIED', 403));
   }
   for (const claims of [claimsFor(email, subject(), { email_verified: 'true' }), claimsFor(email, subject(), { email_verified: false }), { iss: ISSUER, sub: subject(), email_verified: true }]) {
-    await assert.rejects(findOidcUser(db, claims, trusted), refusedWith('OIDC_EMAIL_UNVERIFIED', 403));
+    await assert.rejects(signInOidcUser(db, claims, trusted), refusedWith('OIDC_EMAIL_UNVERIFIED', 403));
   }
   assert.equal(await usersAt(email), 0);
   // The unverified refusal comes first, so an untrusted provider cannot learn which emails have accounts.
   const existing = address('probe');
   await account_(existing);
-  await assert.rejects(findOidcUser(db, claimsFor(existing), {}), refusedWith('OIDC_EMAIL_UNVERIFIED'));
-  assert.equal((await findOidcUser(db, claimsFor(email), trusted)).created, true);
+  await assert.rejects(signInOidcUser(db, claimsFor(existing), {}), refusedWith('OIDC_EMAIL_UNVERIFIED'));
+  assert.equal((await signInOidcUser(db, claimsFor(email), trusted)).created, true);
 });
 
 test('an invitation is accepted through a provider only by its own email, and then links the identity', { skip }, async () => {
@@ -1187,7 +1187,7 @@ test('an invitation is accepted through a provider only by its own email, and th
     (error: { code?: string; status?: number }) => error.code === 'OIDC_INVITE_EMAIL_MISMATCH' && error.status === 403);
   assert.equal((await pool!.query('SELECT 1 FROM account WHERE "accountId"=$1', [sub])).rowCount, 0);
   const accepted = await inTransaction(client => team.acceptVerifiedOidcInvitation(client, token, { email: invited, name: 'Invitee', issuer: `${ISSUER}/`, subject: sub }));
-  assert.deepEqual(await findOidcUser(db, { iss: ISSUER, sub }, {}), { userId: accepted.userId, created: false });
+  assert.deepEqual(await signInOidcUser(db, { iss: ISSUER, sub }, {}), { userId: accepted.userId, created: false });
 });
 
 test('a signed-in user links an identity only inside withLockedAuth, and cannot unlink the last way to sign in', { skip }, async () => {
@@ -1203,7 +1203,7 @@ test('a signed-in user links an identity only inside withLockedAuth, and cannot 
   assert.deepEqual(await identitiesOf(id), []);
   assert.deepEqual(await auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, identity)), { linked: true });
   assert.deepEqual(await auth.withLockedAuth(db, id, (_bound, tx) => linkOidcIdentity(tx, identity)), { linked: false });
-  assert.deepEqual(await findOidcUser(db, { iss: identity.issuer, sub: identity.subject }, {}), { userId: id, created: false });
+  assert.deepEqual(await signInOidcUser(db, { iss: identity.issuer, sub: identity.subject }, {}), { userId: id, created: false });
   // Its credential row has no password, so this identity is the only way to sign in.
   const unlink = (target: typeof identity) => auth.withLockedAuth(db, id, (_bound, tx) => unlinkOidcIdentity(tx, target));
   await assert.rejects(unlink(identity), refusedWith('OIDC_LAST_SIGN_IN_METHOD', 409));
@@ -1225,7 +1225,7 @@ test('an identity is unique per (issuer, subject): one account holds it, whateve
   await auth.withLockedAuth(db, first, (_bound, tx) => linkOidcIdentity(tx, { issuer: 'https://IdP.Example.com:443/realms/acme/', subject: sub }));
   await assert.rejects(auth.withLockedAuth(db, other, (_bound, tx) => linkOidcIdentity(tx, { issuer: ISSUER, subject: sub })), refusedWith('OIDC_IDENTITY_IN_USE', 409));
   assert.deepEqual(await identitiesOf(other), []);
-  assert.deepEqual(await findOidcUser(db, { iss: ISSUER, sub }, {}), { userId: first, created: false });
+  assert.deepEqual(await signInOidcUser(db, { iss: ISSUER, sub }, {}), { userId: first, created: false });
   // The same subject at another issuer is another identity; the constraint itself refuses a second row.
   assert.deepEqual(await auth.withLockedAuth(db, other, (_bound, tx) => linkOidcIdentity(tx, { issuer: 'https://idp.example.org/realms/acme', subject: sub })), { linked: true });
   await assert.rejects(pool!.query('INSERT INTO account(id,"accountId","providerId","userId") VALUES($1,$2,$3,$4)', [randomUUID(), sub, oidcProviderId(ISSUER), other]),
@@ -1286,7 +1286,7 @@ test('a first provider sign-in takes the email lock: it waits for a sign-in by e
     await tx.execute(sql`INSERT INTO "user"(id,name,email) VALUES(${randomUUID()}, 'Racer', ${email})`);
   });
   await entered.opened;
-  const provisioning = findOidcUser(db, claimsFor(email), trusted);
+  const provisioning = signInOidcUser(db, claimsFor(email), trusted);
   // The gate opens before the assertion, so a failure never leaves the held transaction waiting.
   let waited = await someoneWaits();
   held.open();
@@ -1300,7 +1300,7 @@ test('a first provider sign-in takes the email lock: it waits for a sign-in by e
   held = gate(); entered = gate();
   let created = '';
   const provisioner = transaction(db, async tx => {
-    created = (await findOidcUser(tx, claimsFor(second), trusted)).userId;
+    created = (await signInOidcUser(tx, claimsFor(second), trusted)).userId;
     entered.open();
     await held.opened;
   });
